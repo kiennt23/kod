@@ -38,6 +38,8 @@ This doc designs a harness that lets an AI agent take a ticket and hand back a p
 
 The agent never holds a credential and never talks to a system directly. Every tool call passes through the gateway, which asks the policy engine and records the decision. The only write the agent can make to the repo is a push to its own branch plus a draft PR, so everything it produces still goes through the normal CI gates and human review.
 
+This implements the control architecture in [*DevSecOps SDLC with AI Agents*](devsecops-sdlc.md#control-architecture): the sandbox → gateway → policy → audit spine is the same. This diagram adds what Kod is concrete about: the tracker and dispatcher on the way in, the pluggable model, and the draft-PR path on the way out.
+
 - **Issue tracker:** the ticket is the task spec. Only team members can add the agent label.
 - **Dispatcher:** a small webhook service. It rejects tickets that are missing acceptance criteria, touch a restricted area, or would push agent work past the team's WIP limit.
 - **Sandbox run:** one throwaway container per ticket, running our agent loop (or another conforming runner) with our skills and hooks loaded.

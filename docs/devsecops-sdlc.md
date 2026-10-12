@@ -175,6 +175,8 @@ control architecture · 6 layers
 
 The kill switch in the orchestrator revokes all agent tokens at once.
 
+This is the pattern, not a product choice. [*Kod: an agent harness for our SDLC*](kod-harness-design.md) is the reference implementation: it uses the same sandbox → gateway → policy → audit spine, and picks concrete components for each box.
+
 ## Securing the agents
 
 The agents are a new attack surface, roughly mapped to the OWASP LLM and Agentic Top 10; prompt injection and excessive agency matter most.
