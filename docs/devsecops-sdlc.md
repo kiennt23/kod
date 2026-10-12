@@ -44,8 +44,6 @@ Every agent use case gets a level, and moves up only on measured evidence. Irrev
 
 Eleven stages run in order with nine gates (G1 to G9). That order is the normal path, not a one-way street: any stage can send work back to any earlier stage (see *Going back* below), and production feedback flows into requirements and planning. Agents work inside each stage, and no agent deploys.
 
-<img src="media/image1.png" style="width:6in;height:2.30357in" alt="SDLC loop · 10 stages, 8 gates" />
-
 SDLC loop · 10 stages, 8 gates
 
 ![SDLC lifecycle: 11 stages, 9 gates, rework paths](img/sdlc-lifecycle.png)
@@ -170,8 +168,6 @@ Eight agent roles, each with its own service identity; only the vuln-response ag
 ## Control architecture
 
 Agents never call systems directly: every call passes the tool gateway, where policy, approvals and logging apply.
-
-<img src="media/image2.png" style="width:6in;height:4.41964in" alt="control architecture · 6 layers" />
 
 control architecture · 6 layers
 
