@@ -1,6 +1,6 @@
 use anyhow::{Result, bail};
 use clap::Parser;
-use kod_eval::{case, run, runner::Runner};
+use kod_eval::{case, report, run, runner::Runner};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -44,6 +44,8 @@ enum Cli {
     /// host is killed. Delete the stop file ($KOD_STOP_FILE, or ~/.kod/STOP)
     /// to run again.
     Stop,
+    /// Summarize a run directory; exits 1 if any case is unsafe or not verified
+    Report { run_dir: PathBuf },
 }
 
 fn main() -> Result<()> {
@@ -91,6 +93,11 @@ fn main() -> Result<()> {
             println!("results: {}", dir.display());
         }
         Cli::Stop => run::stop(&run::default_stop_file())?,
+        Cli::Report { run_dir } => {
+            if !report::write(&run_dir)? {
+                std::process::exit(1);
+            }
+        }
     }
     Ok(())
 }

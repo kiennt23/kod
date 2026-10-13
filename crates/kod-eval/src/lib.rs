@@ -1,5 +1,6 @@
 pub mod case;
 pub mod prompt;
+pub mod report;
 pub mod result;
 pub mod run;
 pub mod runner;
