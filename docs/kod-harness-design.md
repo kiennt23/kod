@@ -163,6 +163,36 @@ Any stage can send work back to an earlier one: a coding run finds an ambiguous 
 
 So "nothing merges against superseded requirements or design" is a property of the merge, not a request to the agent.
 
+## Workflow status
+
+One view answers "where is this story?" across every tool it touches. The tracker board already shows ticket status; what it can't show is doc approvals, staleness, gates and rework, which live elsewhere. This view puts them together.
+
+```
+STORY-142  Export invoices as CSV                          owner: Lan
+Requirements  Plan  Design  Code   Review  Build  Test  Release  Deploy  Operate
+   ✓ G1       ✓ G2   ⚠ G3   ◐      ·       ·      ·     ·        ·       ·
+                     │
+                     └ design v3 approved, v4 in review → 1 PR stale
+
+ Tickets
+ ├ KOD-310  API endpoint    ✓ merged       PR #88
+ ├ KOD-311  CSV writer      ◐ run 2/3      draft PR #91 · stale (design v4)
+ └ KOD-312  UI button       ⛔ blocked      rework request KOD-320 → Design
+```
+
+**What it shows.** A stage strip for the story (the SDLC stages and gates), and under it a tree of the story's tickets with their runs and PRs. Each stage is one of: not started, in progress, in review, approved (with the version), stale, blocked. Rework shows up as a stage going back from approved to in review.
+
+**Where the data comes from.** Nothing new. Doc versions and approvals, tickets, runs and their end states, PRs, gate results, rework requests and staleness are already recorded and keyed by the story ID. The view is computed from those records on read; it has no store of its own.
+
+**Read-only.** The view has no actions, so it adds nothing to the action and permission matrix. It shows only what the viewer can already see in the tracker and GitHub.
+
+**Surfaces, simplest first:**
+
+- **Phase 1:** Kod keeps one status comment on the story's tracker issue up to date, and `kod status <story>` prints the same view in a terminal. No UI to build.
+- **Phase 3:** a read-only web page with one story's view and a board of all stories by stage, for when more teams need it.
+
+A richer UI comes later, once the team has used these and knows what it's missing.
+
 **What re-runs.** Only stale items. A question changes nothing. An amendment re-runs the changed artifact's approval and the stale items under it. A re-plan sends the story back to planning.
 
 **Bounce limit.** Set in the delegation policy. Past it, the dispatcher stops delegating the story and assigns it to the tech lead.
@@ -603,11 +633,11 @@ roadmap · 4 phases, gated, not to scale
 
 - **0 · Prove it.** Two steps. *Offline:* run Claude Code in a minimal sandbox on our own hosts against sanitized copies of our repos, with no network beyond the model endpoint and no writes anywhere; build the eval set and measure the baseline our own loop must match. *Connected pilot:* one repo, draft PRs on low-risk tickets, only after every minimum control passes its test: the sandbox with egress allowlist, a publish operation that holds the git token, model routing, audit capture, the merge checks and GitHub rules, and a practised kill switch. Each control has an owner and a recorded test result, and compliance sees the control mapping before the pilot starts.
 
-- **1 · Team MVP.** Build our Rust agent loop, the dispatcher, both gateways, policy, the audit log, the gate runner and tracing. Our loop becomes the default runner once it matches the phase 0 baseline on the eval set; until then Claude Code keeps running. All 6 engineers delegate, with the WIP limit set to match review capacity.
+- **1 · Team MVP.** Build our Rust agent loop, the dispatcher, both gateways, policy, the audit log, the gate runner, tracing and the workflow status comment and CLI. Our loop becomes the default runner once it matches the phase 0 baseline on the eval set; until then Claude Code keeps running. All 6 engineers delegate, with the WIP limit set to match review capacity.
 
 - **2 · IDE pairing.** IDE agents read the same AGENTS.md and skills, and their tool calls go through the same gateway and policy. Hooks are per agent, so nothing relies on them. Add the reviewer agent to PRs.
 
-- **3 · Scale out.** Add per-team policy, budgets and self-service onboarding, with a platform team owning the harness. Only now does multi-team design work start.
+- **3 · Scale out.** Add per-team policy, budgets and self-service onboarding and the read-only workflow status page, with a platform team owning the harness. Only now does multi-team design work start.
 
 ## Risks
 
