@@ -37,16 +37,16 @@ Every agent use case gets a level, and moves up only on measured evidence. Irrev
 | L0 | Suggest only | Chat assistant |
 | L1 | Draft; a human applies | Agent opens a PR, a human merges |
 | L2 | Acts in a sandbox; a human approves the result | Agent runs tests or migrations in an ephemeral environment |
-| L3 | Acts within guardrails; a human audits after | Patch-level dependency bumps auto-merge when every gate passes |
+| L3 | Acts within guardrails; a human audits after | Patch-level dependency bumps auto-merge when every gate passes (optional per team; Kod v1 doesn't allow it) |
 | L4 | Fully autonomous in production | Not recommended, except tightly bounded reversible tasks |
 
 ## Lifecycle and gates
 
 Eleven stages run in order with nine gates (G1 to G9). That order is the normal path, not a one-way street: any stage can send work back to any earlier stage (see *Going back* below), and production feedback flows into requirements and planning. Agents work inside each stage, and no agent deploys.
 
-SDLC loop · 10 stages, 8 gates
-
 ![SDLC lifecycle: 11 stages, 9 gates, rework paths](img/sdlc-lifecycle.png)
+
+SDLC loop · 11 stages, 9 gates
 
 The diagram shows the forward path: left to right, then back along the lower row. Rework can jump back from any stage to any earlier one.
 
@@ -116,7 +116,7 @@ Each stage's outputs are the next stage's inputs and its gate's evidence: no out
 | Plan | Milestones and test strategy | Lead | Docs tool | Test agent, release |
 | Design | Design doc and ADRs | Designer agent drafts; tech lead approves (G3) | Docs tool, ADRs in repo | Coder, reviewers |
 | Design | API contracts and data model | Designer agent drafts; tech lead approves | OpenAPI and schemas in repo | Coder, test agent |
-| Design | Threat model and data-flow diagram | Threat modeler agent drafts; AppSec reviews | threatmodel.yaml in repo | Reviewers, test agent, release agent |
+| Design | Threat model and data-flow diagram | Threat modeler agent drafts; AppSec reviews | Threat model section of the design doc in the docs tool; approved snapshot in the repo | Reviewers, test agent, release agent |
 | Design | Risk decisions (accept or mitigate) | Named risk owner (G3) | Risk register entry, signed | Release gate, auditors |
 | Design | Security requirements linked to stories | Threat modeler agent | Tracker links | Coder, reviewers |
 | Code | Spec-first tests | Coder agent | Repo, in the PR | CI, reviewers |
@@ -151,7 +151,7 @@ Retention periods depend on the compliance regime; see open questions.
 
 ## Agent roster
 
-Eight agent roles, each with its own service identity; only the vuln-response agent reaches L3, and only for patch bumps.
+Each agent role has its own service identity; only the vuln-response agent reaches L3, and only for patch bumps.
 
 | Agent | Permissions | Max autonomy | Never allowed to |
 |----|----|----|----|
@@ -169,9 +169,9 @@ Eight agent roles, each with its own service identity; only the vuln-response ag
 
 Agents never call systems directly: every call passes the tool gateway, where policy, approvals and logging apply.
 
-control architecture · 6 layers
+![Control architecture](img/sdlc-control-architecture.png)
 
-![Control architecture: agents reach systems only through the tool gateway](img/sdlc-control-architecture.png)
+control architecture · 6 layers
 
 The kill switch in the orchestrator revokes all agent tokens at once.
 
@@ -230,7 +230,7 @@ No agent gets write access until the foundation phase is complete; each later ph
 
 3.  **Author (L2).** Coder and test agents on low-risk repos, measured against the metrics above.
 
-4.  **Selective autonomy (L3).** Auto-merge for proven narrow classes (patch bumps, lint fixes) with sampled human audits.
+4.  **Selective autonomy (L3).** Auto-merge for proven narrow classes (patch bumps, lint fixes) with sampled human audits. Optional per team; Kod v1 doesn't allow it.
 
 5.  **Continuous.** Quarterly red-team of the agents (prompt injection, privilege escalation), refreshed evals, policy review.
 
