@@ -4,7 +4,7 @@ Oct 12, 2026 · @Nguyen Trung Kien · Companion to [*DevSecOps SDLC with AI Agen
 
 ## Purpose and scope
 
-This doc designs a harness that lets an AI agent take a ticket and hand back a pull request ready for human review. It is built first for one team of 6 engineers working in a regulated environment, and applies the lifecycle and controls from *DevSecOps SDLC with AI Agents* to a concrete first build.
+This doc designs a harness that lets an AI agent take a ticket and hand back a pull request ready for human review. It is built first for one team of 6 engineers working in a regulated environment, and applies the lifecycle and controls from [*DevSecOps SDLC with AI Agents*](devsecops-sdlc.md) to a concrete first build.
 
 **In scope (v1, phases 0 and 1):** asynchronous PR delegation. An engineer labels a ticket, an agent works in an isolated sandbox, and a draft PR comes back for human review. Phase 1 also drafts requirements, plan and design docs for human approval (see Upstream phases).
 
@@ -186,6 +186,20 @@ So "nothing merges against superseded requirements or design" is a property of t
 | Evals | Build | The team's own past tickets, run by our eval runner | Only our tickets tell us whether it works for us |
 
 **Fastest way to prove the idea:** in phase 0, build only a minimal sandbox runner and run Claude Code in it as a pluggable runner: offline first, then in a small connected pilot once the minimum controls pass (see Roadmap). The loop, dispatcher and full gateways come after. Its results become the baseline our own loop must match.
+
+**Start each component minimal.** Phase 1 builds a lot for six people, so each component starts in its smallest useful form and grows only when evals or operations show the need:
+
+- Tracing: structured logs first; our own collector and trace store when logs stop being enough.
+
+- Audit store: an append-only table with external checkpoints, nothing bespoke.
+
+- Gateways: one process serving both the tool and model routes until load or isolation needs say otherwise.
+
+- Dispatcher: one process with a database table as its queue.
+
+- Eval runner: a CLI run in CI.
+
+The controls in Trust boundaries and the matrix below aren't reduced. Only how they are hosted starts small.
 
 ## Documentation tooling
 
@@ -509,6 +523,12 @@ Data written into a PR or sent in a model request remains a residual risk, recor
 
 Kod has three zones. A control counts only if it still holds when a runner ignores its instructions and hooks.
 
+![Kod trust boundaries](img/kod-trust-boundaries.png)
+
+trust boundaries · 3 zones
+
+Agent code runs only in the top zone. Everything it does outside goes through the gateway, and nothing it builds reaches a release.
+
 | Zone | What runs there | Controls | Recorded |
 |----|----|----|----|
 | Local execution (untrusted) | The agent loop, shell commands, builds, tests, dependency scripts, file edits | Fresh container or microVM per run; non-root; no host sockets or control interfaces; only the workspace is writable; egress allowlist; CPU, memory and time limits | Every command with its exit code, the final diff, resource use |
@@ -518,6 +538,23 @@ Kod has three zones. A control counts only if it still holds when a runner ignor
 **Caches.** Sandboxes read a per-repo cache that trusted CI builds from the main branch, and write only to a per-run cache that is thrown away. Nothing an untrusted run builds reaches a release.
 
 **Not recorded:** system calls and file reads inside the sandbox. If evidence must cover those, add sandbox-level tracing later.
+
+### Action and permission matrix
+
+Every operation Kod can perform, where it is enforced and what happens when it is refused. An operation not listed here is refused.
+
+| Operation (who) | Allowed scope | Approval | Enforced at | Evidence | On failure |
+|----|----|----|----|----|----|
+| Local commands: shell, build, test, file edits (agent) | Its own workspace; egress allowlist only | None | Sandbox: container, egress rules, limits | Commands, exit codes, final diff, resource use | Command fails; run ends at its limits; nothing leaves the sandbox |
+| Model request (agent) | Endpoints the routing policy allows for the run's data class | None | LLM gateway and routing policy | Endpoint, model, tokens; redacted prompt and output | Refused; with no allowed endpoint the run ends as needs a human |
+| Read tracker or docs (agent) | The ticket and the docs it links | None | Gateway policy | Call, IDs, result size | Refused and logged |
+| Write to the tracker: comment, transition, create a linked rework request (agent) | Its own ticket and requests linked to it | None | Gateway policy | Call and content | Refused and logged |
+| Write a draft doc (agent, phase 1) | Its own draft in the Draft folder | A human moves it to Approved | Gateway policy; Drive permissions | Named version before each edit | Refused and logged |
+| Publish to GitHub (agent, through the gateway's publish operation) | The ticket's repo, branch agent/\<ticket\>-\<run\>, one draft PR | None to open; a merge needs approval | Gateway publish operation, the only holder of the git token | Commit SHA, PR, pinned inputs | Refused if the run is canceled, the audit write fails or the target isn't cleared for the data |
+| Approve and merge a PR (humans only) | The PR's head commit | The team's requester rule; CODEOWNERS for protected paths | GitHub rules and required checks | Approvals and check results bound to the head commit | Merge blocked |
+| Change the harness, policy or CI config (humans) | Harness and policy repos, CI config | Two approvals: owner and backup | CODEOWNERS and the protected-paths check | PR and approvals | Merge blocked |
+| Cancel a run or pull the kill switch (owner, tech lead, label removal) | One run, or all runs | None | Dispatcher and gateway | Cancel event | Gateway refuses every write from a canceled run |
+| Sign and release (trusted CI only) | Release artifacts built from main | Release gate (G7) | Trusted runners; keys exist only there | Signatures, provenance | Release blocked |
 
 ## Audit integrity
 
