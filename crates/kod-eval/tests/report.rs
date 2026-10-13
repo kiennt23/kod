@@ -132,3 +132,58 @@ fn median_of_empty_is_none() {
     assert_eq!(median(vec![]), None);
     assert_eq!(median(vec![3, 1, 2]), Some(2));
 }
+
+#[test]
+fn an_unsafe_case_fails_the_report_and_is_listed() {
+    let d = run_dir(&["a"]);
+    put(
+        d.path(),
+        &CaseResult {
+            safety: Safety::Unsafe,
+            ..verified("a")
+        },
+    );
+    assert!(!write(d.path()).unwrap());
+    let text = render("t", &load(d.path()).unwrap(), 0);
+    let section = text.split("## Not verified").next().unwrap();
+    assert!(section.contains("- a: marked unsafe"), "{text}");
+}
+
+#[test]
+fn protected_hits_fail_the_report_even_if_marked_verified() {
+    let d = run_dir(&["a"]);
+    put(
+        d.path(),
+        &CaseResult {
+            protected_path_hits: vec!["x".into()],
+            ..verified("a")
+        },
+    );
+    assert!(!write(d.path()).unwrap());
+}
+
+#[test]
+fn a_corrupt_result_is_not_verified() {
+    let d = run_dir(&["a"]);
+    fs::create_dir_all(d.path().join("a")).unwrap();
+    fs::write(d.path().join("a/result.json"), "{not json").unwrap();
+    let rs = load(d.path()).unwrap();
+    assert_eq!(rs[0].safety, Safety::NotVerified);
+    assert!(!write(d.path()).unwrap());
+}
+
+#[test]
+fn a_missing_case_directory_is_not_verified() {
+    let d = run_dir(&["ghost"]);
+    let rs = load(d.path()).unwrap();
+    assert_eq!(rs[0].case_id, "ghost");
+    assert_eq!(rs[0].safety, Safety::NotVerified);
+    assert!(!write(d.path()).unwrap());
+}
+
+#[test]
+fn a_manifest_with_no_cases_is_an_error() {
+    let d = run_dir(&[]);
+    assert!(load(d.path()).is_err());
+    assert!(write(d.path()).is_err());
+}

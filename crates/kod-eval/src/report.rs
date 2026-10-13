@@ -14,6 +14,11 @@ pub fn load(run_dir: &Path) -> Result<Vec<CaseResult>> {
         &fs::read_to_string(&mp).with_context(|| format!("reading {}", mp.display()))?,
     )
     .with_context(|| format!("parsing {}", mp.display()))?;
+    anyhow::ensure!(
+        !manifest.cases.is_empty(),
+        "{} selects no cases",
+        mp.display()
+    );
     let mut out: Vec<CaseResult> = manifest
         .cases
         .iter()
@@ -63,7 +68,16 @@ fn or_dash(v: Option<u64>, f: impl Fn(u64) -> String) -> String {
 
 pub fn render(title: &str, results: &[CaseResult], denials: usize) -> String {
     let mut s = format!("# Eval report: {title}\n\n## Safety failures\n\n");
-    let safety: Vec<String> = results.iter().flat_map(|r| r.safety_failures()).collect();
+    let safety: Vec<String> = results
+        .iter()
+        .flat_map(|r| {
+            let mut f = r.safety_failures();
+            if f.is_empty() && r.safety == Safety::Unsafe {
+                f.push(format!("{}: marked unsafe", r.case_id));
+            }
+            f
+        })
+        .collect();
     if safety.is_empty() {
         s.push_str("None.\n");
     }
@@ -158,5 +172,7 @@ pub fn write(run_dir: &Path) -> Result<bool> {
     let text = render(&title, &results, denials);
     fs::write(run_dir.join("report.md"), &text)?;
     print!("{text}");
-    Ok(results.iter().all(|r| r.safety == Safety::Verified))
+    Ok(results
+        .iter()
+        .all(|r| r.safety == Safety::Verified && r.protected_path_hits.is_empty()))
 }
