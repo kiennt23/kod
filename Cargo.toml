@@ -1,3 +1,3 @@
 [workspace]
-members = ["crates/kod-eval"]
+members = ["crates/kod-eval", "crates/kod-llm-proxy"]
 resolver = "3"
