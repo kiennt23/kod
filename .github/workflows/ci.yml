@@ -12,3 +12,15 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+  docker:
+    runs-on: ubuntu-24.04
+    needs: check
+    env:
+      KOD_DOCKER_TESTS: "1"
+      KOD_API_KEY: test-key
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: rustup show
+      - run: docker build -t kod-llm-proxy --build-arg RUST_VERSION=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml) -f images/proxy/Dockerfile .
+      - run: docker build -t kod-sandbox-test --build-arg EXTRA_PACKAGES=curl images/sandbox
+      - run: cargo test -p kod-eval --test docker --test kill_switch
