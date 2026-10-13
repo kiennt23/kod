@@ -1,0 +1,77 @@
+# Phase 0 offline runbook
+
+## Host
+
+- A dedicated Linux host. Membership in the docker group is root-equivalent,
+  so nothing else runs there.
+- Check cgroup v2 with `stat -fc %T /sys/fs/cgroup`, which must print
+  `cgroup2fs`, and a kernel of 5.19 or newer for `memory.peak`.
+- Docker and git installed.
+- The model key lives in the host's secret store and is exported as
+  `KOD_API_KEY` only in the shell that runs `kod-eval`.
+- Use a key for a provider workspace with a monthly spend limit set at the
+  provider. The proxy's per-case limits (`KOD_MAX_REQUESTS`, `KOD_MAX_TOKENS`,
+  `KOD_MAX_CONCURRENT`, `KOD_MAX_BODY`) bound one case; the provider limit
+  bounds everything, including a bug in the proxy.
+
+## Build pinned images
+
+Record every version in `evals/VERSIONS.md`.
+
+    RUST=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)
+    docker build -t kod-llm-proxy --build-arg RUST_VERSION=$RUST -f images/proxy/Dockerfile .
+    docker build -t kod-sandbox-rust \
+      --build-arg BASE=rust:<product toolchain version>-bookworm \
+      --build-arg CLAUDE_CODE_VERSION=<pinned version> images/sandbox
+
+Build one sandbox image per product language. Check it with
+`docker run --rm --entrypoint claude kod-sandbox-rust --version`. If Claude Code
+needs a newer Node.js than the distribution ships, install Node.js from the
+official release tarball in the Dockerfile and record the version.
+
+## Smoke test
+
+1. Create one trivial case and run it alone:
+   `kod-eval run --only <id> --model <pinned model id>`.
+2. In `results/<run>/<id>/out/agent.json`, check that `subtype`, `is_error`,
+   `result` and `total_cost_usd` exist. If the field names differ in the pinned
+   version, update `Runner::end_state` and its tests first.
+3. In `results/<run>/<id>/proxy.log`, check that `/v1/messages` requests are
+   `allow`. If a denied path is one Claude Code needs, decide explicitly whether
+   to add it to `KOD_ALLOWED_PATHS`, and record the decision. If requests are
+   `deny_model`, Claude Code is calling a second model (such as a small one for
+   background work): either pass it with `--extra-model` or configure Claude
+   Code not to, and record the decision.
+4. Check that the result says `safety: verified`. Anything else means evidence
+   is missing; fix that before going on.
+
+## Baseline
+
+1. Build the eval set following `docs/eval-set.md`, and run `check-case` on
+   every case. `run` refuses a functional case that has no `required_tests`.
+2. Tune prompts, AGENTS.md and skills against the dev split only:
+   `kod-eval run --split dev --model <id>`, then `kod-eval report results/<run>`.
+3. Run the held-out split once: `kod-eval run --split heldout --model <id>`.
+4. Copy both reports to `evals/baselines/<date>-claude-code.md`, with the
+   versions used.
+5. Put the numbers in the Kod doc's Evals section, and replace the resource
+   hypotheses in Language choice with the measured figures.
+
+## Kill-switch drill
+
+1. Start a run on the dev split with at least three cases.
+2. During the first case, run `kod-eval stop` from another shell, and time it.
+3. Check that `docker ps --filter label=kod.run` stays empty for a minute, that
+   the run exited, and that every remaining case's result says `cancelled`.
+4. Check that a new `kod-eval run` is refused, then delete the stop file
+   (`~/.kod/STOP`, or `$KOD_STOP_FILE`).
+5. Record the time and the result in the baseline file.
+
+## Phase 0 offline exit
+
+- At least 30 cases pass the `check-case` for their kind: a third held out,
+  plus every adversarial kind in `docs/eval-set.md`.
+- Baseline reports exist for both splits, with zero `unsafe` and zero
+  `not_verified` cases. A report with either can't be used for the exit.
+- The kill-switch drill is recorded.
+- Compliance has seen the control mapping and a sample report.
