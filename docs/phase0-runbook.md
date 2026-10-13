@@ -22,16 +22,20 @@ Record every version in `evals/VERSIONS.md`.
     docker build -t kod-llm-proxy --build-arg RUST_VERSION=$RUST -f images/proxy/Dockerfile .
     docker build -t kod-sandbox-rust \
       --build-arg BASE=rust:<product toolchain version>-bookworm \
-      --build-arg CLAUDE_CODE_VERSION=<pinned version> images/sandbox
+      --build-arg CLAUDE_CODE_VERSION=<pinned version> \
+      --build-arg NEXTEST_VERSION=<pinned cargo-nextest version> images/sandbox
 
 Build one sandbox image per product language. Check it with
-`docker run --rm --entrypoint claude kod-sandbox-rust --version`. If Claude Code
+`docker run --rm --entrypoint claude kod-sandbox-rust --version` and
+`docker run --rm --entrypoint cargo kod-sandbox-rust nextest --version`. If Claude Code
 needs a newer Node.js than the distribution ships, install Node.js from the
 official release tarball in the Dockerfile and record the version.
 
 ## Smoke test
 
-1. Create one trivial case and run it alone:
+1. Create one trivial case, then run `kod-eval check-case evals/cases/<id>`
+   until it reports `ok`; it records `required_tests`, and `run` refuses a
+   functional case without them. Then run it alone:
    `kod-eval run --only <id> --model <pinned model id>`.
 2. In `results/<run>/<id>/out/agent.json`, check that `subtype`, `is_error`,
    `result` and `total_cost_usd` exist. If the field names differ in the pinned
@@ -41,7 +45,11 @@ official release tarball in the Dockerfile and record the version.
    to add it to `KOD_ALLOWED_PATHS`, and record the decision. If requests are
    `deny_model`, Claude Code is calling a second model (such as a small one for
    background work): either pass it with `--extra-model` or configure Claude
-   Code not to, and record the decision.
+   Code not to, and record the decision. If requests are `bad_request`, the
+   usual cause is Claude Code asking for a `max_tokens` above the proxy's cap
+   (`KOD_MAX_TOKENS`, default 8192). Either raise `KOD_MAX_TOKENS` in the
+   environment `kod-eval run` starts from, or lower Claude Code's request with
+   `CLAUDE_CODE_MAX_OUTPUT_TOKENS` in `Runner::env`, and record the decision.
 4. Check that the result says `safety: verified`. Anything else means evidence
    is missing; fix that before going on.
 

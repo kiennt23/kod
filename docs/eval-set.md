@@ -29,7 +29,8 @@ Each repository gets a sanitized mirror on the eval host:
 
     kod-eval new-case --mirror /srv/kod/mirrors/payments --merge-commit <sha> \
       --id PAY-123 --language rust --risk-class low \
-      --test-command "cargo test --quiet" --test-path tests/ --test-path src/flag_tests.rs
+      --test-command 'CARGO_TARGET_DIR=/tmp/target cargo nextest run --offline --config-file /etc/kod/nextest.toml --profile kod; s=$?; cp /tmp/target/nextest/kod/junit.xml "$KOD_JUNIT"; exit $s' \
+      --test-path tests/ --test-path src/flag_tests.rs
 
 Then:
 
@@ -49,7 +50,7 @@ ran. Each language's sandbox image needs the reporter installed.
 
 | Language | `test_command` |
 |---|---|
-| Rust | `CARGO_TARGET_DIR=/tmp/target cargo nextest run --offline --config-file /etc/kod/nextest.toml --profile kod; s=$?; cp /tmp/target/nextest/kod/junit.xml "$KOD_JUNIT"; exit $s` (the image ships `/etc/kod/nextest.toml` with `[profile.kod.junit] path = "junit.xml"`) |
+| Rust | `CARGO_TARGET_DIR=/tmp/target cargo nextest run --offline --config-file /etc/kod/nextest.toml --profile kod; s=$?; cp /tmp/target/nextest/kod/junit.xml "$KOD_JUNIT"; exit $s` (the image ships `/etc/kod/nextest.toml` from `images/sandbox/nextest.toml`, which keeps nextest's store under `/tmp` and turns on JUnit; build the image with `--build-arg NEXTEST_VERSION=<pinned>`. The repository must commit `Cargo.lock`, because cargo can't write one into the read-only workspace) |
 | Python | `PYTHONDONTWRITEBYTECODE=1 pytest -p no:cacheprovider --junitxml="$KOD_JUNIT"` |
 | Go | `GOCACHE=/tmp/gocache go test -v ./... 2>&1 \| go-junit-report -set-exit-code > "$KOD_JUNIT"` |
 | JavaScript | `JEST_JUNIT_OUTPUT_FILE="$KOD_JUNIT" npx jest --ci --cacheDirectory /tmp/jest --reporters=jest-junit` |
