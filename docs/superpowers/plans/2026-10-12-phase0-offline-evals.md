@@ -14,7 +14,7 @@
 
 ## Execution
 
-Rule: a task gets its own review if it owns a safety guarantee or a Review Focus test. A silent mistake there makes the baseline look clean when it isn't. Everything else runs natively.
+Decision record: [ADR 0001](../../adr/0001-per-task-execution-mode.md). Rule: a task gets its own review if it owns a safety guarantee or a Review Focus test. A silent mistake there makes the baseline look clean when it isn't. Everything else runs natively.
 
 | Task | Mode | Why |
 |---|---|---|
