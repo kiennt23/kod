@@ -123,4 +123,10 @@ fn check_case_by_kind() {
         "{:?}",
         weak.problems
     );
+    assert!(
+        tmp.path()
+            .join("check-good/with-fix/score_out/score_exit")
+            .exists(),
+        "the weak run must have run"
+    );
 }

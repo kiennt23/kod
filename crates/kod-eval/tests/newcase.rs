@@ -85,3 +85,55 @@ fn creates_a_case_from_a_merged_change() {
         "no test changes under docs/"
     );
 }
+
+#[test]
+fn check_case_reports_scoring_that_did_not_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let m = tmp.path().join("mirror");
+    fs::create_dir_all(&m).unwrap();
+    git(&m, &["init", "-q"]).unwrap();
+    fs::write(m.join("src.txt"), "v1\n").unwrap();
+    commit(&m, "base");
+    fs::write(m.join("src.txt"), "v2\n").unwrap();
+    fs::write(m.join("t.txt"), "t\n").unwrap();
+    let merge = commit(&m, "merge");
+    let cases = tmp.path().join("cases");
+    let dir = new_case(&spec(&m, &merge, &["t.txt"]), &cases).unwrap();
+    let toml = fs::read_to_string(dir.join("case.toml")).unwrap();
+    fs::write(
+        dir.join("case.toml"),
+        toml.replace("ticket = \"\"\"\n\"\"\"", "ticket = \"x\""),
+    )
+    .unwrap();
+    // A held-back patch that can't apply stops scoring before any container starts.
+    fs::write(
+        dir.join("heldout.patch"),
+        "diff --git a/nope.txt b/nope.txt\n--- a/nope.txt\n+++ b/nope.txt\n@@ -1 +1 @@\n-a\n+b\n",
+    )
+    .unwrap();
+    let c = load_case(&dir).unwrap();
+    let check = kod_eval::newcase::check_case(
+        &c,
+        "kod-sandbox",
+        &tmp.path().join("out"),
+        &tmp.path().join("STOP"),
+    )
+    .unwrap();
+    assert!(
+        check
+            .problems
+            .iter()
+            .any(|p| p.contains("did not run for without fix")),
+        "{:?}",
+        check.problems
+    );
+    assert!(
+        check
+            .problems
+            .iter()
+            .any(|p| p.contains("did not run for with fix")),
+        "{:?}",
+        check.problems
+    );
+    assert!(check.required_tests.is_empty());
+}

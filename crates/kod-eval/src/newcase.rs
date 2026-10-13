@@ -186,6 +186,20 @@ pub fn check_case(
         bail!("the kill switch was turned on during check-case");
     }
 
+    for (label, sc) in [("without", &without), ("with", &with)] {
+        if !sc.ran {
+            problems.push(format!(
+                "scoring did not run for {label} fix; see {}",
+                dir.join(format!("{label}-fix/score_out")).display()
+            ));
+        }
+    }
+    if !problems.is_empty() {
+        return Ok(Check {
+            problems,
+            required_tests: vec![],
+        });
+    }
     let log = dir.join("with-fix/score_out/score.log");
     if !with.exit_ok {
         problems.push(format!(

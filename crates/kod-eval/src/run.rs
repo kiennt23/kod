@@ -44,6 +44,8 @@ pub struct Score {
     /// The kill switch stopped scoring; nothing else in this score counts.
     pub stopped: bool,
     pub exit_ok: bool,
+    /// The score container wrote its exit status, so the test command ran.
+    pub ran: bool,
     /// Every test in the JUnit report, as (`classname::name`, passed).
     pub tests: Vec<(String, bool)>,
     /// Required tests that didn't run or didn't pass.
@@ -91,6 +93,12 @@ fn stopped(s: &Settings) -> bool {
 }
 
 /// Empties a directory left by an earlier run, so no old evidence survives.
+fn unique() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos())
+}
+
 fn fresh_dir(d: &Path) -> Result<()> {
     match fs::remove_dir_all(d) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
@@ -395,6 +403,10 @@ fn run_case(
         r.tests_passed = Some(sc.passed);
         r.tests_missing = sc.missing;
         r.score_wall_ms = Some(sc.wall_ms);
+        if !sc.ran {
+            r.notes
+                .push("scoring did not run: the score container wrote no exit status".into());
+        }
         r.notes.extend(sc.notes);
     }
     Ok(r)
@@ -465,13 +477,8 @@ pub fn score(
     patch: Option<&Path>,
     stop_file: &Path,
 ) -> Result<Score> {
-    let (work, out, tmp) = (
-        dir.join("score_work"),
-        dir.join("score_out"),
-        dir.join("score_tmp"),
-    );
+    let (work, out) = (dir.join("score_work"), dir.join("score_out"));
     fresh_dir(&out)?;
-    fresh_dir(&tmp)?;
     let _ = fs::remove_dir_all(&work);
     let base = workspace::prepare(&case.repo, &case.base_commit, &work)?;
     let fail = |note: String| {
@@ -480,6 +487,7 @@ pub fn score(
             passed: false,
             stopped: false,
             exit_ok: false,
+            ran: false,
             tests: vec![],
             missing: case.required_tests.clone(),
             wall_ms: 0,
@@ -496,10 +504,18 @@ pub fn score(
     }
     let name = format!("kod-score-{run_id}-{}", case.id);
     let env = [("KOD_TEST_COMMAND".to_owned(), case.test_command.clone())];
+    // Mount directories that have never been mounted before, then move the
+    // output into place. Docker on OrbStack can't create files in a mounted
+    // directory whose path once held files deleted from the host; check-case
+    // reruns hit that: "cannot create /out/score.log".
+    let stage = dir.join(format!("score_run_{}", unique()));
+    let (mout, tmp) = (stage.join("out"), stage.join("tmp"));
+    fs::create_dir_all(&mout)?;
+    fs::create_dir_all(&tmp)?;
     let mounts = Mounts {
         work: &work,
         work_read_only: true,
-        out: &out,
+        out: &mout,
         input: None,
         scratch: Some(&tmp),
     };
@@ -515,13 +531,16 @@ pub fn score(
     )?;
     let wall_ms = started.elapsed().as_millis() as u64;
     let _ = fs::remove_dir_all(&work);
-    let _ = fs::remove_dir_all(&tmp);
+    fs::remove_dir_all(&out)?;
+    fs::rename(&mout, &out)?;
+    let _ = fs::remove_dir_all(&stage);
     let stopped = launched == Launch::Stopped;
     let timed_out = launched == Launch::TimedOut;
     let mut notes = vec![];
     if timed_out {
         notes.push("tests timed out".into());
     }
+    let ran = out.join("score_exit").exists();
     let exit_ok =
         !timed_out && fs::read_to_string(out.join("score_exit")).is_ok_and(|t| t.trim() == "0");
     let tests = match fs::read_to_string(out.join("junit.xml"))
@@ -545,6 +564,7 @@ pub fn score(
         passed,
         stopped,
         exit_ok,
+        ran,
         tests,
         missing,
         wall_ms,
