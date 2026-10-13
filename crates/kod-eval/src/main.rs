@@ -1,6 +1,6 @@
 use anyhow::{Result, bail};
 use clap::Parser;
-use kod_eval::{case, report, run, runner::Runner};
+use kod_eval::{case, newcase, report, run, runner::Runner};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -10,6 +10,34 @@ use std::path::PathBuf;
 )]
 #[allow(clippy::large_enum_variant)] // parsed once at startup
 enum Cli {
+    /// Create a case from a merged change
+    NewCase {
+        #[arg(long)]
+        mirror: PathBuf,
+        #[arg(long)]
+        merge_commit: String,
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        language: String,
+        #[arg(long)]
+        risk_class: String,
+        #[arg(long)]
+        test_command: String,
+        /// A path holding the change's tests; repeat for several
+        #[arg(long = "test-path", required = true)]
+        test_paths: Vec<String>,
+        #[arg(long, default_value = "evals/cases")]
+        cases: PathBuf,
+    },
+    /// Check a case by its kind, and record a functional case's required tests
+    CheckCase {
+        case_dir: PathBuf,
+        #[arg(long, default_value = "kod-sandbox")]
+        image_prefix: String,
+        #[arg(long, default_value = "results")]
+        out: PathBuf,
+    },
     /// Run eval cases and score them
     Run {
         #[arg(long, default_value = "evals/cases")]
@@ -91,6 +119,60 @@ fn main() -> Result<()> {
             };
             let dir = run::run_all(&cases, &runner, &settings)?;
             println!("results: {}", dir.display());
+        }
+        Cli::NewCase {
+            mirror,
+            merge_commit,
+            id,
+            language,
+            risk_class,
+            test_command,
+            test_paths,
+            cases,
+        } => {
+            let n = newcase::NewCase {
+                mirror,
+                merge_commit,
+                id,
+                language,
+                risk_class,
+                test_command,
+                test_paths,
+            };
+            let dir = newcase::new_case(&n, &cases)?;
+            println!(
+                "created {}: paste the ticket into case.toml, then run check-case",
+                dir.display()
+            );
+        }
+        Cli::CheckCase {
+            case_dir,
+            image_prefix,
+            out,
+        } => {
+            let c = case::load_case(&case_dir)?;
+            let check = newcase::check_case(
+                &c,
+                &image_prefix,
+                &out.join(format!("check-{}", c.id)),
+                &run::default_stop_file(),
+            )?;
+            if !check.problems.is_empty() {
+                for p in &check.problems {
+                    eprintln!("{}: {p}", c.id);
+                }
+                std::process::exit(1);
+            }
+            if c.expected_end_state == case::EndState::Done {
+                newcase::set_required_tests(&case_dir, &check.required_tests)?;
+                println!(
+                    "{}: ok, required tests: {}",
+                    c.id,
+                    check.required_tests.join(", ")
+                );
+            } else {
+                println!("{}: ok", c.id);
+            }
         }
         Cli::Stop => run::stop(&run::default_stop_file())?,
         Cli::Report { run_dir } => {

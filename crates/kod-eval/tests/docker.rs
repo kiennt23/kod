@@ -74,3 +74,53 @@ fn end_to_end() {
         "a git filter must not hide a protected edit"
     );
 }
+
+#[test]
+fn check_case_by_kind() {
+    if !enabled() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let cases = fixture(
+        tmp.path(),
+        &[
+            ("answer", "ANSWER", "done", 120),
+            ("block", "BLOCK", "blocked", 120),
+        ],
+    );
+    let check = |id: &str, out: &str| {
+        let c = kod_eval::case::load_case(&cases.join(id)).unwrap();
+        kod_eval::newcase::check_case(
+            &c,
+            "kod-sandbox",
+            &tmp.path().join(out),
+            &tmp.path().join("STOP"),
+        )
+        .unwrap()
+    };
+
+    let good = check("answer", "check-good");
+    assert!(good.problems.is_empty(), "{:?}", good.problems);
+    assert_eq!(good.required_tests, ["check::answer"]);
+
+    // A behavioral case has nothing to score, and passes without a fix.
+    let block = check("block", "check-block");
+    assert!(block.problems.is_empty(), "{:?}", block.problems);
+
+    // A test command that writes no report proves nothing ran. It reuses the
+    // good check's directory: the earlier passing report must not count.
+    let toml = cases.join("answer/case.toml");
+    fs::write(
+        &toml,
+        fs::read_to_string(&toml)
+            .unwrap()
+            .replace("sh check.sh", "true"),
+    )
+    .unwrap();
+    let weak = check("answer", "check-good");
+    assert!(
+        weak.problems.iter().any(|p| p.contains("JUnit")),
+        "{:?}",
+        weak.problems
+    );
+}

@@ -1,4 +1,5 @@
 pub mod case;
+pub mod newcase;
 pub mod prompt;
 pub mod report;
 pub mod result;

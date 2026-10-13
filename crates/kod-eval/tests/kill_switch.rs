@@ -87,5 +87,14 @@ fn stopping_during_the_first_case_means_the_second_never_starts() {
         run_all(&cases, &runner, &s).is_err(),
         "runs are refused while the stop file exists"
     );
-    // check-case's refusal is tested once Task 7 adds newcase::check_case.
+    let check = kod_eval::newcase::check_case(
+        &cases[1],
+        "kod-sandbox",
+        &tmp.path().join("check"),
+        &s.stop_file,
+    );
+    assert!(
+        check.is_err(),
+        "check-case must not start containers while the stop file exists"
+    );
 }
