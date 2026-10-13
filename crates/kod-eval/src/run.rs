@@ -146,12 +146,16 @@ pub fn run_all(cases: &[EvalCase], runner: &Runner, s: &Settings) -> Result<Path
             unchecked.join(", ")
         );
     }
+    // Seconds plus pid, and `create_dir` fails if it exists, so no run can
+    // overwrite an earlier one.
     let id = format!(
-        "run-{}",
-        SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()
+        "run-{}-{}",
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+        std::process::id()
     );
     let dir = s.out_root.join(&id);
-    fs::create_dir_all(&dir)?;
+    fs::create_dir_all(&s.out_root)?;
+    fs::create_dir(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let dir = dir.canonicalize()?;
     let manifest = Manifest {
         run_id: id.clone(),

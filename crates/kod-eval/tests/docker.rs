@@ -54,6 +54,10 @@ fn end_to_end() {
         !egress.contains("leaked.txt"),
         "the sandbox reached the internet"
     );
+    assert!(
+        diff(&dir, "tamper").contains("build.sh"),
+        "the tampering script must reach scoring"
+    );
     assert_eq!(
         r("tamper").tests_passed,
         Some(false),

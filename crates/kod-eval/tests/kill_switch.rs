@@ -54,8 +54,14 @@ fn stopping_during_the_first_case_means_the_second_never_starts() {
         wait_for_agent();
         stop(&stop_file).unwrap();
     });
+    let started = std::time::Instant::now();
     let dir = run_all(&cases, &runner, &s).unwrap();
+    let elapsed = started.elapsed();
     killer.join().unwrap();
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "the running agent was not killed: run took {elapsed:?}"
+    );
 
     let first = result(&dir, "a-stopme");
     assert!(
