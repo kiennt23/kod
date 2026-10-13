@@ -1,6 +1,6 @@
 # Phase 0 (Offline) Eval Harness Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** execution mode is set per task in **Execution** below. *Subagent + review* tasks use superpowers:subagent-driven-development (fresh implementer, then a fresh reviewer before the next task starts). *Native* tasks use superpowers:executing-plans in the orchestrating session. Every mode ends with one whole-branch review. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Run Claude Code headless in a locked-down sandbox on our own hosts against eval cases built from our past tickets, score it with held-back tests, and produce the baseline that our own Rust loop must match in phase 1.
 
@@ -11,6 +11,23 @@
 **Spec:** `docs/kod-harness-design.md`, mainly "Roadmap → 0 · Prove it (offline)", "Evals and metrics", "Agent portability" (runner adapter contract and conformance checklist), "Trust boundaries", "Language choice" and "Security model".
 
 **Out of scope (later plans):** the connected pilot (gateway publish operation, audit store, merge checks, GitHub rules, identity revocation), our own Rust agent loop (phase 1), the Codex runner, and running cases concurrently.
+
+## Execution
+
+Rule: a task gets its own review if it owns a safety guarantee or a Review Focus test. A silent mistake there makes the baseline look clean when it isn't. Everything else runs natively.
+
+| Task | Mode | Why |
+|---|---|---|
+| 1. Workspace, CI, case format | Native | Scaffolding and schema; mistakes surface in every later task's tests. |
+| 2. Model proxy | Subagent + review | Holds the model key and enforces spend limits. |
+| 3. Prompt, runners, sandbox, image | Subagent + review | Container isolation, read-only scoring, trusted diff collector, ticket escaping. |
+| 4. Workspaces and held-back tests | Subagent + review | No history, held-back test replacement, symlink escape. |
+| 5. Results, run loop, kill switch | Subagent + review | Kill switch, safety tri-state, per-case proxy, scoring. |
+| 6. Report | Subagent + review | Missing evidence must never report clean. |
+| 7. Case authoring and check-case | Subagent + review | Decides which tests a pass requires. |
+| 8. Runbook, baseline, drill | Native | Docs and human-run procedures; the owner checks the results. |
+
+A task can move to the stricter mode at any point; it never moves to the lighter one without the owner agreeing.
 
 ## Global Constraints
 
