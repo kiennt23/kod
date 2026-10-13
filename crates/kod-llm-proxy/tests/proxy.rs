@@ -215,3 +215,44 @@ async fn limits_concurrent_requests() {
 async fn post_msg_owned(p: String) -> u16 {
     post_msg(&p, msg(MODEL, 10)).await.status().as_u16()
 }
+
+/// The client holds the key, so it must not follow a redirect to another host.
+#[tokio::test]
+async fn does_not_follow_upstream_redirects() {
+    let stolen = Arc::new(AtomicUsize::new(0));
+    let seen = stolen.clone();
+    let thief = serve(Router::new().fallback(move || {
+        seen.fetch_add(1, Ordering::SeqCst);
+        async { "stolen" }
+    }))
+    .await;
+    let upstream = serve(Router::new().route(
+        "/v1/messages",
+        post(move || async move {
+            (
+                axum::http::StatusCode::TEMPORARY_REDIRECT,
+                [("location", format!("{thief}/steal"))],
+            )
+        }),
+    ))
+    .await;
+    let p = serve(app(Config {
+        upstream,
+        api_key: "real-key".parse().unwrap(),
+        allowed_paths: vec!["/v1/messages".into()],
+        limits: limits(),
+    }))
+    .await;
+    // The test's own client must not follow it either, or it would reach the thief.
+    let res = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap()
+        .post(format!("{p}/v1/messages"))
+        .body(msg(MODEL, 100))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 307);
+    assert_eq!(stolen.load(Ordering::SeqCst), 0);
+}

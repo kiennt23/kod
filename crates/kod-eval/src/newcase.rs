@@ -111,6 +111,8 @@ pub fn check_case(
         );
     }
     fs::create_dir_all(dir)?;
+    // Docker treats a relative -v source as a volume name.
+    let dir = &dir.canonicalize()?;
     let mut problems = Vec::new();
     if case.expected_end_state != EndState::Done {
         if git(

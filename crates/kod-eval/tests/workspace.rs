@@ -1,3 +1,5 @@
+mod common;
+use kod_eval::case::load_case;
 use kod_eval::workspace::{
     apply, apply_heldout, extract, git, patch_paths, prepare, protected_hits,
 };
@@ -170,4 +172,32 @@ fn protected_paths_match_directories_and_exact_files() {
     let paths = ["auth/login.rs", "author.rs", "Cargo.lock"].map(String::from);
     let hits = protected_hits(&paths, &["auth/".into(), "Cargo.lock".into()]);
     assert_eq!(hits, ["auth/login.rs", "Cargo.lock"]);
+}
+
+/// `--cases evals/cases` and `--out results` are relative. git resolves a
+/// relative patch path against `-C <dir>`, not our working directory.
+#[test]
+fn relative_case_and_patch_paths_work() {
+    // Relative to the crate directory, where cargo runs integration tests.
+    let tmp = tempfile::tempdir_in(".").unwrap();
+    let rel = Path::new(tmp.path().file_name().unwrap());
+    let (m, base, merge) = mirror(rel);
+    let dir = rel.join("cases/PAY-1");
+    fs::create_dir_all(&dir).unwrap();
+    fs::rename(heldout(rel, &m, &base, &merge), dir.join("heldout.patch")).unwrap();
+    fs::write(
+        dir.join("case.toml"),
+        common::case_toml("PAY-1").replace(common::SHA, &base),
+    )
+    .unwrap();
+    let w = rel.join("w");
+    let b = prepare(&m, &base, &w).unwrap();
+    let mut paths = patch_paths(&w, &dir.join("heldout.patch")).unwrap();
+    paths.sort();
+    assert_eq!(paths, ["tests/new.sh", "tests/old.sh"]);
+    let case = load_case(&dir).unwrap();
+    assert!(case.dir.is_absolute());
+    apply_heldout(&w, &b, &case.heldout_patch()).unwrap();
+    assert_eq!(read(w.join("tests/new.sh")), "new\n");
+    apply(&w, &dir.join("heldout.patch")).unwrap_err(); // already applied, so it must refuse
 }

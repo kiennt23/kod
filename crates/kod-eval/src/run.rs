@@ -215,12 +215,10 @@ fn cancelled(case: &EvalCase, why: &str) -> CaseResult {
     }
 }
 
-/// One proxy per case, so the request budget and the log are per case.
-/// Returns false if the kill switch is on.
-fn start_proxy(name: &str, run_id: &str, net: &str, runner: &Runner, s: &Settings) -> Result<bool> {
-    let models = [vec![runner.model().to_owned()], s.extra_models.clone()]
-        .concat()
-        .join(",");
+/// `docker run` arguments for a case's proxy. The key is passed by name, so
+/// it never appears on a command line. Unset settings fall back to the
+/// proxy's defaults.
+pub fn proxy_args(name: &str, run_id: &str, models: &str, image: &str) -> Vec<String> {
     let mut args = sv(&[
         "run",
         "-d",
@@ -229,10 +227,9 @@ fn start_proxy(name: &str, run_id: &str, net: &str, runner: &Runner, s: &Setting
         "--label",
         &format!("kod.run={run_id}"),
     ]);
-    // The key is passed by name, so it never appears on a command line. Unset
-    // limits fall back to the proxy's defaults.
     for k in [
         "KOD_API_KEY",
+        "KOD_ALLOWED_PATHS",
         "KOD_MAX_TOKENS",
         "KOD_MAX_BODY",
         "KOD_MAX_REQUESTS",
@@ -243,8 +240,18 @@ fn start_proxy(name: &str, run_id: &str, net: &str, runner: &Runner, s: &Setting
     args.extend([
         "-e".into(),
         format!("KOD_ALLOWED_MODELS={models}"),
-        s.proxy_image.clone(),
+        image.to_owned(),
     ]);
+    args
+}
+
+/// One proxy per case, so the request budget and the log are per case.
+/// Returns false if the kill switch is on.
+fn start_proxy(name: &str, run_id: &str, net: &str, runner: &Runner, s: &Settings) -> Result<bool> {
+    let models = [vec![runner.model().to_owned()], s.extra_models.clone()]
+        .concat()
+        .join(",");
+    let args = proxy_args(name, run_id, &models, &s.proxy_image);
     // The proxy runs detached, so `launch` can't watch it. Check on both
     // sides; if stop finished in between, the next launch sees the file and
     // the run's cleanup removes the proxy.

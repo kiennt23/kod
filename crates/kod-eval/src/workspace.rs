@@ -4,13 +4,19 @@ use anyhow::{Context, Result, bail};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+/// git that reads no global or system config and runs no hooks, so neither
+/// the host's config nor anything in a repository can make it run a program.
+fn host_git(dir: &Path) -> Command {
+    let mut c = Command::new("git");
+    c.env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .args(["-c", "core.hooksPath=/dev/null", "-C"])
+        .arg(dir);
+    c
+}
+
 pub fn git(dir: &Path, args: &[&str]) -> Result<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .context("running git")?;
+    let out = host_git(dir).args(args).output().context("running git")?;
     if !out.status.success() {
         bail!(
             "git {}: {}",
@@ -21,20 +27,20 @@ pub fn git(dir: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-fn utf8(p: &Path) -> Result<&str> {
-    p.to_str()
-        .with_context(|| format!("non-UTF-8 path {}", p.display()))
+/// An absolute patch path: git resolves a relative one against `-C <dir>`.
+fn patch_arg(p: &Path) -> Result<String> {
+    let abs = p
+        .canonicalize()
+        .with_context(|| format!("resolving {}", p.display()))?;
+    abs.into_os_string()
+        .into_string()
+        .map_err(|p| anyhow::anyhow!("non-UTF-8 path {}", Path::new(&p).display()))
 }
 
-/// A fresh repository holding only the tree at `commit`, with no history, so
-/// later commits (including the real fix) can't leak to the agent. Returns the
-/// SHA of its single commit.
 /// Writes the tree at `commit` into `dest`, with no git metadata.
 pub fn extract(mirror: &Path, commit: &str, dest: &Path) -> Result<()> {
     std::fs::create_dir_all(dest)?;
-    let mut archive = Command::new("git")
-        .arg("-C")
-        .arg(mirror)
+    let mut archive = host_git(mirror)
         .args(["archive", "--format=tar", commit])
         .stdout(Stdio::piped())
         .spawn()
@@ -51,6 +57,9 @@ pub fn extract(mirror: &Path, commit: &str, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+/// A fresh repository holding only the tree at `commit`, with no history, so
+/// later commits (including the real fix) can't leak to the agent. Returns the
+/// SHA of its single commit.
 pub fn prepare(mirror: &Path, commit: &str, dest: &Path) -> Result<String> {
     extract(mirror, commit, dest)?;
     git(dest, &["init", "-q"])?;
@@ -77,7 +86,7 @@ pub fn patch_paths(dir: &Path, patch: &Path) -> Result<Vec<String>> {
     if std::fs::metadata(patch)?.len() == 0 {
         return Ok(vec![]);
     }
-    let out = git(dir, &["apply", "--numstat", "-z", utf8(patch)?])?;
+    let out = git(dir, &["apply", "--numstat", "-z", &patch_arg(patch)?])?;
     let mut paths = Vec::new();
     let mut fields = out.split('\0');
     while let Some(record) = fields.next() {
@@ -101,7 +110,7 @@ pub fn apply(repo: &Path, patch: &Path) -> Result<()> {
     if std::fs::metadata(patch)?.len() == 0 {
         return Ok(());
     }
-    git(repo, &["apply", "--binary", utf8(patch)?]).map(|_| ())
+    git(repo, &["apply", "--binary", &patch_arg(patch)?]).map(|_| ())
 }
 
 /// Puts the held-back tests in place. Agent changes to those paths are

@@ -89,7 +89,10 @@ pub fn load_case(dir: &Path) -> Result<EvalCase> {
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     let mut case: EvalCase =
         toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-    case.dir = dir.to_path_buf();
+    // Absolute, so git and docker resolve it the same from any directory.
+    case.dir = dir
+        .canonicalize()
+        .with_context(|| format!("resolving {}", dir.display()))?;
     validate(&case)?;
     Ok(case)
 }

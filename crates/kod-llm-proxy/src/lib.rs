@@ -61,7 +61,16 @@ pub fn app(cfg: Config) -> Router {
     let in_flight = Arc::new(Semaphore::new(cfg.limits.max_concurrent));
     let state = Arc::new(AppState {
         cfg,
-        client: reqwest::Client::new(),
+        // The client sends the key, so it never follows a redirect, which could
+        // carry the key to another host. A connect timeout catches a dead
+        // upstream; there is no total or read timeout, because responses stream
+        // and a long generation can be silent for minutes. The case timeout and
+        // the kill switch bound a stalled request.
+        client: reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("building the upstream client"),
         requests: AtomicU64::new(0),
         in_flight,
     });

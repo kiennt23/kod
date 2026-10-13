@@ -30,7 +30,10 @@ fn loads_a_valid_case() {
     assert_eq!(c.split, Split::Dev);
     assert_eq!(c.base_commit, SHA);
     assert_eq!(c.expected_end_state, EndState::Done);
-    assert_eq!(c.heldout_patch(), d.join("heldout.patch"));
+    assert_eq!(
+        c.heldout_patch(),
+        d.canonicalize().unwrap().join("heldout.patch")
+    );
 }
 
 #[test]

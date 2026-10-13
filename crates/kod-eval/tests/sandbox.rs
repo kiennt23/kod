@@ -1,4 +1,5 @@
 mod common;
+use kod_eval::runner::Runner;
 use kod_eval::sandbox::{Mounts, image, run_args};
 use std::path::Path;
 
@@ -69,5 +70,64 @@ fn image_is_per_language() {
     assert_eq!(
         image(&common::case("PAY-1"), "kod-sandbox"),
         "kod-sandbox-rust"
+    );
+}
+
+/// The model key lives only in the proxy. Nothing in the agent, collect or
+/// score arguments may name it, the way `-e KOD_API_KEY` would pass it through.
+#[test]
+fn no_sandbox_container_gets_the_model_key() {
+    let c = common::case("PAY-1");
+    let runner = Runner::ClaudeCode {
+        model: "claude-test-1".into(),
+    };
+    let m = |work_read_only, input, scratch| Mounts {
+        work: Path::new("/r/w"),
+        work_read_only,
+        out: Path::new("/r/o"),
+        input,
+        scratch,
+    };
+    let agent = [
+        run_args(
+            "a",
+            "r",
+            &c,
+            "net",
+            &m(false, Some(Path::new("/r/in")), None),
+            (1, 1),
+            &runner.env(),
+        ),
+        runner.command(&c),
+    ]
+    .concat();
+    let collect = run_args(
+        "c",
+        "r",
+        &c,
+        "none",
+        &m(true, Some(Path::new("/r/b")), None),
+        (1, 1),
+        &[],
+    );
+    let score_env = [("KOD_TEST_COMMAND".to_owned(), c.test_command.clone())];
+    let score = run_args(
+        "s",
+        "r",
+        &c,
+        "none",
+        &m(true, None, Some(Path::new("/r/s"))),
+        (1, 1),
+        &score_env,
+    );
+    for args in [agent, collect, score] {
+        let a = args.join(" ");
+        assert!(!a.contains("KOD_API_KEY"), "{a}");
+    }
+    assert!(
+        runner
+            .env()
+            .contains(&("ANTHROPIC_API_KEY".into(), "sk-kod-dummy".into())),
+        "the agent gets a dummy key"
     );
 }
