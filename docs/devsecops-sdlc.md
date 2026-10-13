@@ -131,7 +131,7 @@ Each stage's outputs are the next stage's inputs and its gate's evidence: no out
 | Test | Test results, mutation score, changed-line coverage | Pipeline and test agent | JUnit and coverage reports | G6 |
 | Test | DAST and container scan reports | Pipeline | SARIF | G6, AppSec |
 | Test | Finding triage with evidence; exception requests | Test agent drafts; AppSec approves exceptions | Tracker, exception register | G6, risk owner |
-| Test | Policy decision | Policy engine (OPA) | Decision log | G7, auditors |
+| Test | Policy decision | Policy engine | Decision log | G7, auditors |
 | Release | Release notes and risk summary | Release agent | Change record | Release manager, users |
 | Release | Rollback plan | Release agent drafts; release manager approves | Change record | On-call |
 | Release | Change record with approvals | Pipeline, auto-filled | ITSM tool | G7, auditors |

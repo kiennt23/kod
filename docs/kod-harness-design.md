@@ -19,7 +19,7 @@ This doc designs a harness that lets an AI agent take a ticket and hand back a p
 | Regulated industry | Every control must leave audit evidence. Code may only go to a model endpoint in an approved region with zero data retention. Separation of duties is enforced by tooling, not by trust. |
 | Team of 6 | Everything is built and run in-house except models and other agent loops, so each in-house component must stay small and boring. Review capacity is the real bottleneck, so agent work in progress is capped to match it. |
 | PR delegation first | The pull request is the unit of work, handoff and evidence. |
-| IDE pairing later | Skills, hooks and tool config live in one package that both the PR runner and the IDE load. No second copy. |
+| IDE pairing later | AGENTS.md, skills and the gateway are shared by the PR runner and the IDE. No second copy. |
 | Low resource consumption | Every harness component we build is Rust. See *Language choice*. |
 | Scale out later | Keep the seams (gateway, policy, audit) as separate components now. Don't build multi-team features yet. |
 
@@ -418,7 +418,7 @@ Measure a baseline in phase 0 and set targets from it, not before.
 
 - **0 · Prove it.** Build a minimal sandbox runner on our own hosts and run Claude Code in it on one repo, producing draft PRs on low-risk tickets. Build the eval set, measure the baseline our own loop must match, practise the kill switch, and take the control mapping to compliance.
 - **1 · Team MVP.** Build our Rust agent loop, the dispatcher, both gateways, policy, the audit log, the gate runner and tracing. Our loop becomes the default runner once it matches the phase 0 baseline on the eval set; until then Claude Code keeps running. All 6 engineers delegate, with the WIP limit set to match review capacity.
-- **2 · IDE pairing.** Package skills, hooks and MCP config as one plugin that the IDE extension loads. IDE tool calls go through the same gateway and policy. Add the reviewer agent to PRs.
+- **2 · IDE pairing.** IDE agents read the same AGENTS.md and skills, and their tool calls go through the same gateway and policy. Hooks are per agent, so nothing relies on them. Add the reviewer agent to PRs.
 - **3 · Scale out.** Add per-team policy, budgets and self-service onboarding, with a platform team owning the harness. Only now does multi-team design work start.
 
 ## Risks
