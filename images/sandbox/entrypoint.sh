@@ -27,8 +27,11 @@ collect)
   export GIT_DIR=/tmp/collect.git GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null HOME=/nonexistent
   mkdir -p /tmp/base /tmp/work || fail mkdir
   # Every .git entry is dropped, so a nested repository can't hide its files.
-  (cd /in && tar --exclude=.git -cf - .) | (cd /tmp/base && tar -xf -) || fail "copy base"
-  (cd /work && tar --exclude=.git -cf - .) | (cd /tmp/work && tar -xf -) || fail "copy work"
+  # Each tar runs on its own so a failure in the creating side is caught.
+  (cd /in && tar --exclude=.git -cf /tmp/base.tar .) || fail "archive base"
+  (cd /tmp/base && tar -xf /tmp/base.tar) || fail "copy base"
+  (cd /work && tar --exclude=.git -cf /tmp/work.tar .) || fail "archive work"
+  (cd /tmp/work && tar -xf /tmp/work.tar) || fail "copy work"
   git init -q || fail init
   # info/attributes overrides any .gitattributes the agent wrote: no filters,
   # no line-ending conversion, always a text diff.
@@ -47,8 +50,7 @@ score)
   as_agent env KOD_JUNIT=/tmp/kod/junit.xml sh -c "$KOD_TEST_COMMAND" > /out/score.log 2>&1
   echo $? > /out/score_exit
   # Nothing the tests started may touch the report after this point.
-  pkill -KILL -u agent
-  while pgrep -u agent > /dev/null; do sleep 0.1; done
+  while pgrep -u agent > /dev/null; do pkill -KILL -u agent; sleep 0.1; done
   if [ -f /tmp/kod/junit.xml ] && [ ! -L /tmp/kod/junit.xml ]; then cp /tmp/kod/junit.xml /out/junit.xml; fi
   ;;
 *)
