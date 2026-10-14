@@ -38,12 +38,41 @@ pub fn load(run_dir: &Path) -> Result<Vec<CaseResult>> {
     Ok(out)
 }
 
-/// Every proxy event that refused a request.
-pub fn proxy_denials(log: &str) -> usize {
+fn proxy_events(log: &str) -> impl Iterator<Item = serde_json::Value> + '_ {
     log.lines()
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .filter(|v| v["event"].as_str().is_some_and(|e| e != "allow"))
+}
+
+/// Every proxy event that refused a request.
+pub fn proxy_denials(log: &str) -> usize {
+    proxy_events(log)
+        .filter(|v| {
+            v["event"]
+                .as_str()
+                .is_some_and(|e| e != "allow" && e != "usage")
+        })
         .count()
+}
+
+/// Input and output tokens summed over the proxy's usage lines (None when no
+/// line had a value), and how many usage lines lacked either count.
+pub fn proxy_tokens(log: &str) -> (Option<u64>, Option<u64>, usize) {
+    let (mut input, mut output, mut missing) = (None, None, 0);
+    for v in proxy_events(log).filter(|v| v["event"] == "usage") {
+        let (i, o) = (v["input_tokens"].as_u64(), v["output_tokens"].as_u64());
+        input = sum(input, i);
+        output = sum(output, o);
+        missing += usize::from(i.is_none() || o.is_none());
+    }
+    (input, output, missing)
+}
+
+/// Adds what is known; None only when nothing is.
+fn sum<T: std::ops::Add<Output = T>>(a: Option<T>, b: Option<T>) -> Option<T> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a + b),
+        (a, b) => a.or(b),
+    }
 }
 
 pub fn median(mut v: Vec<u64>) -> Option<u64> {
@@ -97,7 +126,7 @@ pub fn render(title: &str, results: &[CaseResult], denials: usize) -> String {
         s.push_str(&format!("- {}: {}\n", r.case_id, r.notes.join("; ")));
     }
 
-    s.push_str("\n## By slice\n\n| Split | Language | Risk | Passed | Cases | Median wall (s) | Median peak memory (MiB) | Median CPU (s) | Cost (USD) |\n|---|---|---|---|---|---|---|---|---|\n");
+    s.push_str("\n## By slice\n\n| Split | Language | Risk | Passed | Cases | Median wall (s) | Median peak memory (MiB) | Median CPU (s) | Runner-reported cost (USD, subtotal) | Cases without runner cost | Proxy input tokens | Proxy output tokens |\n|---|---|---|---|---|---|---|---|---|---|---|---|\n");
     let mut slices: BTreeMap<_, Vec<&CaseResult>> = BTreeMap::new();
     for r in results {
         slices
@@ -122,15 +151,33 @@ pub fn render(title: &str, results: &[CaseResult], denials: usize) -> String {
             median(rs.iter().filter_map(|r| r.agent_cpu_usec).collect()),
             |v| format!("{:.0}", v as f64 / 1e6),
         );
-        let cost: f64 = rs.iter().filter_map(|r| r.cost_usd).sum();
+        let na = |v: Option<String>| v.unwrap_or_else(|| "n/a".into());
+        let cost = na(rs
+            .iter()
+            .map(|r| r.cost_usd)
+            .fold(None, sum)
+            .map(|c| format!("{c:.2}")));
+        let no_cost = rs.iter().filter(|r| r.cost_usd.is_none()).count();
+        let tokens = |f: fn(&CaseResult) -> Option<u64>| {
+            na(rs
+                .iter()
+                .map(|r| f(r))
+                .fold(None, sum)
+                .map(|t| t.to_string()))
+        };
+        let (input, output) = (
+            tokens(|r| r.proxy_input_tokens),
+            tokens(|r| r.proxy_output_tokens),
+        );
         s.push_str(&format!(
-            "| {} | {language} | {} | {passed} | {} | {wall} | {mem} | {cpu} | {cost:.2} |\n",
+            "| {} | {language} | {} | {passed} | {} | {wall} | {mem} | {cpu} | {cost} | {no_cost} | {input} | {output} |\n",
             name(split),
             name(risk),
             rs.len()
         ));
     }
 
+    s.push_str("\nCost is the subtotal of what the runner reported, over the cases that reported one. Proxy tokens are summed from each case's proxy.log and are not converted to dollars in phase 0.\n");
     s.push_str(&format!(
         "\n## Cases\n\nProxy refusals in this run: {denials}\n\n| Case | Expected | Got | Safety | Tests | Passed | Notes |\n|---|---|---|---|---|---|---|\n"
     ));

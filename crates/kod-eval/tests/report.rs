@@ -1,6 +1,6 @@
 use kod_eval::{
     case::Split,
-    report::{load, median, proxy_denials, render, write},
+    report::{load, median, proxy_denials, proxy_tokens, render, write},
     result::{CaseResult, Safety},
     run::Manifest,
 };
@@ -56,7 +56,7 @@ fn groups_by_slice_and_lists_safety_first() {
 
 #[test]
 fn counts_every_refusal_event() {
-    let log = "{\"event\":\"allow\"}\n{\"event\":\"deny\"}\n{\"event\":\"over_budget\"}\n{\"event\":\"deny_model\"}\nnot json\n";
+    let log = "{\"event\":\"allow\"}\n{\"event\":\"usage\"}\n{\"event\":\"deny\"}\n{\"event\":\"over_budget\"}\n{\"event\":\"deny_model\"}\nnot json\n";
     assert_eq!(proxy_denials(log), 3);
 }
 
@@ -186,4 +186,40 @@ fn a_manifest_with_no_cases_is_an_error() {
     let d = run_dir(&[]);
     assert!(load(d.path()).is_err());
     assert!(write(d.path()).is_err());
+}
+
+#[test]
+fn sums_proxy_tokens_and_counts_responses_without_usage() {
+    let log = r#"{"event":"allow"}
+{"event":"usage","input_tokens":10,"output_tokens":3}
+{"event":"usage","input_tokens":5,"output_tokens":null}
+{"event":"usage","input_tokens":null,"output_tokens":null}
+{"event":"deny"}
+"#;
+    assert_eq!(proxy_tokens(log), (Some(15), Some(3), 2));
+    assert_eq!(proxy_tokens("{\"event\":\"allow\"}\n"), (None, None, 0));
+}
+
+#[test]
+fn shows_runner_cost_and_proxy_tokens_per_slice_with_na_for_missing() {
+    let a = CaseResult {
+        cost_usd: Some(0.25),
+        proxy_input_tokens: Some(100),
+        proxy_output_tokens: Some(7),
+        ..verified("a")
+    };
+    let b = CaseResult {
+        proxy_input_tokens: Some(50),
+        ..verified("b")
+    };
+    let c = CaseResult {
+        language: "go".into(),
+        ..verified("c")
+    };
+    let text = render("run-1", &[a, b, c], 0);
+    assert!(text.contains("Runner-reported cost (USD, subtotal) | Cases without runner cost | Proxy input tokens | Proxy output tokens |"), "{text}");
+    assert!(text.contains("| 0.25 | 1 | 150 | 7 |"), "{text}");
+    assert!(text.contains("| n/a | 1 | n/a | n/a |"), "{text}");
+    assert!(!text.contains("0.00"), "{text}");
+    assert!(text.contains("not converted to dollars"), "{text}");
 }

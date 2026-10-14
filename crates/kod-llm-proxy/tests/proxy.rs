@@ -4,14 +4,14 @@ use axum::{
     http::{HeaderMap, Uri},
     routing::{get, post},
 };
-use kod_llm_proxy::{Config, Limits, app};
+use kod_llm_proxy::{Config, Limits, USAGE_FIELDS, Usage, app};
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
 use std::time::Duration;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
 };
 
@@ -255,4 +255,109 @@ async fn does_not_follow_upstream_redirects() {
         .unwrap();
     assert_eq!(res.status(), 307);
     assert_eq!(stolen.load(Ordering::SeqCst), 0);
+}
+
+const SSE: &str = "event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":12,\"output_tokens\":1,\"cache_creation_input_tokens\":3,\"cache_read_input_tokens\":4}}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"hi\"}}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":34}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+
+fn usage_of(sse: bool, body: &str, chunk: usize) -> serde_json::Value {
+    let mut u = Usage::new(sse);
+    for c in body.as_bytes().chunks(chunk) {
+        u.feed(c);
+    }
+    serde_json::Value::Object(u.finish())
+}
+
+#[test]
+fn reads_usage_from_json_and_event_streams_in_any_chunking() {
+    let json =
+        r#"{"id":"m","usage":{"input_tokens":7,"output_tokens":9,"cache_read_input_tokens":2}}"#;
+    for chunk in [1, 5, 4096] {
+        let u = usage_of(false, json, chunk);
+        assert_eq!(u["input_tokens"], 7);
+        assert_eq!(u["output_tokens"], 9);
+        assert_eq!(u["cache_read_input_tokens"], 2);
+        assert!(
+            u["cache_creation_input_tokens"].is_null(),
+            "missing is null, not 0"
+        );
+        let u = usage_of(true, SSE, chunk);
+        assert_eq!(
+            u,
+            serde_json::json!({"input_tokens": 12, "output_tokens": 34,
+                "cache_creation_input_tokens": 3, "cache_read_input_tokens": 4})
+        );
+    }
+    for (sse, body) in [
+        (false, r#"{"error":{}}"#),
+        (false, "{trunc"),
+        (true, "data: {}\n"),
+    ] {
+        let u = usage_of(sse, body, 3);
+        assert!(USAGE_FIELDS.iter().all(|k| u[k].is_null()), "{u}");
+    }
+}
+
+/// The proxy binary passes an event stream through unchanged and logs one
+/// usage line once the stream has ended.
+#[tokio::test]
+async fn logs_usage_after_a_stream_and_passes_it_through_unchanged() {
+    let upstream = serve(Router::new().route(
+        "/v1/messages",
+        post(|| async { ([("content-type", "text/event-stream")], SSE) }),
+    ))
+    .await;
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_kod-llm-proxy"))
+        .env("KOD_UPSTREAM", &upstream)
+        .env("KOD_API_KEY", "real-key")
+        .env("KOD_ALLOWED_MODELS", MODEL)
+        .env("KOD_LISTEN", format!("127.0.0.1:{port}"))
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let p = format!("http://127.0.0.1:{port}");
+    let mut body = None;
+    for _ in 0..100 {
+        if let Ok(r) = reqwest::Client::new()
+            .post(format!("{p}/v1/messages"))
+            .body(msg(MODEL, 10))
+            .send()
+            .await
+        {
+            body = Some(r.text().await.unwrap());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(body.as_deref(), Some(SSE));
+    let mut lines = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+    let mut events = vec![];
+    while let Ok(Some(line)) = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+        .await
+        .unwrap()
+    {
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        events.push(v["event"].as_str().unwrap().to_owned());
+        if v["event"] == "usage" {
+            assert_eq!(
+                (v["input_tokens"].clone(), v["output_tokens"].clone()),
+                (12.into(), 34.into())
+            );
+            assert_eq!(v["status"], 200);
+            break;
+        }
+    }
+    assert_eq!(events, ["allow", "usage"]);
 }

@@ -48,6 +48,10 @@ Node.js is too old. Check it with
    (`KOD_MAX_TOKENS`, default 8192). Either raise `KOD_MAX_TOKENS` in the
    environment `kod-eval run` starts from, or lower Claude Code's request with
    `CLAUDE_CODE_MAX_OUTPUT_TOKENS` in `Runner::env`, and record the decision.
+   Each allowed `/v1/messages` request also gets a `usage` line when its
+   response ends, with `input_tokens`, `output_tokens`,
+   `cache_creation_input_tokens` and `cache_read_input_tokens` (null when the
+   response reported none). Check that they are numbers.
 4. Check that the result says `safety: verified`. Anything else means evidence
    is missing; fix that before going on.
 

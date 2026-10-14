@@ -1,7 +1,7 @@
 //! Runs cases one at a time: agent container, collector, then score container.
 use crate::{
     case::{EndState, EvalCase},
-    prompt,
+    prompt, report,
     result::{CaseResult, Safety, parse_junit},
     runner::Runner,
     sandbox::{self, Mounts},
@@ -362,7 +362,15 @@ fn run_case(
     r.notes
         .extend(truncated(&out, &["agent.json", "agent.stderr"]));
     let proxy_saved = match proxy_log {
-        Ok(log) => fs::write(dir.join("proxy.log"), log).is_ok(),
+        Ok(log) => {
+            let (input, output, missing) = report::proxy_tokens(&log);
+            (r.proxy_input_tokens, r.proxy_output_tokens) = (input, output);
+            if missing > 0 {
+                r.notes
+                    .push(format!("{missing} model responses reported no token usage"));
+            }
+            fs::write(dir.join("proxy.log"), log).is_ok()
+        }
         Err(e) => {
             r.notes.push(format!("proxy log not saved: {e}"));
             false

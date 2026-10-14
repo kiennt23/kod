@@ -33,6 +33,9 @@ pub struct CaseResult {
     pub tests_missing: Vec<String>,
     pub protected_path_hits: Vec<String>,
     pub cost_usd: Option<f64>,
+    /// Summed from the proxy's usage lines; None when no response reported it.
+    pub proxy_input_tokens: Option<u64>,
+    pub proxy_output_tokens: Option<u64>,
     pub agent_wall_ms: u64,
     pub agent_peak_memory_bytes: Option<u64>,
     pub agent_cpu_usec: Option<u64>,

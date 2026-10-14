@@ -3,6 +3,11 @@
 //! forwarded, so ".." and other paths can't reach other endpoints. Every
 //! request is checked against the case's limits before it is forwarded,
 //! because code in the sandbox can call the proxy without the runner.
+//!
+//! Log lines are JSON on stdout. Each request gets one line when it is
+//! allowed or refused; an allowed /v1/messages request gets a second line,
+//! event "usage", when its response body ends, with the token counts the
+//! response reported (null when it reported none).
 use axum::{
     Router,
     body::{Body, to_bytes},
@@ -11,6 +16,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use futures_util::StreamExt;
+use serde_json::{Map, Value, json};
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -146,9 +152,22 @@ async fn forward(State(st): State<Arc<AppState>>, req: Request) -> Response {
                     res = res.header(k, v);
                 }
             }
+            let sse = up
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.starts_with("text/event-stream"));
+            let mut meter = (path == "/v1/messages").then(|| Meter {
+                usage: Usage::new(sse),
+                path: path.clone(),
+                status: up.status().as_u16(),
+            });
             // Streamed, so server-sent events reach the runner as they arrive.
             let stream = up.bytes_stream().map(move |chunk| {
                 let _held = &permit;
+                if let (Some(m), Ok(c)) = (&mut meter, &chunk) {
+                    m.usage.feed(c);
+                }
                 chunk
             });
             res.body(Body::from_stream(stream))
@@ -162,11 +181,129 @@ async fn forward(State(st): State<Arc<AppState>>, req: Request) -> Response {
 }
 
 fn log(event: &str, path: &str, status: u16) {
+    log_with(event, path, status, Map::new());
+}
+
+fn log_with(event: &str, path: &str, status: u16, mut extra: Map<String, Value>) {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis());
-    println!(
-        "{}",
-        serde_json::json!({ "ts": ts, "event": event, "path": path, "status": status })
-    );
+    for (k, v) in [
+        ("ts", json!(ts)),
+        ("event", json!(event)),
+        ("path", json!(path)),
+        ("status", json!(status)),
+    ] {
+        extra.insert(k.into(), v);
+    }
+    println!("{}", Value::Object(extra));
+}
+
+/// Logs the usage line when the response body is dropped: after its last
+/// byte, or when the client went away.
+struct Meter {
+    usage: Usage,
+    path: String,
+    status: u16,
+}
+
+impl Drop for Meter {
+    fn drop(&mut self) {
+        let usage = std::mem::replace(&mut self.usage, Usage::new(false));
+        log_with("usage", &self.path, self.status, usage.finish());
+    }
+}
+
+/// The usage fields logged for each /v1/messages response.
+pub const USAGE_FIELDS: [&str; 4] = [
+    "input_tokens",
+    "output_tokens",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+];
+/// A JSON body or SSE line longer than this is not parsed; its usage is
+/// recorded as missing.
+const USAGE_BUF_CAP: usize = 4 << 20;
+
+/// Token usage read from a Messages API response while its bytes pass
+/// through unchanged. A JSON body is held (up to USAGE_BUF_CAP) and parsed at
+/// the end; a server-sent event stream is parsed line by line, so only the
+/// current line is held.
+pub struct Usage {
+    sse: bool,
+    buf: Vec<u8>,
+    overflow: bool,
+    seen: Map<String, Value>,
+}
+
+impl Usage {
+    pub fn new(sse: bool) -> Self {
+        Usage {
+            sse,
+            buf: vec![],
+            overflow: false,
+            seen: Map::new(),
+        }
+    }
+
+    pub fn feed(&mut self, chunk: &[u8]) {
+        if self.overflow {
+            return;
+        }
+        self.buf.extend_from_slice(chunk);
+        if self.sse {
+            while let Some(i) = self.buf.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = self.buf.drain(..=i).collect();
+                self.sse_line(&line);
+            }
+        }
+        if self.buf.len() > USAGE_BUF_CAP {
+            self.buf = vec![];
+            self.overflow = !self.sse;
+        }
+    }
+
+    /// The usage fields, each a number or null when the response had none.
+    pub fn finish(mut self) -> Map<String, Value> {
+        let rest = std::mem::take(&mut self.buf);
+        if self.sse {
+            self.sse_line(&rest);
+        } else if !self.overflow
+            && let Ok(v) = serde_json::from_slice::<Value>(&rest)
+        {
+            self.take(&v["usage"]);
+        }
+        USAGE_FIELDS
+            .iter()
+            .map(|&k| {
+                (
+                    k.to_owned(),
+                    self.seen.get(k).cloned().unwrap_or(Value::Null),
+                )
+            })
+            .collect()
+    }
+
+    /// message_start carries message.usage; message_delta carries usage with
+    /// the final output_tokens. Later values replace earlier ones.
+    fn sse_line(&mut self, line: &[u8]) {
+        let Some(data) = line.strip_prefix(b"data:") else {
+            return;
+        };
+        if let Ok(v) = serde_json::from_slice::<Value>(data.trim_ascii()) {
+            match v["type"].as_str() {
+                Some("message_start") => self.take(&v["message"]["usage"]),
+                Some("message_delta") => self.take(&v["usage"]),
+                _ => {}
+            }
+        }
+    }
+
+    fn take(&mut self, usage: &Value) {
+        for k in USAGE_FIELDS {
+            if let Some(n) = usage.get(k).filter(|n| n.is_u64()) {
+                self.seen.insert(k.into(), n.clone());
+            }
+        }
+    }
 }
