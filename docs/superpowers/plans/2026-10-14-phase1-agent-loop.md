@@ -23,14 +23,14 @@ These choices were left open by the spec and the phase 0 code. Each one is made 
 | D3 | The base URL comes from `ANTHROPIC_BASE_URL`, the same variable the Claude Code runner gets. The loop sends no API key at all. | The gateway injects the key, and the sandbox must never hold one. A missing base URL is an error, never a fallback to the provider. |
 | D4 | stdout carries exactly one JSON line, `Outcome {end_state, summary, turns, usage, error}`. `kod-eval` trusts it only when the exit code is 0 and the whole of stdout parses. Anything else is `needs_human`. Cost is `None`; comparisons use the proxy's token counts. | This fits `run_case`, which reads `out/agent.json` as stdout. The end state is reported by the agent, so it's untrusted. Safety never depends on it: `kod-eval` checks the diff, protected paths and held-back tests itself. Pricing belongs to the gateway (sub-plan 2). |
 | D5 | The `finish{state, summary}` tool ends a run with `done`, `blocked` or `needs_human`. A plain-text reply with no tool calls is read with the same `KOD_END_STATE:` marker rule as the Claude Code runner, and is `done` otherwise. The model can't claim `over_budget`. | The shared eval prompt asks for marker lines. Accepting them keeps the prompt identical across runners, so the comparison is fair. |
-| D6 | Error mapping. A 429 with no Anthropic error body (the proxy's budget refusal) → `over_budget`, with no retry. 5xx, a 429 that has an error body (provider rate limit), or a transport error → retried after 2 s, 10 s and 30 s, then `needs_human`. Any other status, or a 2xx that isn't a message → `needs_human` at once. | This follows the spec's action matrix: a refused model request with no allowed endpoint ends as needs human. Retrying a refusal would only burn the request budget. |
+| D6 | Error mapping. A 429 with no Anthropic error body (the proxy's budget refusal) → `over_budget`, with no retry. 5xx, a 429 that has an error body (provider rate limit), or a transport error → retried after 2 s, 10 s and 30 s (or the response's `Retry-After`, capped at 60 s, when that is longer), then `needs_human`. Each retry counts in the proxy's request budget, as Claude Code's do. Any other status, or a 2xx that isn't a message → `needs_human` at once. | This follows the spec's action matrix: a refused model request with no allowed endpoint ends as needs human. Retrying a refusal would only burn the request budget. |
 | D7 | One model request is one turn. Reaching `--max-turns` → `over_budget`. | This matches Claude Code's `--max-turns` / `error_max_turns`, so `budget.max_turns` means the same thing for both runners. |
-| D8 | Paths aren't confined to `/work`. `run` is `sh -c` in its own process group, with stdin closed. Output goes to an unlinked temp file and is cut in the middle at 30 000 bytes. At `--command-timeout-secs` (default 600) the whole process group is killed. | The sandbox is the boundary (non-root, cap-drop ALL, internal network, limits), and `run` can reach any path anyway, so confining paths would only pretend to be a control. A file instead of a pipe means a background child can't hang the loop, and a flood can't fill its memory. |
+| D8 | Paths aren't confined to `/work`. `run` is `sh -c` in its own process group, with stdin closed. Output goes to an unlinked temp file and is cut in the middle at 30 000 bytes. At `--command-timeout-secs` (default 600) the leader and then its whole process group are killed. Background children left when a command exits are killed too. | The sandbox is the boundary (non-root, cap-drop ALL, internal network, limits), and `run` can reach any path anyway, so confining paths would only pretend to be a control. A file instead of a pipe means a background child can't hang the loop, and a flood can't fill its memory. |
 | D9 | AGENTS.md from the workspace root is appended to the system prompt. Skills are indexed from `.agents/skills/*/SKILL.md`, then `.claude/skills/*/SKILL.md`; if two share a name, the first wins. Only the name, description and path go in the prompt, and the model reads the full SKILL.md with `read_file` when it needs it. The base prompt is `crates/kod-loop/system.md`, installed at `/etc/kod/kod-loop/system.md`. | The spec says prompts and skills are Markdown loaded at runtime, so iteration stays out of the compile loop. Indexing skills and reading them on demand keeps the context small. `.claude/skills` is read so that repos already set up for the baseline work unchanged. The owner confirmed this order (`.agents/skills` first, then `.claude/skills`) for product repos. |
-| D10 | Once the serialized conversation is over `--context-bytes` (default 400 000), the oldest `tool_result` contents are replaced with a placeholder. There is no summarization. | Long runs hit the context limit through old command output. Eliding is deterministic and testable, and the model can rerun a tool. |
+| D10 | Once the system prompt plus the serialized conversation is over `--context-bytes` (default 400 000), the oldest `tool_result` contents are replaced with a placeholder until the total is at most half the limit. There is no summarization. | Long runs hit the context limit through old command output. Eliding is deterministic and testable, and the model can rerun a tool. Going down to half means elision is rare, so the cached prompt prefix survives between elisions instead of changing on every turn. |
 | D11 | The trace is JSONL on stderr, using OTel GenAI attribute names (`gen_ai.request.model`, `gen_ai.usage.input_tokens`, `gen_ai.tool.name`, …). Each event gives the command and duration, never file contents. There is no OTel SDK. | The spec says "structured logs first". `kod-eval` already keeps `out/agent.stderr` with each case. An exporter comes when the tracing work needs one. |
 | D12 | `kod-eval` passes `KOD_UPSTREAM` through to each proxy and records it in the manifest (default `https://api.anthropic.com`). | The Docker end-to-end test needs a scripted model behind the real proxy. Recording the upstream also makes a run's model endpoint auditable before the gateway sub-plan adds routing. |
-| D13 | `kod-eval compare <baseline> <candidate>` refuses runs of different cases. It matches only when every case is `verified` in both runs (zero `unsafe`, zero `not_verified`, no tolerance) and the candidate's overall pass count is at most 1 below the baseline's. The report still shows passes per slice (split × language × risk), but slices don't decide the verdict. | The owner's rule for the phase 1 exit, "our loop matches the baseline, no escapes". Safety is strict. A one-pass margin overall stops a single flaky case from deciding the result, and small slices would make a per-slice rule noisy. |
+| D13 | `kod-eval compare <baseline> <candidate>` refuses runs of different cases, or with a different model id, upstream, allowed paths or `KOD_MAX_*` limits, and prints both runs' image ids. The two runs must use images from the same `evals/VERSIONS.md` pins; if the pins changed, the baseline is rerun on the current images. It matches only when every case is `verified` in both runs (zero `unsafe`, zero `not_verified`, no tolerance) and the candidate's overall pass count is at most 1 below the baseline's. The report still shows passes per slice (split × language × risk), but slices don't decide the verdict. | The owner's rule for the phase 1 exit, "our loop matches the baseline, no escapes". Safety is strict. A one-pass margin overall stops a single flaky case from deciding the result, and small slices would make a per-slice rule noisy. |
 | D14 | `kod-eval` writes `runner_version` with `as_agent "$1" --version`, where `$1` is the runner's binary, in place of a hard-coded `claude --version`. | Otherwise a kod-loop run would record the Claude Code version. |
 | D15 | Conformance item 1 (follows an AGENTS.md-only rule) is checked in two forms. In CI, the Docker end-to-end fixture repo has an AGENTS.md whose rule names the answer file, and the scripted model can only learn that name from the AGENTS.md text the loop put in its system prompt (Task 5, `agents` case). In the eval set, one held-out case from a real product repo has a fix that depends on a rule stated only in that repo's AGENTS.md (eval-set guidance in the Task 7 runbook; no code). | The owner's choice. The fixture is deterministic and proves the loop really applies the workspace's AGENTS.md, inside the real sandbox. The real case shows that a real model follows it. |
 | D16 | kod-loop becomes the default runner for offline evals once `compare` matches (D13) on the held-out split. It becomes the default for the connected pilot only after sub-plan 5 adds the MCP client, so conformance items 2, 4 and 7 pass too. Claude Code stays available for comparison and fallback. | The owner's rule. Offline evals need nothing from the gateway. The connected pilot does. |
@@ -66,9 +66,9 @@ The modes follow [ADR 0001](../../adr/0001-per-task-execution-mode.md): a task t
 ## Review Focus
 
 1. **A malformed or unknown tool call** (wrong tool name, missing or mistyped arguments, `finish` with `over_budget`) must come back as an `is_error` tool result, with the loop carrying on. It must never cause a panic or a false end state. Pinned by Task 1 `malformed_and_unknown_calls_are_errors_not_panics` and Task 3 `bad_tool_calls_get_error_results_and_the_loop_goes_on`.
-2. **A command that never exits, waits on stdin, leaves children running, or floods output** must be killed with its process group at the timeout, see EOF on stdin, and have its output cut to head and tail. Pinned by Task 1 `runaway_command_is_killed_with_its_children`, `stdin_is_closed` and `output_flood_is_capped_head_and_tail`.
-3. **A gateway refusal or outage** must end correctly. A budget 429 is `over_budget` with no retry. A 400, 403, 404 or 413 is `needs_human` with no retry. A 5xx, a provider 429 or a transport error is retried a bounded number of times, then `needs_human`. A setup error still prints one outcome line. Pinned by Task 3 `the_gateway_budget_refusal_ends_over_budget_without_retry`, `transient_errors_are_retried`, `errors_that_outlast_the_retries_need_a_human`, `refusals_are_not_retried`, `setup_errors_still_print_one_outcome_line` and `through_the_proxy_the_key_is_added_and_the_budget_ends_the_run`.
-4. **A reply cut off at `max_tokens`, or an empty reply,** must never be taken as `done`. A cut-off reply is continued, and an empty one is `needs_human`. Pinned by Task 3 `a_reply_cut_at_max_tokens_is_continued_not_taken_as_done` and `a_reply_without_tool_calls_ends_the_run`.
+2. **A command that never exits, waits on stdin, leaves children running, or floods output** must be killed with its process group at the timeout (the leader first, which needs no fork, so the loop never hangs), see EOF on stdin, have its leftover background children killed when it exits, and have its output cut to head and tail. Pinned by Task 1 `runaway_command_is_killed_with_its_children`, `background_children_are_killed_when_the_command_exits`, `stdin_is_closed` and `output_flood_is_capped_head_and_tail`.
+3. **A gateway refusal or outage** must end correctly. A budget 429 is `over_budget` with no retry. A 400, 403, 404 or 413 is `needs_human` with no retry. A 5xx, a provider 429 or a transport error is retried a bounded number of times, waiting at least the capped `Retry-After`, then `needs_human`. A setup error still prints one outcome line. Pinned by Task 3 `the_gateway_budget_refusal_ends_over_budget_without_retry`, `transient_errors_are_retried`, `errors_that_outlast_the_retries_need_a_human`, `refusals_are_not_retried`, `retry_after_is_honoured_when_longer_than_the_backoff`, `setup_errors_still_print_one_outcome_line` and `through_the_proxy_the_key_is_added_and_the_budget_ends_the_run`.
+4. **A reply cut off at `max_tokens`, an empty reply, or any other unusual stop** must never be taken as `done`. A cut-off reply is continued, and its tool calls are answered with an error instead of being run, since their input may be truncated. An empty reply, or one that stops for any reason other than `end_turn` or `stop_sequence` (a refusal, a context overflow, a new reason), is `needs_human`. Pinned by Task 3 `a_reply_cut_at_max_tokens_is_continued_not_taken_as_done`, `a_tool_call_cut_at_max_tokens_is_not_run`, `only_end_turn_or_stop_sequence_can_end_done` and `a_reply_without_tool_calls_ends_the_run`.
 5. **Garbled, duplicated or forged runner stdout, or a non-zero exit,** must map to `needs_human` in `kod-eval`, never to `done` or `blocked`. Pinned by Task 4 `kod_loop_garbled_or_failed_output_needs_a_human`.
 
 ---
@@ -347,6 +347,30 @@ fn runaway_command_is_killed_with_its_children() {
 }
 
 #[test]
+fn background_children_are_killed_when_the_command_exits() {
+    let d = tempfile::tempdir().unwrap();
+    let r = call(
+        d.path(),
+        "run",
+        json!({"command": "sleep 300 > /dev/null 2>&1 & echo $! > child.pid"}),
+    );
+    assert!(r.text.ends_with("[exit code 0]"), "{}", r.text);
+    let pid = fs::read_to_string(d.path().join("child.pid")).unwrap();
+    let alive = || {
+        Command::new("kill")
+            .args(["-0", pid.trim()])
+            .status()
+            .unwrap()
+            .success()
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while alive() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!alive(), "the background child outlived its command");
+}
+
+#[test]
 fn output_flood_is_capped_head_and_tail() {
     let d = tempfile::tempdir().unwrap();
     let r = call(
@@ -565,21 +589,53 @@ fn run(ws: &Path, timeout: Duration, input: &Value) -> Result<String, String> {
             };
         }
         if start.elapsed() >= timeout {
-            let _ = Command::new("sh")
-                .arg("-c")
-                .arg(format!("kill -KILL -- -{}", child.id()))
-                .status();
+            // Killing the leader needs no fork, so wait() below always returns,
+            // even when the command has used up the sandbox's pids limit.
+            let _ = child.kill();
+            let note = if kill_group(child.id()) {
+                ""
+            } else {
+                "; some of its child processes may still be running"
+            };
             let _ = child.wait();
             break format!(
-                "[killed after {}s: the command hit the time limit]",
+                "[killed after {}s: the command hit the time limit{note}]",
                 timeout.as_secs()
             );
         }
         thread::sleep(Duration::from_millis(20));
     };
-    // ponytail: children left running after a normal exit keep running until
-    // the sandbox stops; reap them per command if that ever matters.
-    Ok(format!("{}\n{status}", read_capped(&mut out).map_err(err)?))
+    // Leftover background children are killed too: they would keep writing
+    // to the scratch file in /tmp (shared with CARGO_HOME) until the case ends.
+    kill_group(child.id());
+    let mut text = read_capped(&mut out).map_err(err)?;
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    Ok(format!("{text}{status}"))
+}
+
+/// SIGKILLs the command's process group. `kill` itself needs a fork, which
+/// fails while the group holds every pid the sandbox allows, so the spawn is
+/// retried for up to 5 seconds. Returns false if it never ran.
+/// ponytail: a fork bomb that keeps the pids limit full for 5s outlives this;
+/// the sandbox's pids limit and kod-eval's case timeout still bound it. Use
+/// kill(2) through a libc binding if that ever shows up in an eval.
+fn kill_group(pid: u32) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        // It fails harmlessly ("no such process") when the group is gone.
+        let ran = Command::new("sh")
+            .arg("-c")
+            .arg(format!("kill -KILL -- -{pid} 2>/dev/null"))
+            .stdin(Stdio::null())
+            .status()
+            .is_ok();
+        if ran || Instant::now() >= deadline {
+            return ran;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn finish(input: &Value) -> ToolResult {
@@ -664,7 +720,7 @@ fn join(head: &[u8], omitted: u64, tail: &[u8]) -> String {
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test -p kod-loop --test tools`
-Expected: PASS, 11 tests.
+Expected: PASS, 12 tests.
 
 - [ ] **Step 6: Commit**
 
@@ -689,7 +745,7 @@ git commit -m "kod-loop: tools for files, commands and finish"
   - `pub struct Skill { pub name: String, pub description: String, pub path: String }`
   - `pub fn skills(workspace: &Path) -> Vec<Skill>`
   - `pub const ELIDED: &str`
-  - `pub fn elide(messages: &mut [serde_json::Value], max_bytes: usize)`
+  - `pub fn elide(messages: &mut [serde_json::Value], system_bytes: usize, max_bytes: usize)`
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -774,13 +830,13 @@ fn conversation() -> Vec<Value> {
 #[test]
 fn elide_replaces_the_oldest_results_first_and_never_the_last_message() {
     let mut m = conversation();
-    elide(&mut m, 15_000);
+    elide(&mut m, 0, 15_000);
     assert_eq!(m[2]["content"][0]["content"], ELIDED);
     assert_eq!(m[4]["content"][0]["content"].as_str().unwrap().len(), 10_000);
     assert_eq!(m[2]["content"][0]["tool_use_id"], "a", "ids stay paired");
 
     let mut m = conversation();
-    elide(&mut m, 100);
+    elide(&mut m, 0, 100);
     assert_eq!(m[2]["content"][0]["content"], ELIDED);
     assert_eq!(
         m[4]["content"][0]["content"].as_str().unwrap().len(),
@@ -790,9 +846,33 @@ fn elide_replaces_the_oldest_results_first_and_never_the_last_message() {
 }
 
 #[test]
+fn elide_goes_down_to_half_the_limit_so_the_prefix_stays_stable() {
+    let mut m = conversation();
+    m.push(json!({"role": "assistant", "content": [{"type": "tool_use", "id": "c", "name": "run", "input": {}}]}));
+    m.push(result("c", 10_000));
+    // About 30 000 bytes: over 25 000, so it elides down to 12 500, which
+    // takes both older results, not just the first.
+    elide(&mut m, 0, 25_000);
+    assert_eq!(m[2]["content"][0]["content"], ELIDED);
+    assert_eq!(m[4]["content"][0]["content"], ELIDED);
+    assert_eq!(m[6]["content"][0]["content"].as_str().unwrap().len(), 10_000);
+}
+
+#[test]
+fn elide_counts_the_system_prompt() {
+    // About 20 000 bytes of conversation fits in 30 000, but not with a
+    // 15 000-byte system prompt.
+    let mut m = conversation();
+    elide(&mut m, 0, 30_000);
+    assert_eq!(m, conversation());
+    elide(&mut m, 15_000, 30_000);
+    assert_eq!(m[2]["content"][0]["content"], ELIDED);
+}
+
+#[test]
 fn elide_does_nothing_under_the_limit() {
     let mut m = conversation();
-    elide(&mut m, 1_000_000);
+    elide(&mut m, 0, 1_000_000);
     assert_eq!(m, conversation());
 }
 ```
@@ -893,16 +973,21 @@ fn front(text: &str, key: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-/// Replaces tool results, oldest first, until the conversation serializes to
-/// at most `max_bytes`. The last message is never touched, so the model
-/// always sees its newest results.
+/// Once the system prompt plus the serialized conversation is over
+/// `max_bytes`, replaces tool results, oldest first, until the total is at
+/// most half of `max_bytes`. Going down to the low-water mark means elision
+/// happens rarely, so the cached prefix stays the same between elisions. The
+/// last message is never touched, so the model always sees its newest results.
 /// ponytail: tool inputs (such as write_file content) are kept; the gateway's
 /// body limit refuses a request that is still too large.
-pub fn elide(messages: &mut [Value], max_bytes: usize) {
-    let size = |m: &[Value]| serde_json::to_string(m).map_or(0, |s| s.len());
+pub fn elide(messages: &mut [Value], system_bytes: usize, max_bytes: usize) {
+    let size = |m: &[Value]| system_bytes + serde_json::to_string(m).map_or(0, |s| s.len());
+    if size(messages) <= max_bytes {
+        return;
+    }
     let last = messages.len().saturating_sub(1);
     for i in 0..last {
-        if size(messages) <= max_bytes {
+        if size(messages) <= max_bytes / 2 {
             return;
         }
         let Some(blocks) = messages[i]["content"].as_array_mut() else {
@@ -918,7 +1003,7 @@ pub fn elide(messages: &mut [Value], max_bytes: usize) {
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p kod-loop --test context`
-Expected: PASS, 5 tests.
+Expected: PASS, 7 tests.
 
 - [ ] **Step 5: Commit**
 
@@ -946,7 +1031,7 @@ git commit -m "kod-loop: load AGENTS.md and skills, elide old tool results"
   - `pub struct Outcome { pub end_state: EndState, pub summary: String, pub turns: u32, pub usage: Usage, pub error: Option<String> }`, with the same derives except Default, and `Outcome::failed(error: String) -> Outcome`.
   - `pub struct Config { pub base_url: String, pub model: String, pub max_turns: u32, pub max_tokens: u64, pub workspace: PathBuf, pub system: String, pub context_bytes: usize, pub command_timeout: Duration, pub retry_backoff: Vec<Duration> }`.
   - `pub fn run(cfg: &Config, prompt: &str, trace: &mut dyn std::io::Write) -> Outcome`.
-  - `pub const CUT_OFF: &str`.
+  - `pub const CUT_OFF: &str` and `pub const CUT_OFF_CALL: &str`.
   - The binary `kod-loop`. It takes `--model M --max-turns N [--max-tokens T] [--system-prompt PATH] [--context-bytes B] [--command-timeout-secs S]`, reads `ANTHROPIC_BASE_URL` and stdin, prints one `Outcome` JSON line, and exits 1 when `error` is set. `--version` prints `kod-loop 0.1.0`.
 
 - [ ] **Step 1: Write the shared test helpers**
@@ -1008,7 +1093,7 @@ async fn answer(
     State(m): State<Model>,
     headers: HeaderMap,
     Json(body): Json<Value>,
-) -> (StatusCode, [(header::HeaderName, &'static str); 1], String) {
+) -> (StatusCode, HeaderMap, String) {
     let mut m = m.lock().unwrap();
     m.seen.push((headers, body));
     let (status, reply) = if m.replies.is_empty() {
@@ -1021,11 +1106,14 @@ async fn answer(
     } else {
         reply.to_string()
     };
-    (
-        StatusCode::from_u16(status).unwrap(),
-        [(header::CONTENT_TYPE, "application/json")],
-        body,
-    )
+    let mut h = HeaderMap::new();
+    h.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+    // Test convention: a top-level "retry_after" in a reply is also sent as
+    // the Retry-After header.
+    if let Some(secs) = reply["retry_after"].as_u64() {
+        h.insert(header::RETRY_AFTER, secs.into());
+    }
+    (StatusCode::from_u16(status).unwrap(), h, body)
 }
 
 pub fn bodies(m: &Model) -> Vec<Value> {
@@ -1086,7 +1174,7 @@ pub fn go(cfg: &Config, prompt: &str) -> (Outcome, Vec<Value>) {
 ```rust
 mod common;
 use common::*;
-use kod_loop::{CUT_OFF, Config, EndState, context::ELIDED};
+use kod_loop::{CUT_OFF, CUT_OFF_CALL, Config, EndState, context::ELIDED};
 use serde_json::{Value, json};
 use std::fs;
 
@@ -1290,6 +1378,65 @@ fn a_success_that_is_not_a_message_needs_a_human() {
 }
 
 #[test]
+fn a_tool_call_cut_at_max_tokens_is_not_run() {
+    let ws = tempfile::tempdir().unwrap();
+    let (url, m) = model(vec![
+        msg(json!([tool("t1", "write_file", json!({"path": "half.txt", "content": "first ha"}))]), "max_tokens"),
+        msg(json!([tool("t2", "finish", json!({"state": "done", "summary": "ok"}))]), "tool_use"),
+    ]);
+    let (o, _) = go(&config(&url, ws.path()), "t");
+    assert_eq!((o.end_state, o.turns), (EndState::Done, 2));
+    assert!(!ws.path().join("half.txt").exists(), "a cut-off call never runs");
+    let b = bodies(&m);
+    let r = &b[1]["messages"].as_array().unwrap().last().unwrap()["content"][0];
+    assert_eq!(r["tool_use_id"], "t1");
+    assert_eq!(r["is_error"], true);
+    assert_eq!(r["content"], CUT_OFF_CALL);
+}
+
+#[test]
+fn only_end_turn_or_stop_sequence_can_end_done() {
+    for stop in ["refusal", "model_context_window_exceeded", "something_new"] {
+        let ws = tempfile::tempdir().unwrap();
+        let (url, _m) = model(vec![msg(json!([text("I can't help with that.")]), stop)]);
+        let (o, _) = go(&config(&url, ws.path()), "t");
+        assert_eq!(o.end_state, EndState::NeedsHuman, "{stop}");
+        assert!(o.summary.contains(stop), "{}", o.summary);
+    }
+    let ws = tempfile::tempdir().unwrap();
+    let (url, _m) = model(vec![msg(json!([text("Done.")]), "stop_sequence")]);
+    let (o, _) = go(&config(&url, ws.path()), "t");
+    assert_eq!(o.end_state, EndState::Done);
+}
+
+#[test]
+fn retry_after_is_honoured_when_longer_than_the_backoff() {
+    let ws = tempfile::tempdir().unwrap();
+    let mut busy = error_body("rate_limit_error");
+    busy["retry_after"] = json!(1);
+    let (url, m) = model(vec![(429, busy), msg(json!([text("done")]), "end_turn")]);
+    let start = std::time::Instant::now();
+    // config() sets every backoff to zero.
+    let (o, _) = go(&config(&url, ws.path()), "t");
+    assert_eq!(o.end_state, EndState::Done, "{:?}", o.error);
+    assert!(start.elapsed() >= std::time::Duration::from_secs(1));
+    assert_eq!(bodies(&m).len(), 2);
+}
+
+#[test]
+fn the_trace_keeps_only_the_start_of_a_command() {
+    let ws = tempfile::tempdir().unwrap();
+    let long = format!("cat > f.txt <<'EOF'\n{}\nEOF", "s".repeat(1000));
+    let (url, _m) = model(vec![
+        msg(json!([tool("t1", "run", json!({"command": long}))]), "tool_use"),
+        msg(json!([tool("t2", "finish", json!({"state": "done", "summary": "ok"}))]), "tool_use"),
+    ]);
+    let (_, trace) = go(&config(&url, ws.path()), "t");
+    assert_eq!(trace[1]["command"].as_str().unwrap().chars().count(), 200);
+    assert_eq!(trace[1]["command_bytes"], long.len());
+}
+
+#[test]
 fn an_unreachable_gateway_needs_a_human() {
     let ws = tempfile::tempdir().unwrap();
     let (o, trace) = go(&config("http://127.0.0.1:1", ws.path()), "t");
@@ -1483,7 +1630,8 @@ impl Client {
     }
 
     /// One reply. Transient failures (5xx, a provider 429 with an error body,
-    /// transport errors) are retried once per backoff entry; refusals are not.
+    /// transport errors) are retried once per backoff entry, waiting longer
+    /// when the response's Retry-After asks for it; refusals are not retried.
     pub fn messages(&self, body: &Value) -> Result<Value, ApiError> {
         let mut waits = self.backoff.iter();
         loop {
@@ -1494,10 +1642,15 @@ impl Client {
                 .header("content-type", "application/json")
                 .body(body.to_string())
                 .send();
-            let why = match sent {
-                Err(e) => format!("request failed: {e}"),
+            let (why, retry_after) = match sent {
+                Err(e) => (format!("request failed: {e}"), None),
                 Ok(r) => {
                     let status = r.status();
+                    let retry_after = r
+                        .headers()
+                        .get(reqwest::header::RETRY_AFTER)
+                        .and_then(|v| v.to_str().ok()?.parse::<u64>().ok())
+                        .map(|secs| Duration::from_secs(secs).min(MAX_RETRY_AFTER));
                     let text = r.text().unwrap_or_default();
                     let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
                     if status.is_success() {
@@ -1506,7 +1659,7 @@ impl Client {
                         }
                         return Err(ApiError::Failed(format!(
                             "{status}: not a message: {}",
-                            head(&text)
+                            head(&text, 500)
                         )));
                     }
                     let api_error = v["type"] == "error";
@@ -1514,21 +1667,25 @@ impl Client {
                         return Err(ApiError::Budget);
                     }
                     if status != 429 && !status.is_server_error() {
-                        return Err(ApiError::Failed(format!("{status}: {}", head(&text))));
+                        return Err(ApiError::Failed(format!("{status}: {}", head(&text, 500))));
                     }
-                    format!("{status}: {}", head(&text))
+                    (format!("{status}: {}", head(&text, 500)), retry_after)
                 }
             };
             match waits.next() {
-                Some(w) => std::thread::sleep(*w),
+                Some(w) => std::thread::sleep(retry_after.map_or(*w, |a| a.max(*w))),
                 None => return Err(ApiError::Failed(why)),
             }
         }
     }
 }
 
-fn head(s: &str) -> &str {
-    match s.char_indices().nth(500) {
+/// The longest Retry-After honoured, so a bad value can't stall the run.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
+
+/// The first `n` characters of `s`.
+pub(crate) fn head(s: &str, n: usize) -> &str {
+    match s.char_indices().nth(n) {
         Some((i, _)) => &s[..i],
         None => s,
     }
@@ -1627,6 +1784,10 @@ pub struct Config {
 pub const CUT_OFF: &str =
     "Your reply was cut off at the output token limit. Continue in smaller steps.";
 
+/// The result for each tool call in a reply cut off at the output limit: its
+/// input may be truncated, so it is never run.
+pub const CUT_OFF_CALL: &str = "Not run: your reply was cut off at the output token limit, so this call's input may be incomplete. Resend it in smaller steps.";
+
 pub fn run(cfg: &Config, prompt: &str, trace: &mut dyn Write) -> Outcome {
     let client = Client::new(&cfg.base_url, cfg.retry_backoff.clone());
     let mut messages = vec![json!({"role": "user", "content": prompt})];
@@ -1645,7 +1806,7 @@ pub fn run(cfg: &Config, prompt: &str, trace: &mut dyn Write) -> Outcome {
             break end(EndState::OverBudget, why, turns, &usage, None);
         }
         turns += 1;
-        context::elide(&mut messages, cfg.context_bytes);
+        context::elide(&mut messages, cfg.system.len(), cfg.context_bytes);
         let started = Instant::now();
         let reply = match client.messages(&request(cfg, &messages)) {
             Ok(r) => r,
@@ -1680,8 +1841,17 @@ pub fn run(cfg: &Config, prompt: &str, trace: &mut dyn Write) -> Outcome {
         if !content.is_empty() {
             messages.push(json!({"role": "assistant", "content": content}));
         }
+        let stop = reply["stop_reason"].as_str().unwrap_or("");
+        if stop == "max_tokens" && !calls.is_empty() {
+            let results: Vec<Value> = calls
+                .iter()
+                .map(|c| json!({"type": "tool_result", "tool_use_id": c["id"], "content": CUT_OFF_CALL, "is_error": true}))
+                .collect();
+            messages.push(json!({"role": "user", "content": results}));
+            continue;
+        }
         if calls.is_empty() {
-            if reply["stop_reason"] == "max_tokens" {
+            if stop == "max_tokens" {
                 messages.push(json!({"role": "user", "content": CUT_OFF}));
                 continue;
             }
@@ -1689,6 +1859,12 @@ pub fn run(cfg: &Config, prompt: &str, trace: &mut dyn Write) -> Outcome {
             if text.trim().is_empty() {
                 let why = "the model ended with an empty reply";
                 break end(EndState::NeedsHuman, why.into(), turns, &usage, None);
+            }
+            // Only a normal stop can be done; a refusal, a context overflow or
+            // an unknown reason goes to a person.
+            if stop != "end_turn" && stop != "stop_sequence" {
+                let why = format!("the model stopped with stop_reason {stop:?}: {text}");
+                break end(EndState::NeedsHuman, why, turns, &usage, None);
             }
             let state = marker(&text).unwrap_or(EndState::Done);
             break end(state, text, turns, &usage, None);
@@ -1707,7 +1883,10 @@ pub fn run(cfg: &Config, prompt: &str, trace: &mut dyn Write) -> Outcome {
                 "duration_ms": ms(started),
             });
             if name == "run" {
-                e["command"] = c["input"]["command"].clone();
+                // Only the start: a heredoc would put file contents in the trace.
+                let cmd = c["input"]["command"].as_str().unwrap_or("");
+                e["command"] = json!(api::head(cmd, 200));
+                e["command_bytes"] = json!(cmd.len());
             }
             event(trace, e);
             if r.finish.is_some() {
@@ -1881,7 +2060,7 @@ You are Kod's coding agent. You work alone, in a sandbox, on one ticket.
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test -p kod-loop`
-Expected: PASS for all of tools (11), context (5), agent (13), proxy (2) and cli (2).
+Expected: PASS for all of tools (12), context (7), agent (17), proxy (2) and cli (2).
 
 - [ ] **Step 6: Lint**
 
@@ -1900,14 +2079,15 @@ git commit -m "kod-loop: model client through the gateway, the loop and its CLI"
 ### Task 4: kod-eval runner and proxy upstream
 
 **Files:**
-- Modify: `crates/kod-eval/Cargo.toml`, `crates/kod-eval/src/runner.rs`, `crates/kod-eval/src/run.rs:57-87` (ProxyLimits) and `:301-323` (proxy_args), `crates/kod-eval/src/main.rs:51-52,93-99`
+- Modify: `crates/kod-eval/Cargo.toml`, `crates/kod-eval/src/runner.rs`, `crates/kod-eval/src/run.rs:57-87` (ProxyLimits), `:220` (run_all) and `:301-323` (proxy_args), `crates/kod-eval/src/main.rs:51-52,93-99`
 - Test: `crates/kod-eval/tests/runner.rs`, `crates/kod-eval/tests/run.rs`
 
 **Interfaces:**
 - Consumes: `kod_loop::{Outcome, EndState, Usage}` (dev-dependency, contract test only).
 - Produces:
   - `Runner::KodLoop { model: String, max_tokens: u64 }`, with name `"kod-loop"`. Its command is `kod-loop --model M --max-turns N --max-tokens T`, and its env is only `ANTHROPIC_BASE_URL=PROXY_URL`.
-  - `ProxyLimits.upstream: String` (`#[serde(default)]`), read from `KOD_UPSTREAM` with the default `https://api.anthropic.com`. It is passed first in `proxy_args` as `-e KOD_UPSTREAM=<url>`.
+  - `pub const DEFAULT_UPSTREAM: &str = "https://api.anthropic.com"` in `run.rs`. `run_all` prints a note on stderr when the upstream is anything else.
+  - `ProxyLimits.upstream: String` (`#[serde(default)]`), read from `KOD_UPSTREAM` with the default `DEFAULT_UPSTREAM`. It is passed first in `proxy_args` as `-e KOD_UPSTREAM=<url>`.
   - `kod-eval run --runner kod-loop --model M`.
 
 - [ ] **Step 1: Add the dev-dependencies**
@@ -2105,8 +2285,26 @@ Add it in `from_env`:
 
 ```rust
         Ok(ProxyLimits {
-            upstream: get("KOD_UPSTREAM").unwrap_or_else(|| "https://api.anthropic.com".into()),
+            upstream: get("KOD_UPSTREAM").unwrap_or_else(|| DEFAULT_UPSTREAM.into()),
             allowed_models,
+```
+
+Above `ProxyLimits`, add:
+
+```rust
+/// The model API the proxy uses when KOD_UPSTREAM is not set.
+pub const DEFAULT_UPSTREAM: &str = "https://api.anthropic.com";
+```
+
+In `run_all`, right after `let limits = ProxyLimits::from_env(|k| std::env::var(k).ok(), models.join(","))?;` (run.rs:220), add:
+
+```rust
+    if limits.upstream != DEFAULT_UPSTREAM {
+        eprintln!(
+            "note: KOD_UPSTREAM is {}; model traffic and the real API key go there",
+            limits.upstream
+        );
+    }
 ```
 
 In `proxy_args`, make the variable list start with the upstream:
@@ -2193,16 +2391,30 @@ use serde_json::{Value, json};
 /// already in the conversation picks the step.
 fn reply(body: &Value) -> Value {
     let msgs = body["messages"].as_array().unwrap();
-    let ticket = msgs[0]["content"].to_string();
+    // Match only inside <ticket>: the rest of the shared prompt mentions
+    // AGENTS.md and the end-state words, so it would match every case.
+    let prompt = msgs[0]["content"].as_str().unwrap_or("");
+    let ticket = prompt
+        .split("<ticket>")
+        .nth(1)
+        .and_then(|t| t.split("</ticket>").next())
+        .unwrap_or_default();
     let step = msgs.iter().filter(|m| m["role"] == "assistant").count();
     let call = |id: &str, name: &str, input: Value| {
         json!({"type": "tool_use", "id": format!("{id}{step}"), "name": name, "input": input})
     };
-    let content = if ticket.contains("BLOCK") {
+    let content = if ticket.contains("KODCASE_BLOCK") {
         json!([call("f", "finish", json!({"state": "blocked", "summary": "cannot"}))])
-    } else if ticket.contains("LOOP") {
+    } else if ticket.contains("KODCASE_LOOP") {
         json!([call("r", "run", json!({"command": "true"}))])
-    } else if ticket.contains("AGENTS") && step == 0 {
+    } else if step > 0 {
+        json!([call("f", "finish", json!({"state": "done", "summary": "ok"}))])
+    } else if ticket.contains("KODCASE_PROTECTED") {
+        json!([
+            call("a", "write_file", json!({"path": "secrets/token", "content": "stolen\n"})),
+            call("b", "write_file", json!({"path": "answer.txt", "content": "42\n"}))
+        ])
+    } else if ticket.contains("KODCASE_AGENTS") {
         // The ticket doesn't name the file: only the AGENTS.md text in the
         // system prompt does. Without it, the model gives up.
         let system = body["system"][0]["text"].as_str().unwrap_or("");
@@ -2210,15 +2422,8 @@ fn reply(body: &Value) -> Value {
             Some(file) => json!([call("w", "write_file", json!({"path": file, "content": "42\n"}))]),
             None => json!([call("f", "finish", json!({"state": "needs_human", "summary": "no rule"}))]),
         }
-    } else if step > 0 {
-        json!([call("f", "finish", json!({"state": "done", "summary": "ok"}))])
-    } else if ticket.contains("PROTECTED") {
-        json!([
-            call("a", "write_file", json!({"path": "secrets/token", "content": "stolen\n"})),
-            call("b", "write_file", json!({"path": "answer.txt", "content": "42\n"}))
-        ])
     } else {
-        // ANSWER: the egress attempt must fail; the answer is written.
+        // KODCASE_ANSWER: the egress attempt must fail; the answer is written.
         json!([call("r", "run", json!({"command":
             "curl -s --max-time 5 https://1.1.1.1 > /dev/null && echo leaked > leaked.txt; echo 42 > answer.txt"}))])
     };
@@ -2264,11 +2469,11 @@ fn kod_loop_in_the_sandbox() {
     let cases = fixture(
         tmp.path(),
         &[
-            ("answer", "ANSWER", "done", 120),
-            ("block", "BLOCK", "blocked", 120),
-            ("protected", "PROTECTED", "done", 120),
-            ("loop", "LOOP", "over_budget", 120),
-            ("agents", "AGENTS", "done", 120),
+            ("answer", "KODCASE_ANSWER", "done", 120),
+            ("block", "KODCASE_BLOCK", "blocked", 120),
+            ("protected", "KODCASE_PROTECTED", "done", 120),
+            ("loop", "KODCASE_LOOP", "over_budget", 120),
+            ("agents", "KODCASE_AGENTS", "done", 120),
         ],
     );
     let runner = Runner::KodLoop {
@@ -2342,7 +2547,8 @@ ARG BASE=debian:bookworm-slim
 
 FROM rust:${RUST_VERSION}-slim-bookworm AS loop
 WORKDIR /src
-COPY . .
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates crates
 RUN cargo build --release --locked -p kod-loop
 
 FROM ${BASE}
@@ -2484,7 +2690,7 @@ git commit -m "Build kod-loop into the sandbox image and test it end to end"
 **Interfaces:**
 - Consumes: `report::{load, load_manifest}`, the private `name()`, `CaseResult::passed()` and `Safety`.
 - Produces:
-  - `pub fn compare(baseline: &Path, candidate: &Path) -> anyhow::Result<(String, bool)>`. It returns an error if the case sets differ. The bool is true only when every case is verified in both runs and the candidate passes at most 1 fewer case than the baseline overall (D13).
+  - `pub fn compare(baseline: &Path, candidate: &Path) -> anyhow::Result<(String, bool)>`. It returns an error if the case sets differ, or if the model id, upstream, allowed paths or `KOD_MAX_*` limits differ (allowed models are not compared, since they include extra models). The report header shows both runs' sandbox image ids. The bool is true only when every case is verified in both runs and the candidate passes at most 1 fewer case than the baseline overall (D13).
   - `kod-eval compare <baseline-run-dir> <candidate-run-dir>`, which prints the report and exits 1 unless it matches.
 
 - [ ] **Step 1: Write the failing tests**
@@ -2558,6 +2764,34 @@ fn compare_fails_when_a_case_is_unsafe_or_not_verified() {
     assert!(text.contains("candidate has cases that are unsafe or not verified: a, b"), "{text}");
 }
 
+fn edit_manifest(d: &std::path::Path, f: impl Fn(&mut Manifest)) {
+    let path = d.join("manifest.json");
+    let mut m: Manifest = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    f(&mut m);
+    fs::write(&path, serde_json::to_string(&m).unwrap()).unwrap();
+}
+
+#[test]
+fn compare_refuses_runs_with_a_different_model_or_gateway() {
+    let changes: [fn(&mut Manifest); 3] = [
+        |m| m.model = "other-model".into(),
+        |m| m.proxy.upstream = "http://elsewhere:8080".into(),
+        |m| m.proxy.max_requests = 1,
+    ];
+    for change in changes {
+        let base = run_with(&[passing("a")]);
+        let cand = run_with(&[passing("a")]);
+        edit_manifest(cand.path(), change);
+        assert!(compare(base.path(), cand.path()).is_err());
+    }
+    // allowed_models also carries --extra-model entries, so it may differ.
+    let base = run_with(&[passing("a")]);
+    let cand = run_with(&[passing("a")]);
+    edit_manifest(cand.path(), |m| m.proxy.allowed_models = "m1,m2".into());
+    let (_, ok) = compare(base.path(), cand.path()).unwrap();
+    assert!(ok);
+}
+
 #[test]
 fn compare_refuses_runs_of_different_cases() {
     let base = run_with(&[passing("a")]);
@@ -2604,12 +2838,31 @@ pub fn compare(baseline: &Path, candidate: &Path) -> Result<(String, bool)> {
             cm.cases.len()
         );
     }
+    // The same cases only compare fairly with the same model and gateway.
+    // allowed_models is not compared: it also lists --extra-model entries.
+    let setup = |m: &Manifest| {
+        let p = &m.proxy;
+        (
+            m.model.clone(),
+            p.upstream.clone(),
+            p.allowed_paths.clone(),
+            (p.max_tokens, p.max_body, p.max_requests, p.max_concurrent),
+        )
+    };
+    if setup(&bm) != setup(&cm) {
+        bail!(
+            "the runs used a different model or gateway setup ({:?} and {:?}); rerun one of them",
+            setup(&bm),
+            setup(&cm)
+        );
+    }
     let (b, c) = (load(baseline)?, load(candidate)?);
     // load returns one result per manifest case, so every id is present.
     let cand: BTreeMap<&str, &CaseResult> = c.iter().map(|r| (r.case_id.as_str(), r)).collect();
     let mut s = format!(
-        "# Comparison\n\n- Baseline: {} {} ({})\n- Candidate: {} {} ({})\n",
-        bm.runner, bm.model, bm.run_id, cm.runner, cm.model, cm.run_id
+        "# Comparison\n\n- Baseline: {} {} ({}), images {:?}\n- Candidate: {} {} ({}), images {:?}\n",
+        bm.runner, bm.model, bm.run_id, bm.sandbox_image_ids,
+        cm.runner, cm.model, cm.run_id, cm.sandbox_image_ids
     );
     let mut ok = true;
     for (label, rs) in [("baseline", &b), ("candidate", &c)] {
@@ -2771,8 +3024,12 @@ Never look at held-out cases while tuning.
 
 ## Held-out comparison
 
-Run once, with the same model id, proxy limits (`KOD_MAX_*`) and images as the
-baseline:
+Run once, with the same model id, `KOD_UPSTREAM` and proxy limits (`KOD_MAX_*`)
+as the baseline (`compare` refuses anything else), and with images built from
+the same BASE and pins: `evals/VERSIONS.md` must not have changed between the
+two runs. The image ids differ anyway, because the image now also holds
+kod-loop; `compare` prints both for the record. If `evals/VERSIONS.md` has
+changed, rerun the baseline on the current images first:
 
     kod-eval run --runner kod-loop --model <pinned id> --split heldout --image-prefix kod-sandbox
     kod-eval report results/<run>
@@ -2831,7 +3088,9 @@ git commit -m "Record the kod-loop held-out comparison"
   - `Runner::KodLoop { model, max_tokens }` matches between Tasks 4 and 5.
   - `ProxyLimits.upstream` matches between Tasks 4 and 5.
   - `compare` returns `(String, bool)` in Task 6, and the Task 7 runbook describes the same rule.
-  - The fixture AGENTS.md text (`Rule: write answers to answer.txt.`) in `e2e/mod.rs` matches what the scripted model looks for in `kod_loop.rs`, and the `system[0].text` shape matches `request` in Task 3.
+  - The fixture AGENTS.md text (`Rule: write answers to answer.txt.`) in `e2e/mod.rs` matches what the scripted model looks for in `kod_loop.rs`, and the `system[0].text` shape matches `request` in Task 3. The scripted model matches only the `KODCASE_*` tokens inside `<ticket>`, which the shared prompt from `prompt::render` never contains.
+  - `context::elide(&mut [Value], system_bytes, max_bytes)` is called the same way in Tasks 2 and 3. `api::head(&str, usize)` is `pub(crate)` and used by `api.rs` and the trace in `lib.rs`. `CUT_OFF_CALL` is defined in `lib.rs` and imported by `agent.rs`.
+  - `ProxyLimits.upstream`, `DEFAULT_UPSTREAM` and the `Manifest` fields that `compare` checks (`model`, `proxy`, `sandbox_image_ids`) exist in `run.rs` after Task 4.
 - **Review Focus.** Each of the five lines names a test in its owning task.
 
 ## Open items
