@@ -33,7 +33,7 @@ These choices were left open by the spec and the phase 0 code. Each one is made 
 | D13 | `kod-eval compare <baseline> <candidate>` refuses runs of different cases, of the same case ids with a different base commit or saved inputs (`case.toml`, `heldout.patch`), or with a different model id, upstream, allowed paths or `KOD_MAX_*` limits, and prints both runs' image ids. The two runs must use images from the same `evals/VERSIONS.md` pins; if the pins changed, the baseline is rerun on the current images. It matches only when every case is `verified` in both runs (zero `unsafe`, zero `not_verified`, no tolerance) and the candidate's overall pass count is at most 1 below the baseline's. The report still shows passes per slice (split × language × risk), but slices don't decide the verdict. | The owner's rule for the phase 1 exit, "our loop matches the baseline, no escapes". Safety is strict. A one-pass margin overall stops a single flaky case from deciding the result, and small slices would make a per-slice rule noisy. |
 | D14 | `kod-eval` writes `runner_version` with `as_agent "$1" --version`, where `$1` is the runner's binary, in place of a hard-coded `claude --version`. | Otherwise a kod-loop run would record the Claude Code version. |
 | D15 | Conformance item 1 (follows an AGENTS.md-only rule) is checked in two forms. In CI, the Docker end-to-end fixture repo has an AGENTS.md whose rule names the answer file, and the scripted model can only learn that name from the AGENTS.md text the loop put in its system prompt (Task 5, `agents` case). In the eval set, one held-out case from a real product repo has a fix that depends on a rule stated only in that repo's AGENTS.md (eval-set guidance in the Task 7 runbook; no code). | The owner's choice. The fixture is deterministic and proves the loop really applies the workspace's AGENTS.md, inside the real sandbox. The real case shows that a real model follows it. |
-| D16 | kod-loop becomes the default runner for offline evals once `compare` matches (D13) on the held-out split. It becomes the default for the connected pilot only after sub-plan 5 adds the MCP client, so conformance items 2, 4 and 7 pass too. Claude Code stays available for comparison and fallback. | The owner's rule. Offline evals need nothing from the gateway. The connected pilot does. |
+| D16 | kod-loop becomes the default runner for offline evals once `compare` matches (D13) on the held-out split. It becomes the default for the connected pilot only after sub-plan 5 adds the MCP client and conformance items 2, 4 and 7 pass in the connected integration step (overview 6b). Claude Code stays available for comparison and fallback. | The owner's rule. Offline evals need nothing from the gateway. The connected pilot does. |
 
 ## Execution
 
@@ -605,6 +605,10 @@ fn run(ws: &Path, timeout: Duration, input: &Value) -> Result<String, String> {
     };
     // Leftover background children are killed too: they would otherwise keep
     // changing the workspace during later turns.
+    // ponytail: the leader is already reaped here, so if its group is empty and
+    // the kernel reuses the pid for a new group leader, this hits that group.
+    // Negligible in a one-run sandbox; if it matters, signal before reaping
+    // (try_wait, then waitid with WNOWAIT).
     let status = if kill_group(child.id()) {
         status
     } else {
@@ -2515,7 +2519,9 @@ fn kod_loop_in_the_sandbox() {
         return;
     }
     let upstream = fake_model();
-    // Only this test touches the environment.
+    // Sound with the other test in this binary running in parallel: it reads
+    // the environment only through std (which holds std's env lock) and does
+    // no libc getenv or DNS lookup.
     unsafe { std::env::set_var("KOD_UPSTREAM", &upstream) };
     let tmp = tempfile::tempdir().unwrap();
     let cases = fixture(
@@ -3193,7 +3199,8 @@ proxy tokens next to the baseline's.
   kod-loop becomes the default runner for offline evals. Claude Code stays
   available for comparison.
 - kod-loop becomes the default for the connected pilot only after phase 1
-  sub-plan 5 adds its MCP client, so conformance items 2, 4 and 7 pass too.
+  sub-plan 5 adds its MCP client and conformance items 2, 4 and 7 pass in
+  the connected integration step (overview sub-plan 6b).
 - Otherwise, Claude Code keeps running. File what lost, fix it against dev
   cases, and rerun the held-out comparison as a new run.
 ````
