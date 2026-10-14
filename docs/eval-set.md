@@ -35,7 +35,11 @@ Each repository gets a sanitized mirror on the eval host:
 Then:
 
 1. Paste the ticket text into `case.toml` exactly as the requester wrote it.
-2. Set `split`, `protected_paths` and the budget.
+2. Set `split`, `protected_paths` and the budget. `[budget]` holds
+   `max_turns`, `timeout_secs`, `memory` (also the swap limit), `cpus` and
+   `disk` (default `"2g"`). `disk` sizes each of the sandbox's `/work` and
+   `/tmp`. Both are tmpfs and count against `memory`, so `disk` must be below
+   `memory`, and the build output under `/tmp` must fit in it.
 3. Run `kod-eval check-case evals/cases/PAY-123`. It must report `ok`, and it
    records the held-back tests that fail without the fix and pass with it as
    `required_tests`. A run counts a case as passed only if every one of them
@@ -50,7 +54,7 @@ ran. Each language's sandbox image needs the reporter installed.
 
 | Language | `test_command` |
 |---|---|
-| Rust | `CARGO_TARGET_DIR=/tmp/target cargo nextest run --offline --config-file /etc/kod/nextest.toml --profile kod; s=$?; cp /tmp/target/nextest/kod/junit.xml "$KOD_JUNIT"; exit $s` (the image ships `/etc/kod/nextest.toml` from `images/sandbox/nextest.toml`, which keeps nextest's store under `/tmp` and turns on JUnit; build the image with `--build-arg NEXTEST_VERSION=<pinned>`. The repository must commit `Cargo.lock`, because cargo can't write one into the read-only workspace) |
+| Rust | `CARGO_TARGET_DIR=/tmp/target cargo nextest run --offline --config-file /etc/kod/nextest.toml --profile kod; s=$?; cp /tmp/target/nextest/kod/junit.xml "$KOD_JUNIT"; exit $s` (the image ships `/etc/kod/nextest.toml` from `images/sandbox/nextest.toml`, which keeps nextest's store under `/tmp` and turns on JUnit; build the image with the pinned `NEXTEST_VERSION` from `evals/VERSIONS.md`. The repository must commit `Cargo.lock`, because cargo can't write one into the read-only workspace) |
 | Python | `PYTHONDONTWRITEBYTECODE=1 pytest -p no:cacheprovider --junitxml="$KOD_JUNIT"` |
 | Go | `GOCACHE=/tmp/gocache go test -v ./... 2>&1 \| go-junit-report -set-exit-code > "$KOD_JUNIT"` |
 | JavaScript | `JEST_JUNIT_OUTPUT_FILE="$KOD_JUNIT" npx jest --ci --cacheDirectory /tmp/jest --reporters=jest-junit` |

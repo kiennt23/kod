@@ -34,16 +34,21 @@ Missing evidence never reads as clean.
 Run on a dedicated Linux host with Docker (see the runbook for why).
 
 ```sh
-# 1. Build the CLI and the images (exact sandbox build command: evals/VERSIONS.md)
-cargo build --release -p kod-eval
+# 1. Install the CLI and build the images
+cargo install --path crates/kod-eval --locked   # puts kod-eval in ~/.cargo/bin
 docker build -t kod-llm-proxy --build-arg RUST_VERSION=1.99.0 -f images/proxy/Dockerfile .
-docker build -t kod-sandbox-rust --build-arg BASE=... --build-arg CLAUDE_CODE_VERSION=... images/sandbox
+docker build -t kod-sandbox-rust \
+  --build-arg BASE=rust:1.99.0-bookworm@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6 \
+  --build-arg NODE_VERSION=22.23.3 --build-arg CLAUDE_CODE_VERSION=2.1.296 \
+  --build-arg NEXTEST_VERSION=0.9.148 images/sandbox  # pinned in evals/VERSIONS.md; keep the two in step
 
-# 2. Turn a merged change into a case, then check it (records required_tests)
+# 2. Turn a merged change into a case, then check it (records required_tests).
+#    The test command is the Rust one from docs/eval-set.md: the workspace is
+#    read-only, so build output stays under /tmp and JUnit goes to $KOD_JUNIT.
 kod-eval new-case --mirror /srv/mirrors/payments.git --merge-commit <sha> --id PAY-123 \
   --language rust --risk-class low --test-path tests/refund.rs \
-  --test-command 'cargo nextest run --config-file /etc/kod/nextest.toml --profile kod'
-$EDITOR evals/cases/PAY-123/case.toml      # write the ticket text
+  --test-command 'CARGO_TARGET_DIR=/tmp/target cargo nextest run --offline --config-file /etc/kod/nextest.toml --profile kod; s=$?; cp /tmp/target/nextest/kod/junit.xml "$KOD_JUNIT"; exit $s'
+$EDITOR evals/cases/PAY-123/case.toml      # write the ticket text; set split and [budget]
 kod-eval check-case evals/cases/PAY-123
 
 # 3. Run the dev split against a pinned model, then read the report
