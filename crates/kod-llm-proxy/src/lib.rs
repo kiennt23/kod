@@ -194,7 +194,8 @@ async fn forward(State(st): State<Arc<AppState>>, req: Request) -> Response {
                 .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
         }
         Err(e) => {
-            eprintln!("upstream: {e}");
+            // Without the URL, which carries a query string the agent chose.
+            eprintln!("upstream: {}", e.without_url());
             refuse("upstream_error", &path, StatusCode::BAD_GATEWAY)
         }
     }

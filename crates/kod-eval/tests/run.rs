@@ -80,3 +80,16 @@ fn recorded_proxy_defaults_are_the_proxys_own() {
         )
     );
 }
+
+#[test]
+fn only_a_recorded_zero_passes_the_process_gate() {
+    use kod_eval::run::process_gate;
+    assert!(process_gate(Some("0\n")).is_ok());
+    assert!(
+        process_gate(Some("3"))
+            .unwrap_err()
+            .contains("alive at archive: 3")
+    );
+    assert!(process_gate(Some("")).is_err());
+    assert!(process_gate(None).unwrap_err().contains("no process check"));
+}

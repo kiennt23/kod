@@ -29,6 +29,17 @@ Node.js is too old. Check it with
 `docker run --rm --entrypoint claude kod-sandbox-rust --version` and
 `docker run --rm --entrypoint cargo kod-sandbox-rust nextest --version`.
 
+## Memory
+
+The case template's 6g memory limit (8g for the collect container, which mounts
+one more tmpfs) can exceed the VM of a small Docker Desktop or OrbStack install.
+If the VM has less available memory than the container limit, the VM may run
+out of memory before the container reaches its configured limit, so the run is
+bounded by VM capacity rather than the case budget, and neighboring containers
+can be affected. Allocate enough VM memory for the collector, concurrent
+services and OS overhead, or lower `memory` and `disk` in the cases. Run real
+evals on the dedicated Linux host.
+
 ## Smoke test
 
 1. Create one trivial case, then run `kod-eval check-case evals/cases/<id>`

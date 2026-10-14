@@ -8,9 +8,27 @@ mode=$1
 shift
 as_agent() { env HOME=/home/agent setpriv --reuid=agent --regid=agent --init-groups -- "$@"; }
 give_back() { chown -R "${KOD_HOST_UID:-0}:${KOD_HOST_GID:-0}" "$@"; }
+# Sets $pids to the live (not zombie) processes of the agent user. Shell
+# builtins only, since forking can fail at the pid limit.
+agent_uid=$(id -u agent)
+find_agent() {
+  pids=
+  for s in /proc/[0-9]*/status; do
+    st=
+    while read -r k u _; do
+      [ "$k" = State: ] && st=$u
+      if [ "$k" = Uid: ] && [ "$u" = "$agent_uid" ] && [ "$st" != Z ]; then
+        p=${s#/proc/}
+        pids="$pids ${p%/status}"
+      fi
+    done < "$s"
+  done 2> /dev/null
+}
 # Ends everything the agent user started, so nothing can still write. Only
-# pgrep's "no match" (1) ends the loop: a failed fork (at the pid limit) or any
-# other error keeps it going.
+# pgrep's "no match" (1) ends the loop; any other status retries. At the pid
+# limit dash can't fork pgrep and exits this subshell instead of retrying; the
+# guarantee then comes from PID 1's kill -KILL -1 below and the host's
+# docker kill.
 kill_agent() {
   while :; do
     pgrep -u agent > /dev/null
@@ -52,6 +70,11 @@ agent)
   # PID 1 can signal everything left without forking, even at the pid limit.
   [ $$ -eq 1 ] && kill -KILL -1 2> /dev/null
   kill_agent
+  # Evidence that no agent process is alive when the archive starts.
+  find_agent
+  set -- $pids
+  alive=$#
+  echo "$alive" > /out/agent_procs
   # ponytail: metrics come from inside the container; read them from the host cgroup if they ever need to be tamper-proof
   cat /sys/fs/cgroup/memory.peak > /out/memory_peak
   awk '$1 == "usage_usec" { print $2 }' /sys/fs/cgroup/cpu.stat > /out/cpu_usec
@@ -59,7 +82,9 @@ agent)
   # files at full size, so the archive is as large as what collect extracts,
   # and anything over the disk budget is not collected. Renamed only when
   # complete, since tar reads a truncated archive without error.
-  if bounded "$KOD_DISK_BYTES" /out/work.tar.part tar -C /work --hard-dereference -cf - .; then
+  if [ "$alive" -ne 0 ]; then
+    echo "agent processes alive at archive: $alive" > /out/work_error
+  elif bounded "$KOD_DISK_BYTES" /out/work.tar.part tar -C /work --hard-dereference -cf - . 2> /dev/null; then
     mv /out/work.tar.part /out/work.tar
   else
     rm -f /out/work.tar.part
