@@ -20,16 +20,14 @@ Record every version in `evals/VERSIONS.md`.
 
     RUST=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)
     docker build -t kod-llm-proxy --build-arg RUST_VERSION=$RUST -f images/proxy/Dockerfile .
-    docker build -t kod-sandbox-rust \
-      --build-arg BASE=rust:<product toolchain version>-bookworm \
-      --build-arg CLAUDE_CODE_VERSION=<pinned version> \
-      --build-arg NEXTEST_VERSION=<pinned cargo-nextest version> images/sandbox
+    # The sandbox image: use the exact command and versions in evals/VERSIONS.md.
 
-Build one sandbox image per product language. Check it with
+Build one sandbox image per product language and pin its base image by digest.
+Claude Code runs on the Node.js the Dockerfile installs from nodejs.org
+(`NODE_VERSION`, checked against its SHASUMS256.txt), because distribution
+Node.js is too old. Check it with
 `docker run --rm --entrypoint claude kod-sandbox-rust --version` and
-`docker run --rm --entrypoint cargo kod-sandbox-rust nextest --version`. If Claude Code
-needs a newer Node.js than the distribution ships, install Node.js from the
-official release tarball in the Dockerfile and record the version.
+`docker run --rm --entrypoint cargo kod-sandbox-rust nextest --version`.
 
 ## Smoke test
 

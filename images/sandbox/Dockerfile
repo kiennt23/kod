@@ -1,16 +1,22 @@
 # One image per product language. BASE is that language's toolchain image,
 # for example rust:<version>-bookworm. Claude Code is installed only when
-# CLAUDE_CODE_VERSION is set, and cargo-nextest only when NEXTEST_VERSION is
-# set (Rust images). EXTRA_PACKAGES is for test images.
+# CLAUDE_CODE_VERSION is set, on Node.js NODE_VERSION from nodejs.org (checked
+# against its SHASUMS256.txt; distribution Node.js is too old), and
+# cargo-nextest only when NEXTEST_VERSION is set (Rust images). EXTRA_PACKAGES is for test images.
 ARG BASE=debian:bookworm-slim
 FROM ${BASE}
 ARG CLAUDE_CODE_VERSION=""
 ARG EXTRA_PACKAGES=""
 ARG NEXTEST_VERSION=""
+ARG NODE_VERSION=22.23.3
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git ca-certificates util-linux procps ${NEXTEST_VERSION:+curl} ${EXTRA_PACKAGES} \
+ && apt-get install -y --no-install-recommends git ca-certificates util-linux procps ${NEXTEST_VERSION:+curl} ${CLAUDE_CODE_VERSION:+curl xz-utils} ${EXTRA_PACKAGES} \
  && if [ -n "$CLAUDE_CODE_VERSION" ]; then \
-      apt-get install -y --no-install-recommends nodejs npm \
+      case "$(dpkg --print-architecture)" in arm64) a=arm64 ;; *) a=x64 ;; esac \
+      && n="node-v${NODE_VERSION}-linux-$a.tar.xz" \
+      && cd /tmp && curl -fsSLO "https://nodejs.org/dist/v${NODE_VERSION}/$n" \
+      && curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/SHASUMS256.txt" | grep " $n\$" | sha256sum -c - \
+      && tar -xJf "$n" -C /usr/local --strip-components=1 && rm "$n" && cd / \
       && npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"; \
     fi \
  && if [ -n "$NEXTEST_VERSION" ]; then \
