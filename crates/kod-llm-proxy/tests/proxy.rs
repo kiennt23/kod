@@ -2,6 +2,7 @@ use axum::{
     Router,
     body::Bytes,
     http::{HeaderMap, Uri},
+    response::IntoResponse,
     routing::{get, post},
 };
 use kod_llm_proxy::{Config, Limits, USAGE_FIELDS, Usage, app};
@@ -302,62 +303,148 @@ fn reads_usage_from_json_and_event_streams_in_any_chunking() {
         let u = usage_of(sse, body, 3);
         assert!(USAGE_FIELDS.iter().all(|k| u[k].is_null()), "{u}");
     }
+    // A stream cut before message_stop has a real input count, but its output
+    // count is unknown, not message_start's placeholder.
+    let cut = &SSE[..SSE.find("event: message_stop").unwrap()];
+    let u = usage_of(true, cut, 7);
+    assert_eq!(u["input_tokens"], 12);
+    assert!(u["output_tokens"].is_null(), "{u}");
 }
 
-/// The proxy binary passes an event stream through unchanged and logs one
-/// usage line once the stream has ended.
-#[tokio::test]
-async fn logs_usage_after_a_stream_and_passes_it_through_unchanged() {
-    let upstream = serve(Router::new().route(
-        "/v1/messages",
-        post(|| async { ([("content-type", "text/event-stream")], SSE) }),
-    ))
-    .await;
+/// Starts the proxy binary against `upstream`, waits until it answers, and
+/// returns its URL and its stdout lines.
+async fn spawn_proxy(
+    upstream: &str,
+    env: &[(&str, &str)],
+) -> (
+    String,
+    tokio::process::Child,
+    tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
+) {
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
         .unwrap()
         .port();
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_kod-llm-proxy"))
-        .env("KOD_UPSTREAM", &upstream)
+        .env("KOD_UPSTREAM", upstream)
         .env("KOD_API_KEY", "real-key")
         .env("KOD_ALLOWED_MODELS", MODEL)
         .env("KOD_LISTEN", format!("127.0.0.1:{port}"))
+        .envs(env.iter().copied())
         .stdout(std::process::Stdio::piped())
         .kill_on_drop(true)
         .spawn()
         .unwrap();
-    let p = format!("http://127.0.0.1:{port}");
-    let mut body = None;
     for _ in 0..100 {
-        if let Ok(r) = reqwest::Client::new()
-            .post(format!("{p}/v1/messages"))
-            .body(msg(MODEL, 10))
-            .send()
-            .await
-        {
-            body = Some(r.text().await.unwrap());
+        if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert_eq!(body.as_deref(), Some(SSE));
-    let mut lines = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
-    let mut events = vec![];
-    while let Ok(Some(line)) = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+    let lines = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+    (format!("http://127.0.0.1:{port}"), child, lines)
+}
+
+/// Log lines until the proxy has been quiet for half a second.
+async fn drain(
+    lines: &mut tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
+) -> Vec<serde_json::Value> {
+    let mut out = vec![];
+    while let Ok(Ok(Some(l))) =
+        tokio::time::timeout(Duration::from_millis(500), lines.next_line()).await
+    {
+        out.push(serde_json::from_str(&l).unwrap());
+    }
+    out
+}
+
+fn sse_upstream() -> Router {
+    Router::new().route(
+        "/v1/messages",
+        post(|body: String| async move {
+            if body.contains("fail") {
+                (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    [("content-type", "application/json")],
+                    r#"{"error":{}}"#,
+                )
+                    .into_response()
+            } else {
+                ([("content-type", "text/event-stream")], SSE).into_response()
+            }
+        }),
+    )
+}
+
+/// The proxy binary passes an event stream through unchanged and logs one
+/// usage line once the stream has ended.
+#[tokio::test]
+async fn logs_usage_after_a_stream_and_passes_it_through_unchanged() {
+    let upstream = serve(sse_upstream()).await;
+    let (p, _child, mut lines) = spawn_proxy(&upstream, &[]).await;
+    let body = reqwest::Client::new()
+        .post(format!("{p}/v1/messages"))
+        .body(msg(MODEL, 10))
+        .send()
         .await
         .unwrap()
-    {
-        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
-        events.push(v["event"].as_str().unwrap().to_owned());
-        if v["event"] == "usage" {
-            assert_eq!(
-                (v["input_tokens"].clone(), v["output_tokens"].clone()),
-                (12.into(), 34.into())
-            );
-            assert_eq!(v["status"], 200);
-            break;
-        }
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(body, SSE);
+    let events = drain(&mut lines).await;
+    let names: Vec<_> = events.iter().map(|v| v["event"].clone()).collect();
+    assert_eq!(names, ["allow", "usage"]);
+    let v = &events[1];
+    assert_eq!(
+        (v["input_tokens"].clone(), v["output_tokens"].clone()),
+        (12.into(), 34.into())
+    );
+    assert_eq!(v["status"], 200);
+}
+
+/// The log is bounded by the request budget: refused paths count against it,
+/// only the first request past it is logged, logged paths are cut short, and
+/// error responses get no usage line.
+#[tokio::test]
+async fn log_lines_are_bounded_by_the_request_budget() {
+    let upstream = serve(sse_upstream()).await;
+    let (p, _child, mut lines) = spawn_proxy(&upstream, &[("KOD_MAX_REQUESTS", "3")]).await;
+    let c = reqwest::Client::new();
+    let long = format!("{p}/v1/{}", "x".repeat(10_000));
+    assert_eq!(c.post(&long).send().await.unwrap().status(), 403);
+    let ok = c
+        .post(format!("{p}/v1/messages"))
+        .body(msg(MODEL, 10))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 200);
+    ok.text().await.unwrap();
+    let fail = format!(r#"{{"model":"{MODEL}","max_tokens":10,"fail":1}}"#);
+    let res = c
+        .post(format!("{p}/v1/messages"))
+        .body(fail)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 500);
+    res.text().await.unwrap();
+    for _ in 0..20 {
+        assert_eq!(c.post(&long).send().await.unwrap().status(), 429);
     }
-    assert_eq!(events, ["allow", "usage"]);
+    let events = drain(&mut lines).await;
+    let names: Vec<_> = events
+        .iter()
+        .map(|v| v["event"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        ["deny", "allow", "usage", "allow", "over_budget"],
+        "{events:?}"
+    );
+    for v in &events {
+        assert!(v.to_string().len() < 1024, "{v}");
+    }
 }

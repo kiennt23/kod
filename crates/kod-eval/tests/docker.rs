@@ -61,7 +61,17 @@ fn end_to_end() {
     assert!(m.sandbox_image_ids["test"].starts_with("sha256:"), "{text}");
     assert_eq!(m.proxy.max_requests, 200, "{text}");
     assert_eq!(m.kod_eval_version, env!("CARGO_PKG_VERSION"));
-    assert_ne!(m.kod_eval_git_sha, "", "{text}");
+    // The commit this test binary was built from, so "unknown" fails.
+    let head = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .unwrap();
+    assert_eq!(
+        m.kod_eval_git_sha,
+        String::from_utf8_lossy(&head.stdout).trim(),
+        "{text}"
+    );
     for c in &cases {
         assert_eq!(m.base_commits[&c.id], c.base_commit, "{text}");
         let inputs = dir.join(&c.id).join("inputs");

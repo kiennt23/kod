@@ -40,7 +40,7 @@ fn proxy_gets_the_key_by_name_and_the_recorded_limits() {
 }
 
 #[test]
-fn proxy_limits_come_from_the_environment_and_never_hold_the_key() {
+fn proxy_limits_come_from_the_environment() {
     let env = |k: &str| match k {
         "KOD_MAX_TOKENS" => Some("100".to_owned()),
         "KOD_ALLOWED_PATHS" => Some("/v1/messages".to_owned()),
@@ -57,5 +57,26 @@ fn proxy_limits_come_from_the_environment_and_never_hold_the_key() {
     };
     let lim = ProxyLimits::from_env(env, "m".into()).unwrap();
     assert_eq!((lim.max_tokens, lim.max_requests), (100, 200));
-    assert!(!serde_json::to_string(&lim).unwrap().contains("sekret"));
+}
+
+/// Unset settings are recorded as the values kod-llm-proxy actually uses.
+#[test]
+fn recorded_proxy_defaults_are_the_proxys_own() {
+    use kod_llm_proxy as p;
+    let lim = ProxyLimits::from_env(|_| None, "m".into()).unwrap();
+    assert_eq!(lim.allowed_paths, p::DEFAULT_ALLOWED_PATHS);
+    assert_eq!(
+        (
+            lim.max_tokens,
+            lim.max_body,
+            lim.max_requests,
+            lim.max_concurrent
+        ),
+        (
+            p::DEFAULT_MAX_TOKENS,
+            p::DEFAULT_MAX_BODY,
+            p::DEFAULT_MAX_REQUESTS,
+            p::DEFAULT_MAX_CONCURRENT
+        )
+    );
 }

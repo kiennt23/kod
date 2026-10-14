@@ -14,3 +14,4 @@ toml = "0.9"
 
 [dev-dependencies]
 tempfile = "3"
+kod-llm-proxy = { path = "../kod-llm-proxy" }

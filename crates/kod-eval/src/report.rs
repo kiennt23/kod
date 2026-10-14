@@ -60,16 +60,33 @@ pub fn proxy_denials(log: &str) -> usize {
 }
 
 /// Input and output tokens summed over the proxy's usage lines (None when no
-/// line had a value), and how many usage lines lacked either count.
+/// line had a value), and how many model responses lack either count: usage
+/// lines with a null, plus successful /v1/messages responses that never got a
+/// usage line (the proxy only writes it when the body ends).
 pub fn proxy_tokens(log: &str) -> (Option<u64>, Option<u64>, usize) {
     let (mut input, mut output, mut missing) = (None, None, 0);
-    for v in proxy_events(log).filter(|v| v["event"] == "usage") {
-        let (i, o) = (v["input_tokens"].as_u64(), v["output_tokens"].as_u64());
-        input = sum(input, i);
-        output = sum(output, o);
-        missing += usize::from(i.is_none() || o.is_none());
+    let (mut responses, mut usage_lines) = (0usize, 0usize);
+    for v in proxy_events(log) {
+        let ok = v["status"]
+            .as_u64()
+            .is_some_and(|s| (200..300).contains(&s));
+        match v["event"].as_str() {
+            Some("allow") if ok && v["path"] == "/v1/messages" => responses += 1,
+            Some("usage") => {
+                usage_lines += 1;
+                let (i, o) = (v["input_tokens"].as_u64(), v["output_tokens"].as_u64());
+                input = sum(input, i);
+                output = sum(output, o);
+                missing += usize::from(i.is_none() || o.is_none());
+            }
+            _ => {}
+        }
     }
-    (input, output, missing)
+    (
+        input,
+        output,
+        missing + responses.saturating_sub(usage_lines),
+    )
 }
 
 /// Adds what is known; None only when nothing is.

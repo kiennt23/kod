@@ -206,6 +206,16 @@ fn sums_proxy_tokens_and_counts_responses_without_usage() {
 "#;
     assert_eq!(proxy_tokens(log), (Some(15), Some(3), 2));
     assert_eq!(proxy_tokens("{\"event\":\"allow\"}\n"), (None, None, 0));
+    // A model response whose usage line never came (the proxy was removed
+    // mid-stream) is missing too. Error responses and token counting have no
+    // usage, so they are neither.
+    let log = r#"{"event":"allow","path":"/v1/messages","status":200}
+{"event":"allow","path":"/v1/messages","status":200}
+{"event":"usage","path":"/v1/messages","status":200,"input_tokens":4,"output_tokens":2}
+{"event":"allow","path":"/v1/messages","status":529}
+{"event":"allow","path":"/v1/messages/count_tokens","status":200}
+"#;
+    assert_eq!(proxy_tokens(log), (Some(4), Some(2), 1));
 }
 
 #[test]

@@ -448,6 +448,16 @@ fn run_case(
     }
     let proxy_saved = match proxy_log {
         Ok(log) => {
+            // The proxy logs a bounded number of lines per request; the cap
+            // is for a runaway one.
+            let mut log = log;
+            if log.len() as u64 > sandbox::LOG_CAP {
+                log.truncate(log.floor_char_boundary(sandbox::LOG_CAP as usize));
+                r.notes.push(format!(
+                    "proxy.log was cut at {} MiB",
+                    sandbox::LOG_CAP >> 20
+                ));
+            }
             let (input, output, missing) = report::proxy_tokens(&log);
             (r.proxy_input_tokens, r.proxy_output_tokens) = (input, output);
             if missing > 0 {

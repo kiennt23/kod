@@ -4,10 +4,13 @@
 //! request is checked against the case's limits before it is forwarded,
 //! because code in the sandbox can call the proxy without the runner.
 //!
-//! Log lines are JSON on stdout. Each request gets one line when it is
-//! allowed or refused; an allowed /v1/messages request gets a second line,
-//! event "usage", when its response body ends, with the token counts the
-//! response reported (null when it reported none).
+//! Log lines are JSON on stdout. Each request within the request budget gets
+//! one line when it is allowed or refused, and the first request past it gets
+//! an "over_budget" line; later ones are refused silently, so the log is
+//! bounded by the budget. Logged paths are cut at LOG_PATH_MAX bytes. An
+//! allowed /v1/messages request with a 2xx response gets a second line, event
+//! "usage", when its response body ends, with the token counts the response
+//! reported (null when it reported none or the stream ended early).
 use axum::{
     Router,
     body::{Body, to_bytes},
@@ -32,6 +35,16 @@ const DROP: [&str; 6] = [
     "x-api-key",
     "authorization",
 ];
+
+/// Defaults for the KOD_* settings, shared with kod-eval, which records them.
+pub const DEFAULT_ALLOWED_PATHS: &str = "/v1/messages,/v1/messages/count_tokens";
+pub const DEFAULT_MAX_TOKENS: u64 = 8192;
+pub const DEFAULT_MAX_BODY: u64 = 4 << 20;
+pub const DEFAULT_MAX_REQUESTS: u64 = 200;
+pub const DEFAULT_MAX_CONCURRENT: u64 = 2;
+
+/// Logged paths are cut to this many bytes; the agent chooses them.
+const LOG_PATH_MAX: usize = 256;
 
 #[derive(Clone)]
 pub struct Limits {
@@ -108,12 +121,18 @@ fn check_body(lim: &Limits, path: &str, body: &[u8]) -> Result<(), (&'static str
 
 async fn forward(State(st): State<Arc<AppState>>, req: Request) -> Response {
     let path = req.uri().path().to_owned();
+    let lim = &st.cfg.limits;
+    // Every request counts, refused ones too, so a script can neither probe
+    // nor fill the log for free.
+    let n = st.requests.fetch_add(1, Ordering::SeqCst);
+    if n > lim.max_requests {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    }
+    if n == lim.max_requests {
+        return refuse("over_budget", &path, StatusCode::TOO_MANY_REQUESTS);
+    }
     if !st.cfg.allowed_paths.contains(&path) {
         return refuse("deny", &path, StatusCode::FORBIDDEN);
-    }
-    let lim = &st.cfg.limits;
-    if st.requests.fetch_add(1, Ordering::SeqCst) >= lim.max_requests {
-        return refuse("over_budget", &path, StatusCode::TOO_MANY_REQUESTS);
     }
     let url = format!(
         "{}{}",
@@ -157,7 +176,8 @@ async fn forward(State(st): State<Arc<AppState>>, req: Request) -> Response {
                 .get("content-type")
                 .and_then(|v| v.to_str().ok())
                 .is_some_and(|v| v.starts_with("text/event-stream"));
-            let mut meter = (path == "/v1/messages").then(|| Meter {
+            // Error responses carry no usage.
+            let mut meter = (path == "/v1/messages" && up.status().is_success()).then(|| Meter {
                 usage: Usage::new(sse),
                 path: path.clone(),
                 status: up.status().as_u16(),
@@ -191,7 +211,10 @@ fn log_with(event: &str, path: &str, status: u16, mut extra: Map<String, Value>)
     for (k, v) in [
         ("ts", json!(ts)),
         ("event", json!(event)),
-        ("path", json!(path)),
+        (
+            "path",
+            json!(path.get(..path.floor_char_boundary(LOG_PATH_MAX))),
+        ),
         ("status", json!(status)),
     ] {
         extra.insert(k.into(), v);
@@ -233,6 +256,8 @@ pub struct Usage {
     sse: bool,
     buf: Vec<u8>,
     overflow: bool,
+    /// message_stop arrived, so the last output count is final.
+    stopped: bool,
     seen: Map<String, Value>,
 }
 
@@ -242,6 +267,7 @@ impl Usage {
             sse,
             buf: vec![],
             overflow: false,
+            stopped: false,
             seen: Map::new(),
         }
     }
@@ -268,6 +294,9 @@ impl Usage {
         let rest = std::mem::take(&mut self.buf);
         if self.sse {
             self.sse_line(&rest);
+            if !self.stopped {
+                self.seen.remove("output_tokens");
+            }
         } else if !self.overflow
             && let Ok(v) = serde_json::from_slice::<Value>(&rest)
         {
@@ -285,7 +314,8 @@ impl Usage {
     }
 
     /// message_start carries message.usage; message_delta carries usage with
-    /// the final output_tokens. Later values replace earlier ones.
+    /// the output_tokens so far, final once message_stop arrives. Later values
+    /// replace earlier ones.
     fn sse_line(&mut self, line: &[u8]) {
         let Some(data) = line.strip_prefix(b"data:") else {
             return;
@@ -294,6 +324,7 @@ impl Usage {
             match v["type"].as_str() {
                 Some("message_start") => self.take(&v["message"]["usage"]),
                 Some("message_delta") => self.take(&v["usage"]),
+                Some("message_stop") => self.stopped = true,
                 _ => {}
             }
         }
