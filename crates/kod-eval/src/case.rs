@@ -44,7 +44,7 @@ pub struct Budget {
     pub memory: String,
     /// Size of each writable tmpfs in the sandbox (/work for the agent, /tmp
     /// for agent and score), e.g. "2g". tmpfs is charged to the memory limit,
-    /// so it must be below `memory`.
+    /// so twice this plus sandbox::HOME_SIZE must be below `memory`.
     #[serde(default = "default_disk")]
     pub disk: String,
     pub cpus: f64,
@@ -186,11 +186,13 @@ fn validate(c: &EvalCase) -> Result<()> {
         size("memory", &c.budget.memory)?,
         size("disk", &c.budget.disk)?,
     );
-    if disk >= memory {
+    let home = parse_size(crate::sandbox::HOME_SIZE).unwrap_or(0);
+    if disk.saturating_mul(2).saturating_add(home) >= memory {
         bail!(
-            "{id}: budget disk ({}) must be below memory ({}): the sandbox's tmpfs counts against its memory limit",
+            "{id}: budget disk ({}) is too large for memory ({}): /work and /tmp each get disk, plus {} for /home/agent, and all of it counts against the memory limit",
             c.budget.disk,
-            c.budget.memory
+            c.budget.memory,
+            crate::sandbox::HOME_SIZE
         );
     }
     if c.expected_end_state == EndState::Done {

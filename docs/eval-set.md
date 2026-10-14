@@ -38,8 +38,11 @@ Then:
 2. Set `split`, `protected_paths` and the budget. `[budget]` holds
    `max_turns`, `timeout_secs`, `memory` (also the swap limit), `cpus` and
    `disk` (default `"2g"`). `disk` sizes each of the sandbox's `/work` and
-   `/tmp`. Both are tmpfs and count against `memory`, so `disk` must be below
-   `memory`, and the build output under `/tmp` must fit in it.
+   `/tmp`. Both are tmpfs and count against `memory`, as does the 256m
+   `/home/agent`, so `2 x disk + 256m` must be below `memory` (the template's
+   6g fits the default disk). Build output under `/tmp` must fit in `disk`,
+   and so must the agent's work tree with sparse files and hardlinks counted
+   at full size; a larger tree is not collected and the case is not verified.
 3. Run `kod-eval check-case evals/cases/PAY-123`. It must report `ok`, and it
    records the held-back tests that fail without the fix and pass with it as
    `required_tests`. A run counts a case as passed only if every one of them

@@ -26,7 +26,7 @@ fn agent_container_is_locked_down() {
         "--label kod.run=run-1",
         "--network kod-run-1",
         "--workdir /work",
-        "--memory 4g --memory-swap 4g",
+        "--memory 6g --memory-swap 6g",
         "--cpus 2",
         "--pids-limit 512",
         "--cap-drop ALL",
@@ -38,7 +38,8 @@ fn agent_container_is_locked_down() {
         "--read-only",
         "--tmpfs /work:size=2g,exec",
         "--tmpfs /tmp:size=2g,exec",
-        "--tmpfs /home/agent:size=64m,exec",
+        "--tmpfs /home/agent:size=256m,exec",
+        "-e KOD_DISK_BYTES=2147483648",
         "-e KOD_LOG_CAP=16777216",
     ] {
         assert!(a.contains(want), "missing {want:?} in {a}");
@@ -71,6 +72,30 @@ fn score_container_sees_the_workspace_read_only() {
         !a.contains(":/tmp"),
         "scratch is a tmpfs, not a host directory: {a}"
     );
+}
+
+/// Collect extracts agent-made archives, so it writes only to capped tmpfs.
+#[test]
+fn collect_container_writes_only_to_capped_tmpfs() {
+    let c = common::case("PAY-1");
+    let m = Mounts {
+        read_only: &[(Path::new("/r/b"), "/in"), (Path::new("/r/a"), "/agent")],
+        out: Path::new("/r/o"),
+        tmpfs: &["/tmp", "/base", "/wt"],
+    };
+    let a = run_args("n", "run-1", &c, "none", &m, (1, 1), &[]).join(" ");
+    for want in [
+        "--network none",
+        "-v /r/b:/in:ro",
+        "-v /r/a:/agent:ro",
+        "--read-only",
+        "--tmpfs /tmp:size=2g,exec",
+        "--tmpfs /base:size=2g,exec",
+        "--tmpfs /wt:size=2g,exec",
+        "-e KOD_DISK_BYTES=2147483648",
+    ] {
+        assert!(a.contains(want), "missing {want:?} in {a}");
+    }
 }
 
 #[test]
@@ -110,7 +135,15 @@ fn no_sandbox_container_gets_the_model_key() {
         runner.command(&c),
     ]
     .concat();
-    let collect = run_args("c", "r", &c, "none", &m(&collect_ro, &[]), (1, 1), &[]);
+    let collect = run_args(
+        "c",
+        "r",
+        &c,
+        "none",
+        &m(&collect_ro, &["/tmp", "/base", "/wt"]),
+        (1, 1),
+        &[],
+    );
     let score_env = [("KOD_TEST_COMMAND".to_owned(), c.test_command.clone())];
     let score = run_args(
         "s",

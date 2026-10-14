@@ -41,6 +41,20 @@ case "$t" in
   echo 'secrets/* filter=hide' > .gitattributes
   echo stolen > secrets/token; echo 42 > answer.txt ;;
 *STOPME*) sleep 30 ;;
+*SPARSE*)
+  # Uses no tmpfs blocks, but is 1 GiB once archived.
+  truncate -s 1G sparse; echo 42 > answer.txt ;;
+*LINKS*)
+  # 1 MiB stored once in /work, 41 MiB once each link is a file.
+  head -c 1048576 /dev/urandom > blob
+  for i in $(seq 40); do ln blob link$i; done
+  echo 42 > answer.txt ;;
+*BOMB*)
+  # Fills the pid limit, and keeps writing to /work while it can.
+  echo 42 > answer.txt
+  (while :; do echo x >> w 2>/dev/null; done) &
+  b() { b & b; }; (b 2>/dev/null) &
+  sleep 2 ;;
 *FILL*)
   # 64 MiB into each writable place; the case's disk budget is 32 MiB. The
   # statuses are recorded after the space is freed again.
@@ -130,8 +144,8 @@ expected_end_state = "{expected}"
 [budget]
 max_turns = 5
 timeout_secs = {timeout}
-memory = "512m"
-disk = "256m"
+memory = "768m"
+disk = "128m"
 cpus = 1.0
 "#,
                 mirror = m.display(),
@@ -177,4 +191,18 @@ pub fn result(dir: &Path, id: &str) -> CaseResult {
 
 pub fn diff(dir: &Path, id: &str) -> String {
     fs::read_to_string(dir.join(id).join("collect_out/diff.patch")).unwrap()
+}
+
+/// Every file under `dir`, not following symlinks.
+pub fn walk(dir: &Path) -> Vec<PathBuf> {
+    let mut out = vec![];
+    for e in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let t = e.file_type().unwrap();
+        if t.is_dir() {
+            out.extend(walk(&e.path()));
+        } else if t.is_file() {
+            out.push(e.path());
+        }
+    }
+    out
 }

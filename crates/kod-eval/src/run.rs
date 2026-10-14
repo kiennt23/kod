@@ -435,11 +435,17 @@ fn run_case(
         ..Default::default()
     };
     if timed_out {
-        r.notes
-            .push(format!("timed out after {}s", case.budget.timeout_secs));
+        r.notes.push(format!(
+            "timed out after {}s; the wall time includes up to {}s more for stopping the agent and archiving /work",
+            case.budget.timeout_secs,
+            TIMEOUT_GRACE.as_secs()
+        ));
     }
     r.notes
         .extend(truncated(&out, &["agent.json", "agent.stderr"]));
+    if let Ok(why) = fs::read_to_string(out.join("work_error")) {
+        r.notes.push(why.trim().to_owned());
+    }
     let proxy_saved = match proxy_log {
         Ok(log) => {
             let (input, output, missing) = report::proxy_tokens(&log);
@@ -524,7 +530,7 @@ fn collect(
     let mounts = Mounts {
         read_only: &[(&base, "/in"), (agent_out, "/agent")],
         out: &out,
-        tmpfs: &[],
+        tmpfs: &["/tmp", "/base", "/wt"],
     };
     let mut args = sandbox::run_args(&name, run_id, case, "none", &mounts, host_ids(dir)?, &[]);
     args.push(sandbox::image(case, &s.image_prefix));
@@ -710,7 +716,17 @@ pub fn launch(args: &[String], name: &str, limit: Duration, stop_file: &Path) ->
         }
         match ending {
             Some(Launch::TimedOut) if Instant::now() < deadline + TIMEOUT_GRACE => {
-                let _ = docker(&sv(&["exec", name, "pkill", "-KILL", "-u", "agent"]));
+                // pkill exits 0 or 1. Anything else, such as no free pid in
+                // the container for the exec, means the agent can't be
+                // stopped from inside, so the container goes.
+                let pkill = Command::new("docker")
+                    .args(["exec", name, "pkill", "-KILL", "-u", "agent"])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+                if !pkill.is_ok_and(|s| matches!(s.code(), Some(0 | 1))) {
+                    let _ = docker(&sv(&["kill", name]));
+                }
             }
             Some(_) => {
                 let _ = docker(&sv(&["kill", name]));

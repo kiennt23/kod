@@ -114,19 +114,30 @@ fn load_cases_sorts_by_id() {
 }
 
 #[test]
-fn disk_defaults_to_2g_and_must_be_below_memory() {
+/// /work and /tmp each get `disk`, plus HOME_SIZE for /home/agent, all
+/// charged to memory.
+fn disk_defaults_to_2g_and_both_tmpfs_and_home_must_fit_in_memory() {
     let tmp = tempfile::tempdir().unwrap();
     let d = write_case(tmp.path(), "PAY-1", &case_toml("PAY-1"), Some("x"));
     assert_eq!(load_case(&d).unwrap().budget.disk, "2g");
-    for (memory, disk) in [("4g", "4g"), ("1g", "2g"), ("512m", "")] {
+    for (memory, disk) in [
+        ("4g", "4g"),
+        ("1g", "2g"),
+        ("512m", ""),
+        ("4g", "2g"),
+        ("2304m", "1g"),
+    ] {
         let toml = case_toml("PAY-1").replace(
-            "memory = \"4g\"",
+            "memory = \"6g\"",
             &format!("memory = \"{memory}\"\ndisk = \"{disk}\""),
         );
         let d = write_case(tmp.path(), "PAY-1", &toml, Some("x"));
         let err = load_case(&d).unwrap_err().to_string();
         assert!(err.contains("disk"), "{memory}/{disk}: {err}");
     }
+    let toml = case_toml("PAY-1").replace("memory = \"6g\"", "memory = \"3g\"\ndisk = \"1g\"");
+    let d = write_case(tmp.path(), "PAY-1", &toml, Some("x"));
+    load_case(&d).unwrap();
 }
 
 #[test]

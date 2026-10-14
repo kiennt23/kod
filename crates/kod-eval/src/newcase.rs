@@ -76,9 +76,9 @@ protected_paths = []
 [budget]
 max_turns = 50
 timeout_secs = 1800
-memory = "4g"
-# Size of each of /work and /tmp in the sandbox (tmpfs, so it counts against
-# memory and must be below it).
+memory = "6g"
+# Size of each of /work and /tmp in the sandbox. Both are tmpfs and count
+# against memory: 2 x disk + 256m (for /home/agent) must be below memory.
 disk = "2g"
 cpus = 2.0
 "#,

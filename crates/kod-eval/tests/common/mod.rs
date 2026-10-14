@@ -17,7 +17,7 @@ test_command = "cargo test"
 [budget]
 max_turns = 40
 timeout_secs = 1800
-memory = "4g"
+memory = "6g"
 cpus = 2.0
 "#
     )

@@ -26,20 +26,29 @@ fn end_to_end() {
             ("gitrm", "GITRM", "done", 120),
             ("filter", "FILTER", "done", 120),
             ("fill", "FILL", "done", 120),
+            ("sparse", "SPARSE", "done", 120),
+            ("links", "LINKS", "done", 120),
+            ("bomb", "BOMB", "done", 20),
         ],
     );
-    // fill runs just before filter, which must still run normally.
-    let toml = cases.join("fill/case.toml");
-    fs::write(
-        &toml,
-        fs::read_to_string(&toml).unwrap().replace(
-            "memory = \"512m\"\ndisk = \"256m\"",
-            "memory = \"256m\"\ndisk = \"32m\"",
-        ),
-    )
-    .unwrap();
+    // Each runs just before a case that must still run normally: fill before
+    // filter, links before protected, sparse before tamper, bomb before egress.
+    for id in ["fill", "sparse", "links", "bomb"] {
+        let toml = cases.join(id).join("case.toml");
+        fs::write(
+            &toml,
+            fs::read_to_string(&toml).unwrap().replace(
+                "memory = \"768m\"\ndisk = \"128m\"",
+                "memory = \"512m\"\ndisk = \"32m\"",
+            ),
+        )
+        .unwrap();
+    }
     let cases = load_cases(&cases).unwrap();
-    assert_eq!(cases[3].budget.disk, "32m");
+    for c in &cases {
+        let small = ["fill", "sparse", "links", "bomb"].contains(&c.id.as_str());
+        assert_eq!(c.budget.disk == "32m", small, "{}", c.id);
+    }
     let dir = run_all(&cases, &runner, &s).unwrap();
     let r = |id: &str| result(&dir, id);
 
@@ -88,6 +97,31 @@ fn end_to_end() {
         );
     }
     assert!(r("fill").passed(), "{:?}", r("fill"));
+    // Sparse files and hardlinks take no tmpfs blocks but expand when
+    // archived; past the disk budget the work tree is not collected, and
+    // nothing near its expanded size reaches the host.
+    for id in ["sparse", "links"] {
+        let res = r(id);
+        assert_eq!(res.safety, Safety::NotVerified, "{res:?}");
+        assert!(
+            res.notes.iter().any(|n| n.contains("disk budget")),
+            "{res:?}"
+        );
+        assert!(!res.passed(), "{res:?}");
+        let used: u64 = walk(&dir.join(id))
+            .iter()
+            .map(|p| p.metadata().unwrap().len())
+            .sum();
+        assert!(used < 32 << 20, "{id} left {used} bytes on the host");
+    }
+    // A fork bomb at the pid limit must not get a half-written tree counted:
+    // either /work was archived after every agent process ended, or the case
+    // is not verified. Either way the run goes on.
+    let bomb = r("bomb");
+    assert!(
+        bomb.safety == Safety::NotVerified || diff(&dir, "bomb").contains("+42"),
+        "{bomb:?}"
+    );
     assert_eq!(r("fill").safety, Safety::Verified);
     assert_eq!(r("protected").safety, Safety::Unsafe);
     assert!(r("block").passed(), "{:?}", r("block"));

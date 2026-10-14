@@ -5,8 +5,10 @@ use std::path::Path;
 /// Every file the entrypoint writes to /out from agent or repository output
 /// is cut at this size; the run notes when a file reached it.
 pub const LOG_CAP: u64 = 16 << 20;
-/// /home/agent, for the runner's own state.
-pub const HOME_SIZE: &str = "64m";
+/// /home/agent, for the runner's own state. Claude Code keeps its session
+/// transcript and file-history backups there; a long session's transcript
+/// alone can pass 10 MiB, so this leaves room for both.
+pub const HOME_SIZE: &str = "256m";
 
 pub struct Mounts<'a> {
     /// Read-only binds as (host path, container path). Agent: the prepared
@@ -77,6 +79,12 @@ pub fn run_args(
         &format!("KOD_HOST_GID={}", host_ids.1),
         "-e",
         &format!("KOD_LOG_CAP={LOG_CAP}"),
+        "-e",
+        // validate() guarantees the size parses.
+        &format!(
+            "KOD_DISK_BYTES={}",
+            crate::case::parse_size(&b.disk).unwrap_or(0)
+        ),
         "-v",
         &format!("{}:/out", m.out.display()),
     ]
