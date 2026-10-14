@@ -28,10 +28,11 @@ collect)
   mkdir -p /tmp/base /tmp/work || fail mkdir
   # Every .git entry is dropped, so a nested repository can't hide its files.
   # Each tar runs on its own so a failure in the creating side is caught.
+  # --no-same-owner: without CAP_FOWNER, root cannot chmod files it gave away.
   (cd /in && tar --exclude=.git -cf /tmp/base.tar .) || fail "archive base"
-  (cd /tmp/base && tar -xf /tmp/base.tar) || fail "copy base"
+  (cd /tmp/base && tar --no-same-owner -xf /tmp/base.tar) || fail "copy base"
   (cd /work && tar --exclude=.git -cf /tmp/work.tar .) || fail "archive work"
-  (cd /tmp/work && tar -xf /tmp/work.tar) || fail "copy work"
+  (cd /tmp/work && tar --no-same-owner -xf /tmp/work.tar) || fail "copy work"
   git init -q || fail init
   # info/attributes overrides any .gitattributes the agent wrote: no filters,
   # no line-ending conversion, always a text diff.
