@@ -165,3 +165,15 @@ fn no_sandbox_container_gets_the_model_key() {
         "the agent gets a dummy key"
     );
 }
+
+#[test]
+fn collect_memory_covers_three_tmpfs() {
+    let c = common::case("PAY-1");
+    let (m, d, h) = (6u64 << 30, 2u64 << 30, 256u64 << 20);
+    assert_eq!(c.budget.memory, "6g");
+    let got: u64 = kod_eval::sandbox::collect_memory(&c.budget)
+        .parse()
+        .unwrap();
+    assert!(3 * d + h < got, "{got}");
+    assert_eq!(got, m + d);
+}

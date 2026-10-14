@@ -542,7 +542,9 @@ fn collect(
         out: &out,
         tmpfs: &["/tmp", "/base", "/wt"],
     };
-    let mut args = sandbox::run_args(&name, run_id, case, "none", &mounts, host_ids(dir)?, &[]);
+    let mut sized = case.clone();
+    sized.budget.memory = sandbox::collect_memory(&case.budget);
+    let mut args = sandbox::run_args(&name, run_id, &sized, "none", &mounts, host_ids(dir)?, &[]);
     args.push(sandbox::image(case, &s.image_prefix));
     args.push("collect".into());
     let launched = launch(
@@ -552,6 +554,8 @@ fn collect(
         &s.stop_file,
     )?;
     let _ = fs::remove_dir_all(&base);
+    // Up to disk + 4x disk per case otherwise stays in the run directory.
+    let _ = fs::remove_file(agent_out.join("work.tar"));
     let ok = launched == Launch::Exited && out.join("collect_ok").is_file();
     Ok(ok.then(|| out.join("diff.patch")))
 }

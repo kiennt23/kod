@@ -24,6 +24,13 @@ pub struct Mounts<'a> {
     pub tmpfs: &'a [&'a str],
 }
 
+/// Collect mounts three tmpfs of `disk` (/tmp, /base, /wt) where the memory
+/// rule budgets two, so its limit is one disk larger than the case's.
+pub fn collect_memory(b: &crate::case::Budget) -> String {
+    let n = |s: &str| crate::case::parse_size(s).unwrap_or(0);
+    (n(&b.memory) + n(&b.disk)).to_string()
+}
+
 pub fn image(case: &EvalCase, prefix: &str) -> String {
     format!("{prefix}-{}", case.language)
 }

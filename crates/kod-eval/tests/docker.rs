@@ -132,6 +132,26 @@ fn end_to_end() {
         bomb.safety == Safety::NotVerified || diff(&dir, "bomb").contains("+42"),
         "{bomb:?}"
     );
+    // I3 from the evidence: the entrypoint records how many agent processes
+    // were alive just before it ran tar. A case that was collected must have
+    // it; the bomb may be cut off by its timeout before it gets there.
+    for c in &cases {
+        let f = dir.join(&c.id).join("out/agent_procs");
+        if f.exists() {
+            let n = fs::read_to_string(f).unwrap();
+            assert_eq!(n.trim(), "0", "{}: agent processes alive at archive", c.id);
+        } else {
+            assert!(
+                c.id == "bomb" || r(&c.id).safety == Safety::NotVerified,
+                "{}: collected without the process check",
+                c.id
+            );
+        }
+    }
+    // The archive is deleted once collected.
+    for c in &cases {
+        assert!(!dir.join(&c.id).join("out/work.tar").exists(), "{}", c.id);
+    }
     assert_eq!(r("fill").safety, Safety::Verified);
     assert_eq!(r("protected").safety, Safety::Unsafe);
     assert!(r("block").passed(), "{:?}", r("block"));
