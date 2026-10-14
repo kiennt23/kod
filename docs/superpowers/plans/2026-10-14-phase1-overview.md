@@ -4,7 +4,7 @@
 
 **Phase 1 exit (from the spec):** our loop matches the baseline, with no escapes. In this plan that means:
 
-- **Matches:** `kod-eval compare <claude-code held-out run> <kod-loop held-out run>` passes. It needs the same cases, every case verified in both runs, and no slice (split × language × risk) where kod-loop passes fewer cases than the baseline. Any tolerance is the owner's call (see Open questions).
+- **Matches** (the owner's rule): `kod-eval compare <claude-code held-out run> <kod-loop held-out run>` passes. It needs the same cases, zero `unsafe` and zero `not_verified` in both runs (strict), and an overall kod-loop pass count at most 1 below the baseline's. The report shows per-slice results (split × language × risk), but they don't decide pass or fail.
 - **No escapes:** zero `unsafe` and zero `not_verified` cases, in every eval run and in every conformance check, on every harness change. Any permission escape, unauthorized action or data leak blocks the change (spec, "Evals and metrics").
 
 Each sub-plan is written in full only when the one before it is merged, so it can build on code that exists. Every sub-plan follows ADR 0001 (an execution mode per task) and ends with a whole-branch review. Every change goes through a PR. Harness changes need two approvals once the backup owner is named.
@@ -13,7 +13,7 @@ Each sub-plan is written in full only when the one before it is merged, so it ca
 
 | # | Sub-plan | Depends on | Blocked by open decisions | Exit criteria |
 |---|---|---|---|---|
-| 1 | **Agent loop** (`kod-loop`): our Rust loop as a runner under `kod-eval`, plus `kod-eval compare`. Full plan: `2026-10-14-phase1-agent-loop.md` | Phase 0 code (merged). The comparison step needs the phase 0 baseline. | None to build it. The comparison waits on the **phase 0 baseline** (cases and runs not done yet). | Conformance checks that apply offline pass in the sandbox: AGENTS.md rule, egress blocked, protected path caught, model traffic only through the proxy, right end state for block and over-budget. The full eval set runs with zero unsafe and zero not verified. `compare` against the baseline is recorded. |
+| 1 | **Agent loop** (`kod-loop`): our Rust loop as a runner under `kod-eval`, plus `kod-eval compare`. Full plan: `2026-10-14-phase1-agent-loop.md` | Phase 0 code (merged). The comparison step needs the phase 0 baseline. | None to build it. The comparison waits on the **phase 0 baseline** (cases and runs not done yet). | Conformance checks that apply offline pass in the sandbox: AGENTS.md rule (a fixture repo in CI, plus a real product-repo case in the eval set), egress blocked, protected path caught, model traffic only through the proxy, right end state for block and over-budget. The full eval set runs with zero unsafe and zero not verified. `compare` against the baseline passes and is recorded, which makes kod-loop the default runner for offline evals. |
 | 2 | **LLM gateway hardening** (`kod-llm-proxy` → LLM gateway): a long-running service in place of one proxy per case. Per-run budgets (tokens and cost, priced from a table), model routing policy per data class (an unknown class is refused), redacted prompt and output capture handed to the audit log, OpenAI-compatible route only if a runner needs it. | 1 (the loop is its first client). 4 for audit capture. | **Routing values** (data classes, endpoint list). Until then, one class and one endpoint, and anything else is refused. | Routing table tests: an unknown class is refused, a disallowed endpoint is refused. Budget tests. Spend can't exceed the budget whether the loop or a script calls it. Eval rerun shows no regression. |
 | 3 | **Policy** (Rego with regorus, in-process) | None | **Compliance profile values** (only for the rules that read them) | Policy repo with tests for every row of the action and permission matrix. Anything not listed is denied. The same rules are used by 2, 5 and 6. |
 | 4 | **Audit log**: append-only hash-chained table, external write-once checkpoints under a separate account, retention from the compliance profile, secret redaction before storage. | 3 (decisions are recorded with their policy version) | **Compliance profile values** (retention). Build with a placeholder profile that refuses to delete anything. **Backup owner** for checkpoint account access. | Tamper, truncation and store-outage tests pass (spec "Audit integrity"). When the audit write fails, the external write is refused. |
@@ -25,7 +25,12 @@ Each sub-plan is written in full only when the one before it is merged, so it ca
 
 **Order:** 1, then 3 and 4, then 2, then 6 and 5, then 7, then 8 and 9. Sub-plan 1 comes first because the roadmap gates the default runner on it, it needs nothing undecided, and every later piece reuses its runner contract. Tracing starts as structured logs in sub-plans 1 and 2 (spec: "structured logs first") and gets its own plan only when logs stop being enough.
 
-**Cutover:** our loop becomes the default runner only when sub-plan 1's comparison passes on the held-out split, and only after 5 has added the MCP client, so the loop also passes the conformance checks that need the gateway. Claude Code stays available as a conforming runner for comparison and fallback.
+**Cutover** (the owner's rule), in two steps:
+
+- kod-loop becomes the default runner for **offline evals** once sub-plan 1's comparison passes on the held-out split.
+- It becomes the default for the **connected pilot** only after sub-plan 5 adds its MCP client, so it also passes the conformance checks that need the gateway (items 2, 4 and 7).
+
+Claude Code stays available as a conforming runner for comparison and fallback.
 
 ## Open decisions that block phase 1
 
@@ -36,4 +41,3 @@ Each sub-plan is written in full only when the one before it is merged, so it ca
 | Compliance profile values | 3 (rules that read them), 4 (retention), 7 (evidence export) |
 | Model routing values | 2 (it refuses everything except one class and one endpoint until then) |
 | Backup owner | Two-approval merges for harness changes, checkpoint account access in 4, kill-switch cover |
-| Match tolerance for `compare` | Phase exit (the default is strict: no slice may be worse) |
