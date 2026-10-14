@@ -31,11 +31,14 @@ Node.js is too old. Check it with
 
 ## Memory
 
-The case template's 6g memory limit (and 8g for the collect container, which
-mounts one more tmpfs) exceeds the VM of a small Docker Desktop or OrbStack
-install. There Docker cannot enforce the limit, so a run no longer shows the
-budget it claims. Give the VM more memory than the largest case limit, or
-lower `memory` and `disk` in the cases; run real evals on the Linux host.
+The case template's 6g memory limit (8g for the collect container, which mounts
+one more tmpfs) can exceed the VM of a small Docker Desktop or OrbStack install.
+If the VM has less available memory than the container limit, the VM may run
+out of memory before the container reaches its configured limit, so the run is
+bounded by VM capacity rather than the case budget, and neighboring containers
+can be affected. Allocate enough VM memory for the collector, concurrent
+services and OS overhead, or lower `memory` and `disk` in the cases. Run real
+evals on the dedicated Linux host.
 
 ## Smoke test
 
