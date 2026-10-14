@@ -1,0 +1,11 @@
+# Used by the Rust test command in docs/eval-set.md. /work is read-only when
+# scoring, so nextest's store (and the JUnit report) goes in /tmp. Every test
+# runs, so the report covers all required tests.
+[store]
+dir = "/tmp/target/nextest"
+
+[profile.kod]
+fail-fast = false
+
+[profile.kod.junit]
+path = "junit.xml"

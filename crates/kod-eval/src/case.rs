@@ -1,0 +1,207 @@
+//! Eval case format: one directory per case, `evals/cases/<id>/`, holding
+//! `case.toml` and, for cases expected to finish, `heldout.patch`.
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum Split {
+    #[default]
+    Dev,
+    Heldout,
+}
+
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum RiskClass {
+    #[default]
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EndState {
+    #[default]
+    Done,
+    Blocked,
+    NeedsHuman,
+    OverBudget,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Budget {
+    pub max_turns: u32,
+    pub timeout_secs: u64,
+    /// Docker memory limit, e.g. "4g". Swap is disabled.
+    pub memory: String,
+    /// Size of each writable tmpfs in the sandbox (/work for the agent, /tmp
+    /// for agent and score), e.g. "2g". tmpfs is charged to the memory limit,
+    /// so twice this plus sandbox::HOME_SIZE must be below `memory`.
+    #[serde(default = "default_disk")]
+    pub disk: String,
+    pub cpus: f64,
+}
+
+fn default_disk() -> String {
+    "2g".into()
+}
+
+/// Bytes in a size such as "512m": digits plus an optional k, m or g
+/// (powers of 1024), the subset both Docker and tmpfs accept.
+pub fn parse_size(s: &str) -> Option<u64> {
+    let (num, unit) = match s.char_indices().last()? {
+        (i, c) if c.is_ascii_alphabetic() => (&s[..i], c.to_ascii_lowercase()),
+        _ => (s, 'b'),
+    };
+    let shift = match unit {
+        'b' => 0,
+        'k' => 10,
+        'm' => 20,
+        'g' => 30,
+        _ => return None,
+    };
+    if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    num.parse::<u64>().ok()?.checked_mul(1 << shift)
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvalCase {
+    pub id: String,
+    pub split: Split,
+    /// Names the sandbox image: `<image prefix>-<language>`.
+    pub language: String,
+    pub risk_class: RiskClass,
+    /// Sanitized mirror on the eval host. Only the tree at `base_commit` reaches the agent.
+    pub repo: PathBuf,
+    pub base_commit: String,
+    /// The real merge commit. Only `check-case` uses it; the agent never sees it.
+    pub merge_commit: Option<String>,
+    pub ticket: String,
+    /// Runs in the score container with /work read-only. It must keep build
+    /// output under /tmp and write a JUnit report to $KOD_JUNIT.
+    pub test_command: String,
+    /// Held-back tests that must run and pass, as `classname::name` from the
+    /// JUnit report. `check-case` fills this in; `run` refuses a case expected
+    /// to finish while it is empty.
+    #[serde(default)]
+    pub required_tests: Vec<String>,
+    /// Directory prefixes ending in "/", or exact file paths.
+    #[serde(default)]
+    pub protected_paths: Vec<String>,
+    #[serde(default)]
+    pub expected_end_state: EndState,
+    pub budget: Budget,
+    #[serde(skip)]
+    pub dir: PathBuf,
+}
+
+impl EvalCase {
+    pub fn heldout_patch(&self) -> PathBuf {
+        self.dir.join("heldout.patch")
+    }
+}
+
+pub fn load_case(dir: &Path) -> Result<EvalCase> {
+    let path = dir.join("case.toml");
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let mut case: EvalCase =
+        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    // Absolute, so git and docker resolve it the same from any directory.
+    case.dir = dir
+        .canonicalize()
+        .with_context(|| format!("resolving {}", dir.display()))?;
+    validate(&case)?;
+    Ok(case)
+}
+
+pub fn load_cases(root: &Path) -> Result<Vec<EvalCase>> {
+    let mut cases = Vec::new();
+    for entry in std::fs::read_dir(root).with_context(|| format!("reading {}", root.display()))? {
+        let path = entry?.path();
+        if path.join("case.toml").is_file() {
+            cases.push(load_case(&path)?);
+        }
+    }
+    cases.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(cases)
+}
+
+fn is_sha(s: &str) -> bool {
+    s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn validate(c: &EvalCase) -> Result<()> {
+    let id = &c.id;
+    // The id names directories and containers.
+    if id.is_empty()
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+    {
+        bail!("{id}: id may only use letters, digits, '.', '_' and '-'");
+    }
+    if c.dir.file_name().and_then(|n| n.to_str()) != Some(id.as_str()) {
+        bail!("{id}: the directory name must equal the case id");
+    }
+    if c.language.is_empty()
+        || !c
+            .language
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+    {
+        bail!("{id}: language must be lowercase letters and digits");
+    }
+    if !is_sha(&c.base_commit) {
+        bail!("{id}: base_commit must be a full 40-character SHA");
+    }
+    if c.merge_commit.as_deref().is_some_and(|m| !is_sha(m)) {
+        bail!("{id}: merge_commit must be a full 40-character SHA");
+    }
+    if c.ticket.trim().is_empty() {
+        bail!("{id}: ticket is empty");
+    }
+    if c.test_command.trim().is_empty() {
+        bail!("{id}: test_command is empty");
+    }
+    if c.budget.max_turns == 0 || c.budget.timeout_secs == 0 || c.budget.cpus <= 0.0 {
+        bail!("{id}: budget values must be positive");
+    }
+    let size = |name: &str, v: &str| match parse_size(v) {
+        Some(n) if n > 0 => Ok(n),
+        _ => bail!("{id}: budget {name} {v:?} must be a size such as \"512m\" or \"4g\""),
+    };
+    let (memory, disk) = (
+        size("memory", &c.budget.memory)?,
+        size("disk", &c.budget.disk)?,
+    );
+    let home = parse_size(crate::sandbox::HOME_SIZE).unwrap_or(0);
+    if disk.saturating_mul(2).saturating_add(home) >= memory {
+        bail!(
+            "{id}: budget disk ({}) is too large for memory ({}): /work and /tmp each get disk, plus {} for /home/agent, and all of it counts against the memory limit",
+            c.budget.disk,
+            c.budget.memory,
+            crate::sandbox::HOME_SIZE
+        );
+    }
+    if c.expected_end_state == EndState::Done {
+        let len = std::fs::metadata(c.heldout_patch())
+            .map(|m| m.len())
+            .unwrap_or(0);
+        if len == 0 {
+            bail!("{id}: a case expected to finish needs a non-empty heldout.patch");
+        }
+    }
+    Ok(())
+}
