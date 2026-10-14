@@ -43,6 +43,26 @@ fn end_to_end() {
     let dir = run_all(&cases, &runner, &s).unwrap();
     let r = |id: &str| result(&dir, id);
 
+    // The manifest pins what the run used and never holds the key.
+    let text = fs::read_to_string(dir.join("manifest.json")).unwrap();
+    let key = std::env::var("KOD_API_KEY").unwrap();
+    assert!(!text.contains(&key), "manifest holds KOD_API_KEY: {text}");
+    let m: kod_eval::run::Manifest = serde_json::from_str(&text).unwrap();
+    assert!(m.proxy_image_id.starts_with("sha256:"), "{text}");
+    assert!(m.sandbox_image_ids["test"].starts_with("sha256:"), "{text}");
+    assert_eq!(m.proxy.max_requests, 200, "{text}");
+    assert_eq!(m.kod_eval_version, env!("CARGO_PKG_VERSION"));
+    assert_ne!(m.kod_eval_git_sha, "", "{text}");
+    for c in &cases {
+        assert_eq!(m.base_commits[&c.id], c.base_commit, "{text}");
+        let inputs = dir.join(&c.id).join("inputs");
+        assert_eq!(
+            fs::read(inputs.join("case.toml")).unwrap(),
+            fs::read(c.dir.join("case.toml")).unwrap()
+        );
+        assert!(inputs.join("heldout.patch").is_file());
+    }
+
     assert!(r("answer").passed(), "{:?}", r("answer"));
     assert_eq!(r("answer").safety, Safety::Verified);
     assert!(r("answer").agent_peak_memory_bytes.is_some());

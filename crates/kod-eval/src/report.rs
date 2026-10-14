@@ -9,16 +9,7 @@ use std::{collections::BTreeMap, fs, path::Path};
 /// One result per case in the manifest. A case with no readable result is
 /// reported as not verified rather than left out.
 pub fn load(run_dir: &Path) -> Result<Vec<CaseResult>> {
-    let mp = run_dir.join("manifest.json");
-    let manifest: Manifest = serde_json::from_str(
-        &fs::read_to_string(&mp).with_context(|| format!("reading {}", mp.display()))?,
-    )
-    .with_context(|| format!("parsing {}", mp.display()))?;
-    anyhow::ensure!(
-        !manifest.cases.is_empty(),
-        "{} selects no cases",
-        mp.display()
-    );
+    let manifest = load_manifest(run_dir)?;
     let mut out: Vec<CaseResult> = manifest
         .cases
         .iter()
@@ -41,6 +32,20 @@ pub fn load(run_dir: &Path) -> Result<Vec<CaseResult>> {
 fn proxy_events(log: &str) -> impl Iterator<Item = serde_json::Value> + '_ {
     log.lines()
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+}
+
+pub fn load_manifest(run_dir: &Path) -> Result<Manifest> {
+    let mp = run_dir.join("manifest.json");
+    let manifest: Manifest = serde_json::from_str(
+        &fs::read_to_string(&mp).with_context(|| format!("reading {}", mp.display()))?,
+    )
+    .with_context(|| format!("parsing {}", mp.display()))?;
+    anyhow::ensure!(
+        !manifest.cases.is_empty(),
+        "{} selects no cases",
+        mp.display()
+    );
+    Ok(manifest)
 }
 
 /// Every proxy event that refused a request.
@@ -95,8 +100,36 @@ fn or_dash(v: Option<u64>, f: impl Fn(u64) -> String) -> String {
     v.map_or("-".into(), f)
 }
 
-pub fn render(title: &str, results: &[CaseResult], denials: usize) -> String {
-    let mut s = format!("# Eval report: {title}\n\n## Safety failures\n\n");
+pub fn render(m: &Manifest, results: &[CaseResult], denials: usize) -> String {
+    let p = &m.proxy;
+    let images: Vec<String> = m
+        .sandbox_image_ids
+        .iter()
+        .map(|(lang, id)| format!("{lang}: {id}"))
+        .collect();
+    let mut s = format!(
+        "# Eval report: {}\n\n## Run\n\n\
+         - Runner: {}, model: {}\n\
+         - kod-eval: {} ({})\n\
+         - Proxy image: {}\n\
+         - Sandbox images: {}\n\
+         - Proxy limits: models {}; paths {}; max_tokens {}; max_body {}; max_requests {}; max_concurrent {}\n\
+         - Inputs and base commits: manifest.json and each case's inputs/\n\
+         \n## Safety failures\n\n",
+        m.run_id,
+        m.runner,
+        m.model,
+        m.kod_eval_version,
+        m.kod_eval_git_sha,
+        m.proxy_image_id,
+        images.join(", "),
+        p.allowed_models,
+        p.allowed_paths,
+        p.max_tokens,
+        p.max_body,
+        p.max_requests,
+        p.max_concurrent
+    );
     let safety: Vec<String> = results
         .iter()
         .flat_map(|r| {
@@ -203,6 +236,7 @@ pub fn render(title: &str, results: &[CaseResult], denials: usize) -> String {
 /// Writes report.md into the run directory and prints it. Returns false when
 /// any case is unsafe or not verified.
 pub fn write(run_dir: &Path) -> Result<bool> {
+    let manifest = load_manifest(run_dir)?;
     let results = load(run_dir)?;
     // A missing proxy log already made that case not verified.
     let denials = results
@@ -213,10 +247,7 @@ pub fn write(run_dir: &Path) -> Result<bool> {
             )
         })
         .sum();
-    let title = run_dir
-        .file_name()
-        .map_or("run".into(), |n| n.to_string_lossy().into_owned());
-    let text = render(&title, &results, denials);
+    let text = render(&manifest, &results, denials);
     fs::write(run_dir.join("report.md"), &text)?;
     print!("{text}");
     Ok(results

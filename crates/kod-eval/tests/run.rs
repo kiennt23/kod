@@ -1,6 +1,6 @@
 use kod_eval::{
     case::EndState,
-    run::{decide, proxy_args},
+    run::{ProxyLimits, decide, proxy_args},
     runner::Runner,
 };
 
@@ -15,20 +15,21 @@ fn timeouts_kills_and_missing_output_map_to_end_states() {
     assert_eq!(decide(&r, false, Some(0), "").0, EndState::Done);
 }
 
-/// Every proxy setting is passed by name, so the key never appears on a
-/// command line and unset ones fall back to the proxy's defaults.
+/// The key is passed by name, so it never appears on a command line. The
+/// limits are passed as the values recorded in the manifest.
 #[test]
-fn proxy_gets_its_settings_by_name() {
-    let a = proxy_args("p", "run-1", "m1,m2", "kod-llm-proxy").join(" ");
-    for k in [
-        "KOD_API_KEY",
-        "KOD_ALLOWED_PATHS",
-        "KOD_MAX_TOKENS",
-        "KOD_MAX_BODY",
-        "KOD_MAX_REQUESTS",
-        "KOD_MAX_CONCURRENT",
+fn proxy_gets_the_key_by_name_and_the_recorded_limits() {
+    let lim = ProxyLimits::from_env(|_| None, "m1,m2".into()).unwrap();
+    let a = proxy_args("p", "run-1", &lim, "kod-llm-proxy").join(" ");
+    assert!(a.contains("-e KOD_API_KEY "), "{a}");
+    for kv in [
+        "KOD_ALLOWED_PATHS=/v1/messages,/v1/messages/count_tokens",
+        "KOD_MAX_TOKENS=8192",
+        "KOD_MAX_BODY=4194304",
+        "KOD_MAX_REQUESTS=200",
+        "KOD_MAX_CONCURRENT=2",
     ] {
-        assert!(a.contains(&format!("-e {k} ")), "missing {k} in {a}");
+        assert!(a.contains(&format!("-e {kv} ")), "missing {kv} in {a}");
     }
     assert!(!a.contains("KOD_API_KEY="), "{a}");
     assert!(a.contains("--label kod.run=run-1"), "{a}");
@@ -36,4 +37,25 @@ fn proxy_gets_its_settings_by_name() {
         a.ends_with("-e KOD_ALLOWED_MODELS=m1,m2 kod-llm-proxy"),
         "{a}"
     );
+}
+
+#[test]
+fn proxy_limits_come_from_the_environment_and_never_hold_the_key() {
+    let env = |k: &str| match k {
+        "KOD_MAX_TOKENS" => Some("100".to_owned()),
+        "KOD_ALLOWED_PATHS" => Some("/v1/messages".to_owned()),
+        _ => Some("sekret-key-value".to_owned()),
+    };
+    assert!(
+        ProxyLimits::from_env(env, "m".into()).is_err(),
+        "non-numbers are refused"
+    );
+    let env = |k: &str| match k {
+        "KOD_API_KEY" => Some("sekret-key-value".to_owned()),
+        "KOD_MAX_TOKENS" => Some("100".to_owned()),
+        _ => None,
+    };
+    let lim = ProxyLimits::from_env(env, "m".into()).unwrap();
+    assert_eq!((lim.max_tokens, lim.max_requests), (100, 200));
+    assert!(!serde_json::to_string(&lim).unwrap().contains("sekret"));
 }

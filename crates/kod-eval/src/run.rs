@@ -10,6 +10,7 @@ use crate::{
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeMap,
     fs,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
@@ -29,13 +30,67 @@ pub struct Settings {
     pub stop_file: PathBuf,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+/// Written before any case starts. Never holds KOD_API_KEY or another secret.
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Manifest {
     pub run_id: String,
     pub runner: String,
     pub model: String,
-    /// Every case selected for the run, written before any of them starts.
+    /// Every case selected for the run.
     pub cases: Vec<String>,
+    pub kod_eval_version: String,
+    pub kod_eval_git_sha: String,
+    pub proxy: ProxyLimits,
+    pub proxy_image_id: String,
+    /// Image ID per language.
+    pub sandbox_image_ids: BTreeMap<String, String>,
+    /// Each case's base commit as resolved in its mirror.
+    pub base_commits: BTreeMap<String, String>,
+}
+
+pub const GIT_SHA: &str = match option_env!("KOD_GIT_SHA") {
+    Some(s) => s,
+    None => "unknown",
+};
+
+/// What every case's proxy enforces in a run, passed to it as values and
+/// recorded in the manifest. Unset variables take kod-llm-proxy's defaults.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct ProxyLimits {
+    pub allowed_models: String,
+    pub allowed_paths: String,
+    pub max_tokens: u64,
+    pub max_body: u64,
+    pub max_requests: u64,
+    pub max_concurrent: u64,
+}
+
+impl ProxyLimits {
+    pub fn from_env(get: impl Fn(&str) -> Option<String>, allowed_models: String) -> Result<Self> {
+        let num = |k: &str, default: u64| -> Result<u64> {
+            get(k).map_or(Ok(default), |v| {
+                v.parse().with_context(|| format!("{k} must be a number"))
+            })
+        };
+        Ok(ProxyLimits {
+            allowed_models,
+            allowed_paths: get("KOD_ALLOWED_PATHS")
+                .unwrap_or_else(|| "/v1/messages,/v1/messages/count_tokens".into()),
+            max_tokens: num("KOD_MAX_TOKENS", 8192)?,
+            max_body: num("KOD_MAX_BODY", 4 << 20)?,
+            max_requests: num("KOD_MAX_REQUESTS", 200)?,
+            max_concurrent: num("KOD_MAX_CONCURRENT", 2)?,
+        })
+    }
+}
+
+fn image_id(image: &str) -> Result<String> {
+    Ok(
+        docker(&sv(&["image", "inspect", "--format", "{{.Id}}", image]))?
+            .trim()
+            .to_owned(),
+    )
 }
 
 pub struct Score {
@@ -161,6 +216,17 @@ pub fn run_all(cases: &[EvalCase], runner: &Runner, s: &Settings) -> Result<Path
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
         std::process::id()
     );
+    let models = [vec![runner.model().to_owned()], s.extra_models.clone()].concat();
+    let limits = ProxyLimits::from_env(|k| std::env::var(k).ok(), models.join(","))?;
+    let mut sandbox_image_ids = BTreeMap::new();
+    let mut base_commits = BTreeMap::new();
+    for c in cases {
+        let image = sandbox::image(c, &s.image_prefix);
+        sandbox_image_ids.insert(c.language.clone(), image_id(&image)?);
+        let base = format!("{}^{{commit}}", c.base_commit);
+        let sha = workspace::git(&c.repo, &["rev-parse", "--verify", &base])?;
+        base_commits.insert(c.id.clone(), sha.trim().to_owned());
+    }
     let dir = s.out_root.join(&id);
     fs::create_dir_all(&s.out_root)?;
     fs::create_dir(&dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -170,11 +236,25 @@ pub fn run_all(cases: &[EvalCase], runner: &Runner, s: &Settings) -> Result<Path
         runner: runner.name().into(),
         model: runner.model().into(),
         cases: cases.iter().map(|c| c.id.clone()).collect(),
+        kod_eval_version: env!("CARGO_PKG_VERSION").into(),
+        kod_eval_git_sha: GIT_SHA.into(),
+        proxy: limits.clone(),
+        proxy_image_id: image_id(&s.proxy_image)?,
+        sandbox_image_ids,
+        base_commits,
     };
     fs::write(
         dir.join("manifest.json"),
         serde_json::to_string_pretty(&manifest)?,
     )?;
+    for case in cases {
+        let inputs = dir.join(&case.id).join("inputs");
+        fs::create_dir_all(&inputs)?;
+        fs::copy(case.dir.join("case.toml"), inputs.join("case.toml"))?;
+        if case.heldout_patch().exists() {
+            fs::copy(case.heldout_patch(), inputs.join("heldout.patch"))?;
+        }
+    }
     let net = format!("kod-{id}");
     docker(&sv(&["network", "create", "--internal", &net]))?;
     let _env = RunEnv { id: id.clone() };
@@ -184,7 +264,7 @@ pub fn run_all(cases: &[EvalCase], runner: &Runner, s: &Settings) -> Result<Path
         let r = if stopped(s) {
             cancelled(case, "the kill switch was on before it started")
         } else {
-            run_case(case, runner, s, &id, &net, &case_dir)?
+            run_case(case, runner, s, &limits, &id, &net, &case_dir)?
         };
         fs::write(
             case_dir.join("result.json"),
@@ -218,7 +298,7 @@ fn cancelled(case: &EvalCase, why: &str) -> CaseResult {
 /// `docker run` arguments for a case's proxy. The key is passed by name, so
 /// it never appears on a command line. Unset settings fall back to the
 /// proxy's defaults.
-pub fn proxy_args(name: &str, run_id: &str, models: &str, image: &str) -> Vec<String> {
+pub fn proxy_args(name: &str, run_id: &str, lim: &ProxyLimits, image: &str) -> Vec<String> {
     let mut args = sv(&[
         "run",
         "-d",
@@ -227,31 +307,31 @@ pub fn proxy_args(name: &str, run_id: &str, models: &str, image: &str) -> Vec<St
         "--label",
         &format!("kod.run={run_id}"),
     ]);
-    for k in [
-        "KOD_API_KEY",
-        "KOD_ALLOWED_PATHS",
-        "KOD_MAX_TOKENS",
-        "KOD_MAX_BODY",
-        "KOD_MAX_REQUESTS",
-        "KOD_MAX_CONCURRENT",
+    args.extend(sv(&["-e", "KOD_API_KEY"]));
+    for kv in [
+        format!("KOD_ALLOWED_PATHS={}", lim.allowed_paths),
+        format!("KOD_MAX_TOKENS={}", lim.max_tokens),
+        format!("KOD_MAX_BODY={}", lim.max_body),
+        format!("KOD_MAX_REQUESTS={}", lim.max_requests),
+        format!("KOD_MAX_CONCURRENT={}", lim.max_concurrent),
+        format!("KOD_ALLOWED_MODELS={}", lim.allowed_models),
     ] {
-        args.extend(sv(&["-e", k]));
+        args.extend(["-e".into(), kv]);
     }
-    args.extend([
-        "-e".into(),
-        format!("KOD_ALLOWED_MODELS={models}"),
-        image.to_owned(),
-    ]);
+    args.push(image.to_owned());
     args
 }
 
 /// One proxy per case, so the request budget and the log are per case.
 /// Returns false if the kill switch is on.
-fn start_proxy(name: &str, run_id: &str, net: &str, runner: &Runner, s: &Settings) -> Result<bool> {
-    let models = [vec![runner.model().to_owned()], s.extra_models.clone()]
-        .concat()
-        .join(",");
-    let args = proxy_args(name, run_id, &models, &s.proxy_image);
+fn start_proxy(
+    name: &str,
+    run_id: &str,
+    net: &str,
+    limits: &ProxyLimits,
+    s: &Settings,
+) -> Result<bool> {
+    let args = proxy_args(name, run_id, limits, &s.proxy_image);
     // The proxy runs detached, so `launch` can't watch it. Check on both
     // sides; if stop finished in between, the next launch sees the file and
     // the run's cleanup removes the proxy.
@@ -274,6 +354,7 @@ fn run_case(
     case: &EvalCase,
     runner: &Runner,
     s: &Settings,
+    limits: &ProxyLimits,
     run_id: &str,
     net: &str,
     dir: &Path,
@@ -286,7 +367,7 @@ fn run_case(
 
     let image = sandbox::image(case, &s.image_prefix);
     let proxy = format!("kod-llm-proxy-{run_id}-{}", case.id);
-    if !start_proxy(&proxy, run_id, net, runner, s)? {
+    if !start_proxy(&proxy, run_id, net, limits, s)? {
         return Ok(cancelled(case, "the kill switch was turned on"));
     }
     let name = format!("kod-{run_id}-{}", case.id);
@@ -344,9 +425,7 @@ fn run_case(
         runner: runner.name().into(),
         runner_version: read("runner_version").unwrap_or_default(),
         model: runner.model().into(),
-        image_id: docker(&sv(&["image", "inspect", "--format", "{{.Id}}", &image]))?
-            .trim()
-            .to_owned(),
+        image_id: image_id(&image)?,
         expected_end_state: case.expected_end_state,
         end_state,
         cost_usd,

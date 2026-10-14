@@ -2,7 +2,7 @@ use kod_eval::{
     case::Split,
     report::{load, median, proxy_denials, proxy_tokens, render, write},
     result::{CaseResult, Safety},
-    run::Manifest,
+    run::{Manifest, ProxyLimits},
 };
 use std::fs;
 
@@ -41,7 +41,7 @@ fn groups_by_slice_and_lists_safety_first() {
             ..Default::default()
         }
     };
-    let text = render("run-1", &[a, b, c, d], 2);
+    let text = render(&manifest("run-1"), &[a, b, c, d], 2);
     assert!(text.contains("| dev | rust | low | 1 | 2 | 4 |"), "{text}");
     assert!(text.contains("| heldout | go | low | 0 | 1 |"), "{text}");
     assert!(text.contains("- c: changed protected path auth/x.go"));
@@ -60,6 +60,13 @@ fn counts_every_refusal_event() {
     assert_eq!(proxy_denials(log), 3);
 }
 
+fn manifest(id: &str) -> Manifest {
+    Manifest {
+        run_id: id.into(),
+        ..Default::default()
+    }
+}
+
 fn run_dir(cases: &[&str]) -> tempfile::TempDir {
     let d = tempfile::tempdir().unwrap();
     let m = Manifest {
@@ -67,6 +74,7 @@ fn run_dir(cases: &[&str]) -> tempfile::TempDir {
         runner: "script".into(),
         model: "none".into(),
         cases: cases.iter().map(|c| c.to_string()).collect(),
+        ..Default::default()
     };
     fs::write(
         d.path().join("manifest.json"),
@@ -144,7 +152,7 @@ fn an_unsafe_case_fails_the_report_and_is_listed() {
         },
     );
     assert!(!write(d.path()).unwrap());
-    let text = render("t", &load(d.path()).unwrap(), 0);
+    let text = render(&manifest("t"), &load(d.path()).unwrap(), 0);
     let section = text.split("## Not verified").next().unwrap();
     assert!(section.contains("- a: marked unsafe"), "{text}");
 }
@@ -216,10 +224,40 @@ fn shows_runner_cost_and_proxy_tokens_per_slice_with_na_for_missing() {
         language: "go".into(),
         ..verified("c")
     };
-    let text = render("run-1", &[a, b, c], 0);
+    let text = render(&manifest("run-1"), &[a, b, c], 0);
     assert!(text.contains("Runner-reported cost (USD, subtotal) | Cases without runner cost | Proxy input tokens | Proxy output tokens |"), "{text}");
     assert!(text.contains("| 0.25 | 1 | 150 | 7 |"), "{text}");
     assert!(text.contains("| n/a | 1 | n/a | n/a |"), "{text}");
     assert!(!text.contains("0.00"), "{text}");
     assert!(text.contains("not converted to dollars"), "{text}");
+}
+
+#[test]
+fn heads_the_report_with_the_manifest_versions_and_limits() {
+    let m = Manifest {
+        run_id: "run-1".into(),
+        runner: "claude-code".into(),
+        model: "claude-x".into(),
+        cases: vec!["a".into()],
+        kod_eval_version: "0.1.0".into(),
+        kod_eval_git_sha: "abc123".into(),
+        proxy: ProxyLimits::from_env(|_| None, "claude-x".into()).unwrap(),
+        proxy_image_id: "sha256:p".into(),
+        sandbox_image_ids: [("rust".to_owned(), "sha256:r".to_owned())].into(),
+        base_commits: [("a".to_owned(), "f".repeat(40))].into(),
+    };
+    let text = render(&m, &[verified("a")], 0);
+    for want in [
+        "# Eval report: run-1",
+        "claude-code",
+        "claude-x",
+        "0.1.0 (abc123)",
+        "sha256:p",
+        "rust: sha256:r",
+        "max_tokens 8192",
+        "max_requests 200",
+    ] {
+        assert!(text.contains(want), "missing {want}: {text}");
+    }
+    assert!(text.find("## Run").unwrap() < text.find("## Safety failures").unwrap());
 }
