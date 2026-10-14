@@ -82,7 +82,9 @@ agent)
   # files at full size, so the archive is as large as what collect extracts,
   # and anything over the disk budget is not collected. Renamed only when
   # complete, since tar reads a truncated archive without error.
-  if bounded "$KOD_DISK_BYTES" /out/work.tar.part tar -C /work --hard-dereference -cf - . 2> /dev/null; then
+  if [ "$alive" -ne 0 ]; then
+    echo "agent processes alive at archive: $alive" > /out/work_error
+  elif bounded "$KOD_DISK_BYTES" /out/work.tar.part tar -C /work --hard-dereference -cf - . 2> /dev/null; then
     mv /out/work.tar.part /out/work.tar
   else
     rm -f /out/work.tar.part

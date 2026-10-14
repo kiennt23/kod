@@ -472,7 +472,13 @@ fn run_case(
         }
     };
 
-    let diff = collect(case, s, run_id, dir, &out)?;
+    let diff = match process_gate(read("agent_procs").as_deref()) {
+        Ok(()) => collect(case, s, run_id, dir, &out)?,
+        Err(note) => {
+            r.notes.push(note);
+            None
+        }
+    };
     if stopped(s) {
         return Ok(cancelled(case, "the kill switch was turned on"));
     }
@@ -558,6 +564,16 @@ fn collect(
     let _ = fs::remove_file(agent_out.join("work.tar"));
     let ok = launched == Launch::Exited && out.join("collect_ok").is_file();
     Ok(ok.then(|| out.join("diff.patch")))
+}
+
+/// The tree is collected only if the entrypoint recorded that no agent process
+/// was alive when it archived /work.
+pub fn process_gate(agent_procs: Option<&str>) -> Result<(), String> {
+    match agent_procs.map(str::trim) {
+        Some("0") => Ok(()),
+        Some(n) => Err(format!("agent processes alive at archive: {n}")),
+        None => Err("no process check recorded".into()),
+    }
 }
 
 /// Notes for output files that reached the entrypoint's LOG_CAP.
