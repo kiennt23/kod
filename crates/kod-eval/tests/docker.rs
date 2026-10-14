@@ -14,7 +14,7 @@ fn end_to_end() {
     let runner = Runner::Script {
         command: SCRIPT.into(),
     };
-    let cases = load_cases(&fixture(
+    let cases = fixture(
         tmp.path(),
         &[
             ("answer", "ANSWER", "done", 120),
@@ -25,9 +25,21 @@ fn end_to_end() {
             ("tamper", "TAMPER", "done", 120),
             ("gitrm", "GITRM", "done", 120),
             ("filter", "FILTER", "done", 120),
+            ("fill", "FILL", "done", 120),
         ],
-    ))
+    );
+    // fill runs just before filter, which must still run normally.
+    let toml = cases.join("fill/case.toml");
+    fs::write(
+        &toml,
+        fs::read_to_string(&toml).unwrap().replace(
+            "memory = \"512m\"\ndisk = \"256m\"",
+            "memory = \"256m\"\ndisk = \"32m\"",
+        ),
+    )
     .unwrap();
+    let cases = load_cases(&cases).unwrap();
+    assert_eq!(cases[3].budget.disk, "32m");
     let dir = run_all(&cases, &runner, &s).unwrap();
     let r = |id: &str| result(&dir, id);
 
@@ -43,6 +55,20 @@ fn end_to_end() {
         "each case keeps its proxy log"
     );
     assert_eq!(r("sleep").end_state, EndState::OverBudget);
+    assert_eq!(
+        r("sleep").safety,
+        Safety::Verified,
+        "a timed-out agent's work must still be collected"
+    );
+    let fill = diff(&dir, "fill");
+    for want in ["+work=1", "+tmp=1", "+root=1"] {
+        assert!(
+            fill.contains(want),
+            "writes past the disk budget must fail: {fill}"
+        );
+    }
+    assert!(r("fill").passed(), "{:?}", r("fill"));
+    assert_eq!(r("fill").safety, Safety::Verified);
     assert_eq!(r("protected").safety, Safety::Unsafe);
     assert!(r("block").passed(), "{:?}", r("block"));
     let egress = diff(&dir, "egress");

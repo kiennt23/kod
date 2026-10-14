@@ -2,16 +2,24 @@
 use crate::case::EvalCase;
 use std::path::Path;
 
+/// Every file the entrypoint writes to /out from agent or repository output
+/// is cut at this size; the run notes when a file reached it.
+pub const LOG_CAP: u64 = 16 << 20;
+/// /home/agent, for the runner's own state.
+pub const HOME_SIZE: &str = "64m";
+
 pub struct Mounts<'a> {
-    pub work: &'a Path,
-    /// True for collect and score, so nothing in those containers can change
-    /// the workspace, including the held-back tests.
-    pub work_read_only: bool,
+    /// Read-only binds as (host path, container path). Agent: the prepared
+    /// workspace at /seed and the prompt at /in. Collect: the base tree at /in
+    /// and the agent's output at /agent. Score: the patched workspace at
+    /// /work, so the tests can't change it.
+    pub read_only: &'a [(&'a Path, &'a str)],
     pub out: &'a Path,
-    /// Read-only input at /in: the prompt for agent, the base tree for collect.
-    pub input: Option<&'a Path>,
-    /// Writable scratch at /tmp for build output. Only score gets it.
-    pub scratch: Option<&'a Path>,
+    /// Writable tmpfs mounts, each of the case's disk budget. Any tmpfs also
+    /// makes the root filesystem read-only and adds a /home/agent tmpfs of
+    /// HOME_SIZE, so nothing the agent or the tests run can write to the host
+    /// disk. tmpfs counts against the memory limit.
+    pub tmpfs: &'a [&'a str],
 }
 
 pub fn image(case: &EvalCase, prefix: &str) -> String {
@@ -30,7 +38,6 @@ pub fn run_args(
     env: &[(String, String)],
 ) -> Vec<String> {
     let b = &case.budget;
-    let ro = if m.work_read_only { ":ro" } else { "" };
     let mut a: Vec<String> = [
         "run",
         "--rm",
@@ -68,18 +75,25 @@ pub fn run_args(
         &format!("KOD_HOST_UID={}", host_ids.0),
         "-e",
         &format!("KOD_HOST_GID={}", host_ids.1),
-        "-v",
-        &format!("{}:/work{ro}", m.work.display()),
+        "-e",
+        &format!("KOD_LOG_CAP={LOG_CAP}"),
         "-v",
         &format!("{}:/out", m.out.display()),
     ]
     .map(String::from)
     .to_vec();
-    if let Some(input) = m.input {
-        a.extend(["-v".into(), format!("{}:/in:ro", input.display())]);
+    for (host, path) in m.read_only {
+        a.extend(["-v".into(), format!("{}:{path}:ro", host.display())]);
     }
-    if let Some(scratch) = m.scratch {
-        a.extend(["-v".into(), format!("{}:/tmp", scratch.display())]);
+    if !m.tmpfs.is_empty() {
+        a.push("--read-only".into());
+        for path in m.tmpfs {
+            a.extend(["--tmpfs".into(), format!("{path}:size={},exec", b.disk)]);
+        }
+        a.extend([
+            "--tmpfs".into(),
+            format!("/home/agent:size={HOME_SIZE},exec"),
+        ]);
     }
     for (k, v) in env {
         a.extend(["-e".into(), format!("{k}={v}")]);

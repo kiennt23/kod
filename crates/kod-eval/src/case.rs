@@ -42,7 +42,36 @@ pub struct Budget {
     pub timeout_secs: u64,
     /// Docker memory limit, e.g. "4g". Swap is disabled.
     pub memory: String,
+    /// Size of each writable tmpfs in the sandbox (/work for the agent, /tmp
+    /// for agent and score), e.g. "2g". tmpfs is charged to the memory limit,
+    /// so it must be below `memory`.
+    #[serde(default = "default_disk")]
+    pub disk: String,
     pub cpus: f64,
+}
+
+fn default_disk() -> String {
+    "2g".into()
+}
+
+/// Bytes in a size such as "512m": digits plus an optional k, m or g
+/// (powers of 1024), the subset both Docker and tmpfs accept.
+pub fn parse_size(s: &str) -> Option<u64> {
+    let (num, unit) = match s.char_indices().last()? {
+        (i, c) if c.is_ascii_alphabetic() => (&s[..i], c.to_ascii_lowercase()),
+        _ => (s, 'b'),
+    };
+    let shift = match unit {
+        'b' => 0,
+        'k' => 10,
+        'm' => 20,
+        'g' => 30,
+        _ => return None,
+    };
+    if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    num.parse::<u64>().ok()?.checked_mul(1 << shift)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -148,6 +177,21 @@ fn validate(c: &EvalCase) -> Result<()> {
     }
     if c.budget.max_turns == 0 || c.budget.timeout_secs == 0 || c.budget.cpus <= 0.0 {
         bail!("{id}: budget values must be positive");
+    }
+    let size = |name: &str, v: &str| match parse_size(v) {
+        Some(n) if n > 0 => Ok(n),
+        _ => bail!("{id}: budget {name} {v:?} must be a size such as \"512m\" or \"4g\""),
+    };
+    let (memory, disk) = (
+        size("memory", &c.budget.memory)?,
+        size("disk", &c.budget.disk)?,
+    );
+    if disk >= memory {
+        bail!(
+            "{id}: budget disk ({}) must be below memory ({}): the sandbox's tmpfs counts against its memory limit",
+            c.budget.disk,
+            c.budget.memory
+        );
     }
     if c.expected_end_state == EndState::Done {
         let len = std::fs::metadata(c.heldout_patch())

@@ -291,11 +291,9 @@ fn run_case(
     }
     let name = format!("kod-{run_id}-{}", case.id);
     let mounts = Mounts {
-        work: &work,
-        work_read_only: false,
+        read_only: &[(&work, "/seed"), (&input, "/in")],
         out: &out,
-        input: Some(&input),
-        scratch: None,
+        tmpfs: &["/work", "/tmp"],
     };
     let mut args = sandbox::run_args(
         &name,
@@ -317,6 +315,8 @@ fn run_case(
         &s.stop_file,
     )?;
     let agent_wall_ms = started.elapsed().as_millis() as u64;
+    // The agent only ever had a copy; collect reads out/work.tar.
+    let _ = fs::remove_dir_all(&work);
     let proxy_log = docker(&sv(&["logs", &proxy]));
     let _ = docker(&sv(&["rm", "-f", &proxy]));
     if launched == Launch::Stopped {
@@ -359,6 +359,8 @@ fn run_case(
         r.notes
             .push(format!("timed out after {}s", case.budget.timeout_secs));
     }
+    r.notes
+        .extend(truncated(&out, &["agent.json", "agent.stderr"]));
     let proxy_saved = match proxy_log {
         Ok(log) => fs::write(dir.join("proxy.log"), log).is_ok(),
         Err(e) => {
@@ -367,9 +369,7 @@ fn run_case(
         }
     };
 
-    let diff = collect(case, s, run_id, dir, &work)?;
-    // ponytail: leaves files behind if a timeout skipped the entrypoint's chown back
-    let _ = fs::remove_dir_all(&work);
+    let diff = collect(case, s, run_id, dir, &out)?;
     if stopped(s) {
         return Ok(cancelled(case, "the kill switch was turned on"));
     }
@@ -419,26 +419,25 @@ fn run_case(
     Ok(r)
 }
 
-/// Diffs the agent's workspace against a clean base tree in a separate
-/// container that runs no agent code and ignores the agent's .git. Returns
-/// None if any step failed, so the result stays unverified.
+/// Diffs the agent's work tree, archived to `agent_out/work.tar` by the agent
+/// container, against a clean base tree in a separate container that runs no
+/// agent code and ignores the agent's .git. Returns None if any step failed,
+/// including a missing archive, so the result stays unverified.
 fn collect(
     case: &EvalCase,
     s: &Settings,
     run_id: &str,
     dir: &Path,
-    work: &Path,
+    agent_out: &Path,
 ) -> Result<Option<PathBuf>> {
     let (base, out) = (dir.join("base_tree"), dir.join("collect_out"));
     fresh_dir(&out)?;
     workspace::extract(&case.repo, &case.base_commit, &base)?;
     let name = format!("kod-collect-{run_id}-{}", case.id);
     let mounts = Mounts {
-        work,
-        work_read_only: true,
+        read_only: &[(&base, "/in"), (agent_out, "/agent")],
         out: &out,
-        input: Some(&base),
-        scratch: None,
+        tmpfs: &[],
     };
     let mut args = sandbox::run_args(&name, run_id, case, "none", &mounts, host_ids(dir)?, &[]);
     args.push(sandbox::image(case, &s.image_prefix));
@@ -452,6 +451,15 @@ fn collect(
     let _ = fs::remove_dir_all(&base);
     let ok = launched == Launch::Exited && out.join("collect_ok").is_file();
     Ok(ok.then(|| out.join("diff.patch")))
+}
+
+/// Notes for output files that reached the entrypoint's LOG_CAP.
+fn truncated(out: &Path, files: &[&str]) -> Vec<String> {
+    files
+        .iter()
+        .filter(|f| fs::metadata(out.join(f)).is_ok_and(|m| m.len() >= sandbox::LOG_CAP))
+        .map(|f| format!("{f} was cut at {} MiB", sandbox::LOG_CAP >> 20))
+        .collect()
 }
 
 pub fn decide(
@@ -516,15 +524,12 @@ pub fn score(
     // directory whose path once held files deleted from the host; check-case
     // reruns hit that: "cannot create /out/score.log".
     let stage = dir.join(format!("score_run_{}", unique()));
-    let (mout, tmp) = (stage.join("out"), stage.join("tmp"));
+    let mout = stage.join("out");
     fs::create_dir_all(&mout)?;
-    fs::create_dir_all(&tmp)?;
     let mounts = Mounts {
-        work: &work,
-        work_read_only: true,
+        read_only: &[(&work, "/work")],
         out: &mout,
-        input: None,
-        scratch: Some(&tmp),
+        tmpfs: &["/tmp"],
     };
     let mut args = sandbox::run_args(&name, run_id, case, "none", &mounts, host_ids(dir)?, &env);
     args.push(sandbox::image(case, image_prefix));
@@ -543,7 +548,7 @@ pub fn score(
     let _ = fs::remove_dir_all(&stage);
     let stopped = launched == Launch::Stopped;
     let timed_out = launched == Launch::TimedOut;
-    let mut notes = vec![];
+    let mut notes = truncated(&out, &["score.log"]);
     if timed_out {
         notes.push("tests timed out".into());
     }
@@ -579,10 +584,16 @@ pub fn score(
     })
 }
 
+/// How long a timed-out container gets to finish after its agent processes
+/// are killed, so the agent container can still archive /work for collect.
+const TIMEOUT_GRACE: Duration = Duration::from_secs(60);
+
 /// The only way a container is started, apart from the detached proxy. It
 /// refuses to start once the kill switch is on, and kills its container if the
 /// switch comes on while it runs. Docker may still be creating the container
 /// when the switch comes on, so it keeps killing until `docker run` exits.
+/// On timeout it first kills only the agent user's processes, letting the
+/// entrypoint record what it can, and kills the container after TIMEOUT_GRACE.
 pub fn launch(args: &[String], name: &str, limit: Duration, stop_file: &Path) -> Result<Launch> {
     if stop_file.exists() {
         return Ok(Launch::Stopped);
@@ -605,13 +616,19 @@ pub fn launch(args: &[String], name: &str, limit: Duration, stop_file: &Path) ->
             }
             return Ok(Launch::Exited);
         }
-        if ending.is_none() && stop_file.exists() {
+        if ending != Some(Launch::Stopped) && stop_file.exists() {
             ending = Some(Launch::Stopped);
         } else if ending.is_none() && Instant::now() >= deadline {
             ending = Some(Launch::TimedOut);
         }
-        if ending.is_some() {
-            let _ = docker(&sv(&["kill", name]));
+        match ending {
+            Some(Launch::TimedOut) if Instant::now() < deadline + TIMEOUT_GRACE => {
+                let _ = docker(&sv(&["exec", name, "pkill", "-KILL", "-u", "agent"]));
+            }
+            Some(_) => {
+                let _ = docker(&sv(&["kill", name]));
+            }
+            None => {}
         }
         std::thread::sleep(Duration::from_millis(200));
     }

@@ -41,6 +41,14 @@ case "$t" in
   echo 'secrets/* filter=hide' > .gitattributes
   echo stolen > secrets/token; echo 42 > answer.txt ;;
 *STOPME*) sleep 30 ;;
+*FILL*)
+  # 64 MiB into each writable place; the case's disk budget is 32 MiB. The
+  # statuses are recorded after the space is freed again.
+  head -c 67108864 /dev/zero > /work/big 2>/dev/null; w=$?; rm -f /work/big
+  head -c 67108864 /dev/zero > /tmp/big 2>/dev/null; t=$?; rm -f /tmp/big
+  touch /var/tmp/x 2>/dev/null; r=$?
+  printf 'work=%s\ntmp=%s\nroot=%s\n' "$w" "$t" "$r" > fill.txt
+  echo 42 > answer.txt ;;
 esac
 "#;
 
@@ -123,6 +131,7 @@ expected_end_state = "{expected}"
 max_turns = 5
 timeout_secs = {timeout}
 memory = "512m"
+disk = "256m"
 cpus = 1.0
 "#,
                 mirror = m.display(),

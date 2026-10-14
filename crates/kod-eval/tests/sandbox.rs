@@ -7,11 +7,9 @@ use std::path::Path;
 fn agent_container_is_locked_down() {
     let c = common::case("PAY-1");
     let m = Mounts {
-        work: Path::new("/r/work"),
-        work_read_only: false,
+        read_only: &[(Path::new("/r/work"), "/seed"), (Path::new("/r/in"), "/in")],
         out: Path::new("/r/out"),
-        input: Some(Path::new("/r/in")),
-        scratch: None,
+        tmpfs: &["/work", "/tmp"],
     };
     let a = run_args(
         "kod-run-1-PAY-1",
@@ -34,35 +32,45 @@ fn agent_container_is_locked_down() {
         "--cap-drop ALL",
         "--security-opt no-new-privileges",
         "-e KOD_HOST_UID=1000",
-        "-v /r/work:/work ",
+        "-v /r/work:/seed:ro",
         "-v /r/out:/out",
         "-v /r/in:/in:ro",
+        "--read-only",
+        "--tmpfs /work:size=2g,exec",
+        "--tmpfs /tmp:size=2g,exec",
+        "--tmpfs /home/agent:size=64m,exec",
+        "-e KOD_LOG_CAP=16777216",
     ] {
         assert!(a.contains(want), "missing {want:?} in {a}");
     }
     assert!(!a.contains("--privileged"));
+    // The agent's writable workspace is a capped tmpfs, never a host directory.
+    assert!(!a.contains(":/work"), "{a}");
 }
 
 #[test]
 fn score_container_sees_the_workspace_read_only() {
     let c = common::case("PAY-1");
     let m = Mounts {
-        work: Path::new("/r/w"),
-        work_read_only: true,
+        read_only: &[(Path::new("/r/w"), "/work")],
         out: Path::new("/r/o"),
-        input: None,
-        scratch: Some(Path::new("/r/s")),
+        tmpfs: &["/tmp"],
     };
     let a = run_args("n", "run-1", &c, "none", &m, (1, 1), &[]).join(" ");
     for want in [
         "--network none",
         "--workdir /work",
         "-v /r/w:/work:ro",
-        "-v /r/s:/tmp",
+        "--read-only",
+        "--tmpfs /tmp:size=2g,exec",
     ] {
         assert!(a.contains(want), "missing {want:?} in {a}");
     }
     assert!(!a.contains("/in"));
+    assert!(
+        !a.contains(":/tmp"),
+        "scratch is a tmpfs, not a host directory: {a}"
+    );
 }
 
 #[test]
@@ -81,42 +89,35 @@ fn no_sandbox_container_gets_the_model_key() {
     let runner = Runner::ClaudeCode {
         model: "claude-test-1".into(),
     };
-    let m = |work_read_only, input, scratch| Mounts {
-        work: Path::new("/r/w"),
-        work_read_only,
+    let m = |read_only, tmpfs| Mounts {
+        read_only,
         out: Path::new("/r/o"),
-        input,
-        scratch,
+        tmpfs,
     };
+    let agent_ro = [(Path::new("/r/w"), "/seed"), (Path::new("/r/in"), "/in")];
+    let collect_ro = [(Path::new("/r/b"), "/in"), (Path::new("/r/o"), "/agent")];
+    let score_ro = [(Path::new("/r/w"), "/work")];
     let agent = [
         run_args(
             "a",
             "r",
             &c,
             "net",
-            &m(false, Some(Path::new("/r/in")), None),
+            &m(&agent_ro, &["/work", "/tmp"]),
             (1, 1),
             &runner.env(),
         ),
         runner.command(&c),
     ]
     .concat();
-    let collect = run_args(
-        "c",
-        "r",
-        &c,
-        "none",
-        &m(true, Some(Path::new("/r/b")), None),
-        (1, 1),
-        &[],
-    );
+    let collect = run_args("c", "r", &c, "none", &m(&collect_ro, &[]), (1, 1), &[]);
     let score_env = [("KOD_TEST_COMMAND".to_owned(), c.test_command.clone())];
     let score = run_args(
         "s",
         "r",
         &c,
         "none",
-        &m(true, None, Some(Path::new("/r/s"))),
+        &m(&score_ro, &["/tmp"]),
         (1, 1),
         &score_env,
     );

@@ -77,6 +77,9 @@ protected_paths = []
 max_turns = 50
 timeout_secs = 1800
 memory = "4g"
+# Size of each of /work and /tmp in the sandbox (tmpfs, so it counts against
+# memory and must be below it).
+disk = "2g"
 cpus = 2.0
 "#,
             id = quoted(&n.id),

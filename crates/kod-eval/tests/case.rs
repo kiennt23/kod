@@ -1,6 +1,6 @@
 mod common;
 use common::{SHA, case_toml};
-use kod_eval::case::{EndState, Split, load_case, load_cases};
+use kod_eval::case::{EndState, Split, load_case, load_cases, parse_size};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -111,4 +111,30 @@ fn load_cases_sorts_by_id() {
         .map(|c| c.id)
         .collect();
     assert_eq!(ids, ["A", "B"]);
+}
+
+#[test]
+fn disk_defaults_to_2g_and_must_be_below_memory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = write_case(tmp.path(), "PAY-1", &case_toml("PAY-1"), Some("x"));
+    assert_eq!(load_case(&d).unwrap().budget.disk, "2g");
+    for (memory, disk) in [("4g", "4g"), ("1g", "2g"), ("512m", "")] {
+        let toml = case_toml("PAY-1").replace(
+            "memory = \"4g\"",
+            &format!("memory = \"{memory}\"\ndisk = \"{disk}\""),
+        );
+        let d = write_case(tmp.path(), "PAY-1", &toml, Some("x"));
+        let err = load_case(&d).unwrap_err().to_string();
+        assert!(err.contains("disk"), "{memory}/{disk}: {err}");
+    }
+}
+
+#[test]
+fn sizes_parse_like_docker() {
+    assert_eq!(parse_size("32m"), Some(32 << 20));
+    assert_eq!(parse_size("4G"), Some(4 << 30));
+    assert_eq!(parse_size("1024"), Some(1024));
+    for bad in ["", "m", "1.5g", "2gb", "-1m", "1t"] {
+        assert_eq!(parse_size(bad), None, "{bad}");
+    }
 }
