@@ -60,7 +60,8 @@ agent)
   # hand it to the agent.
   cp -R --preserve=mode,timestamps,links /seed/. /work/ || { echo "kod: the workspace does not fit in /work" >&2; exit 1; }
   chmod 755 /work && chown -R agent:agent /work && own_home || exit 1
-  { claude --version 2>/dev/null || echo unknown; } | cap /out/runner_version
+  # The runner's own binary ($1: claude, kod-loop, or sh for scripts).
+  { as_agent "$1" --version 2>/dev/null || echo unknown; } | cap /out/runner_version
   # stdout to agent.json, stderr to agent.stderr, each capped. The exit status
   # is recorded before anything left running is killed, which also closes the
   # pipes.

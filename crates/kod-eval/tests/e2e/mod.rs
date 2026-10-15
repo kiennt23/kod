@@ -1,5 +1,6 @@
 //! Shared by the Docker test binaries. They need Docker, the kod-llm-proxy
-//! image, a kod-sandbox-test image built with EXTRA_PACKAGES=curl, and
+//! image, a kod-sandbox-test image built from the repo root with
+//! RUST_VERSION and EXTRA_PACKAGES=curl (see .github/workflows/ci.yml), and
 //! KOD_API_KEY set to any value. Run with KOD_DOCKER_TESTS=1.
 #![allow(dead_code, unused_imports)]
 pub use kod_eval::{
@@ -99,6 +100,11 @@ pub fn fixture(root: &Path, cases: &[(&str, &str, &str, u64)]) -> PathBuf {
         fs::create_dir_all(m.join("secrets")).unwrap();
         git(&m, &["init", "-q"]).unwrap();
         fs::write(m.join("README"), "demo\n").unwrap();
+        fs::write(
+            m.join("AGENTS.md"),
+            "Rule: also record each answer in kod-agents-rule.txt\n",
+        )
+        .unwrap();
         fs::write(m.join("secrets/.keep"), "").unwrap();
         commit(&m, "base");
         fs::write(m.join("check.sh"), CHECK).unwrap();

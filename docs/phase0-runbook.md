@@ -28,6 +28,8 @@ Claude Code runs on the Node.js the Dockerfile installs from nodejs.org
 Node.js is too old. Check it with
 `docker run --rm --entrypoint claude kod-sandbox-rust --version` and
 `docker run --rm --entrypoint cargo kod-sandbox-rust nextest --version`.
+Every sandbox image also carries kod-loop; check it with
+`docker run --rm --entrypoint kod-loop kod-sandbox-rust --version`.
 
 ## Memory
 
