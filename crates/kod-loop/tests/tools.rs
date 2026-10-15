@@ -212,3 +212,17 @@ fn output_flood_is_capped_head_and_tail() {
     assert!(r.text.contains("bytes omitted"));
     assert!(r.text.contains("LAST\n[exit code 0]"));
 }
+
+#[test]
+fn endless_output_is_killed_before_the_timeout() {
+    let d = tempfile::tempdir().unwrap();
+    let start = Instant::now();
+    let r = call(d.path(), "run", json!({"command": "yes"}));
+    assert!(start.elapsed() < Duration::from_secs(20));
+    assert!(
+        r.text.contains("output limit was exceeded"),
+        "{}",
+        r.text.len()
+    );
+    assert!(r.text.len() < OUTPUT_CAP + 200, "{}", r.text.len());
+}

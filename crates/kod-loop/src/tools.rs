@@ -19,6 +19,8 @@ pub const OUTPUT_CAP: usize = 30_000;
 pub const READ_LIMIT: u64 = 2000;
 /// Larger files are read in parts with `run` (head, sed -n).
 const MAX_READ: u64 = 10 << 20;
+/// A command that writes more than this is killed; /tmp may be a small tmpfs.
+const MAX_OUTPUT: u64 = 64 << 20;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolResult {
@@ -191,7 +193,8 @@ fn run(ws: &Path, timeout: Duration, input: &Value) -> Result<String, String> {
                 None => "[killed by a signal]".to_owned(),
             };
         }
-        if start.elapsed() >= timeout {
+        let flooded = out.metadata().map_err(err)?.len() > MAX_OUTPUT;
+        if flooded || start.elapsed() >= timeout {
             let note = if kill_group(child.id()) {
                 ""
             } else {
@@ -200,10 +203,12 @@ fn run(ws: &Path, timeout: Duration, input: &Value) -> Result<String, String> {
             // The leader too, in case the group signal failed, so wait() returns.
             let _ = child.kill();
             let _ = child.wait();
-            break format!(
-                "[killed after {}s: the command hit the time limit{note}]",
-                timeout.as_secs()
-            );
+            let why = if flooded {
+                "the output limit was exceeded"
+            } else {
+                "the command hit the time limit"
+            };
+            break format!("[killed after {}s: {why}{note}]", start.elapsed().as_secs());
         }
         thread::sleep(Duration::from_millis(20));
     };
