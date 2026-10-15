@@ -22,7 +22,7 @@
 
 The phase decomposition is in `2026-10-14-phase1-overview.md`, sub-plan 4. The policy API comes from `2026-10-15-phase1-policy.md` (D3, D4, D12). Execution modes follow `docs/adr/0001-per-task-execution-mode.md`.
 
-**Precondition:** kod-policy (sub-plan 3, branch `feat/phase1-policy`) is merged to main before Task 1 starts. Every task depends on `kod_policy::{Policy, Decision}` and the repo's `policy/` directory. This plan's code was compiled and tested against a stub crate that implements only the policy plan's API (`Policy::load`, `version`, `decide`, `Decision { allow, reasons, policy_version }`) and its D12 `retention_delete` rule, with the same deny reasons. The executor runs the tests against the real crate; if a reason string differs, the policy plan is the source of truth.
+**Precondition:** kod-policy (sub-plan 3, branch `feat/phase1-policy`) is merged to main before Task 1 starts. Every task depends on `kod_policy::{Policy, Decision}` and the repo's `policy/` directory. This revision's executable blocks are validated against the real policy implementation from PR #13 (`d5aa0c8`). The executor repeats the tests against the merged crate; policy reason strings and semantics come from that crate.
 
 **Out of scope here** (later sub-plans, see the overview):
 - The tool gateway that calls `before` around every external write and refuses publish when it fails (5).
@@ -48,15 +48,15 @@ The phase decomposition is in `2026-10-14-phase1-overview.md`, sub-plan 4. The p
 | D1 | **SQLite** through rusqlite 0.40 with `bundled`, one file (default `/var/lib/kod/audit.db`), WAL mode, `synchronous=FULL`, 2 s busy timeout. Appends run in `BEGIN IMMEDIATE`, so concurrent writers (gateway, dispatcher, CLI) serialize and the chain stays linear. | Six people, our own hosts, one trusted audit host: SQLite has no server to run, patch, back up or authenticate, and tests and CI need no service. WAL handles several writer processes on one host. Postgres would add a server and credentials for a write rate of a few rows per second. Its INSERT-only role doesn't stop a host admin either: the integrity evidence comes from the checkpoints, not from the database. **Ceiling:** writers must be on the audit host, because SQLite over a network filesystem is unsafe. Move to Postgres when a writer has to run on another host. |
 | D2 | One row per entry: `seq, at, record_type, payload, payload_sha256, hash`. `hash = sha256(prev_hash ‖ seq ‖ at ‖ len(record_type) ‖ record_type ‖ payload_sha256)`, with the integers as 8-byte little-endian and the hashes as raw bytes. Entry 1's `prev` is `GENESIS` (64 zeros). The chain covers the payload's hash, not the payload. | Retention can then null a payload while every hash still verifies. The length prefix stops record type and payload hash from sliding into each other. `seq` in the hash makes reordering or renumbering visible. |
 | D3 | SQLite triggers refuse `DELETE`; refuse an `INSERT` (including `INSERT OR REPLACE`, whose delete fires no trigger) unless `seq` is the next number; and refuse any `UPDATE` other than setting `payload` to NULL when a `retention` entry with a higher seq, already in the chain, lists that entry under its record type. | They guard against mistakes and stray SQL, not against an attacker: anyone who can write the file can drop them. The tamper tests drop them first, as an attacker would. Binding the payload clear to a chained deletion record means even stray SQL can't erase a payload without leaving the record. |
-| D4 | **Redaction before storage**: `append` runs `redact_value` on the payload before serializing it, so a secret never reaches the file or the WAL. One function, `redact`, runs on every string value and every object key, and replaces with `[REDACTED]`: (a) a known credential prefix (Anthropic and OpenAI `sk-`, Stripe `sk_live_` `rk_live_`, GitHub `ghp_` `gho_` `ghu_` `ghs_` `ghr_` `github_pat_`, GitLab `glpat-`, Slack `xox?-`, AWS `AKIA` `ASIA`, Google `AIza`, JWT `eyJ`, `bearer ` in any case) not preceded by a letter or digit and followed by at least 16 token characters, so `KEY=ghp_…`, `--token=sk-…`, `path/ghp_…` and `?t=…` are caught; (b) the value of `name = value` or `name: value`, the name optionally quoted and spaces allowed around the separator, when the name, ignoring case, `_` and `-`, contains SECRET, TOKEN, PASS, PWD, AUTH, APIKEY, ACCESSKEY or PRIVATEKEY (env dumps, YAML, JSON text, headers such as `X-Api-Key:`, query strings; quoted values with their quotes; `Authorization: Basic …` takes scheme and credentials; all-digit values such as `max_tokens=4096` kept; `PWD`, `OLDPWD` and `author` are not secret names); (c) the value after a secret-sounding `--name ` flag, and `-u user:password`; (d) the password in `scheme://user:password@host`; (e) any `-----BEGIN …PRIVATE KEY…-----` block (PGP's `PRIVATE KEY BLOCK` included), to the end of the text if the END line is missing. `redact_value` also replaces a string under a secret-sounding JSON key, and suffixes `#n` when two keys redact to the same text. | It's the smallest thing that catches what agents actually leak (tokens in commands, env dumps, keys in files, credentials in clone URLs) without a regex dependency. The 16-character minimum keeps `task-list`, `sk-learn` and `ask-me-…` intact. **Ceiling:** an unknown format, or a bare password with no telling name around it, isn't caught. Add a prefix or name when a new shape shows up. |
-| D5 | **Checkpoints** go through `trait CheckpointTarget { put, list }`. `DirTarget` writes `{seq:020}.json` with `create_new` (an existing file is never overwritten), fsyncs it and makes it read-only. `list` reads only `<20 digits>.json` files (skipping `lost+found`, `.DS_Store` and the like) and fails on one it can't parse, or whose name and `seq` disagree. In production the directory is a mount owned by a **separate account**: the kod service user may create files there but can't modify or delete them (for example an NFS export on the backup host with the immutable or append-only attribute set by its own cron, or an S3 Object Lock bucket via a second `CheckpointTarget`). | The trait is two methods, so a second target is easy to add once the storage is chosen, and tests need no cloud. `create_new` plus read-only makes the local fake write-once for the kod user. The separate account is what makes it real. `checkpoint` verifies first and refuses to checkpoint a tampered log, so a tampered head never becomes the trusted reference. |
+| D4 | **Redaction before storage**: `append` rejects serialized payloads over `MAX_PAYLOAD_BYTES` (1 MiB) before redaction, rechecks the redacted size, and runs `redact_value` before taking the write lock, so a secret never reaches the file or the WAL. One function, `redact`, runs on every string value and every object key, and replaces with `[REDACTED]`: (a) a known credential prefix (Anthropic and OpenAI `sk-`, Stripe `sk_live_` `rk_live_`, GitHub `ghp_` `gho_` `ghu_` `ghs_` `ghr_` `github_pat_`, GitLab `glpat-`, Slack `xox?-`, AWS `AKIA` `ASIA`, Google `AIza`, JWT `eyJ`, `bearer ` in any case) not preceded by a letter or digit and followed by at least 16 token characters, so `KEY=ghp_…`, `--token=sk-…`, `path/ghp_…` and `?t=…` are caught; (b) the value of `name = value` or `name: value`, the name optionally quoted and spaces allowed around the separator, when the name, ignoring case, `_` and `-`, contains SECRET, TOKEN, PASS, PWD, AUTH, APIKEY, ACCESSKEY or PRIVATEKEY (env dumps, YAML, JSON text, headers such as `X-Api-Key:`, query strings; quoted values with their quotes; `Authorization: Basic …` takes scheme and credentials; all-digit values such as `max_tokens=4096` kept; `PWD`, `OLDPWD` and `author` are not secret names); (c) the value after a secret-sounding `--name ` flag, and `-u user:password`; (d) the password in `scheme://user:password@host`; (e) any `-----BEGIN …PRIVATE KEY…-----` block (PGP's `PRIVATE KEY BLOCK` included), to the end of the text if the END line is missing. `redact_value` also replaces a string under a secret-sounding JSON key, and suffixes `#n` when two keys redact to the same text. | Nonmatching prefixes are rejected before scanning their bodies, so long nonmatching token text does not repeatedly scan the suffix. It's the smallest thing that catches what agents actually leak (tokens in commands, env dumps, keys in files, credentials in clone URLs) without a regex dependency. The 16-character minimum keeps `task-list`, `sk-learn` and `ask-me-…` intact. **Ceiling:** an unknown format, or a bare password with no telling name around it, isn't caught. Add a prefix or name when a new shape shows up. |
+| D5 | **Checkpoints** go through `trait CheckpointTarget { put, list }`. `put` must publish complete, durable contents without overwriting a prior sequence. `DirTarget` stages a private `.checkpoint-*` file, makes it read-only and fsyncs it, then uses `persist_noclobber` and fsyncs the directory. Readers ignore staging names. The production target must provide these semantics under a **separate account**. Validate atomic publication, no-overwrite, durability, and account separation on the selected storage before the integrity exit criterion. | Staging prevents partial files from appearing as checkpoints. The local adapter is a test fake until that storage contract is verified; read-only permissions do not stop a file's owner from changing them. A second `CheckpointTarget` can use storage-native atomic write-once publication. `checkpoint` verifies first and refuses a tampered log. |
 | D6 | systemd timers on the audit host run `kod-audit checkpoint` **every 5 minutes**, `kod-audit verify` hourly and `kod-audit purge` daily for each record type. Any failure exits non-zero with `{"ok":false,"error":…}`, and `OnFailure=` alerts the owner. | The spec says "every few minutes". Five minutes bounds the untraceable truncation window. `verify` reads a snapshot and `purge` writes in batches, so neither holds the write lock long enough to time out a gateway append. The runbook section (Task 4) has the units. |
 | D7 | **Fail closed**: `before(record_type, payload, call)` returns `Err` without running `call` whenever the append fails: the store is busy beyond 2 s, the disk is full, the file is unreadable, or the record type is invalid. `AuditLog::open` fails on a missing directory or a file that isn't a database. | This is the spec's failure rule: when the audit write fails, the external write is refused. It's a closure rather than a flag, so a caller can't run the call after forgetting to check. Sub-plan 5 wraps publish and every tracker or docs write in it. |
-| D8 | **Retention**: `purge(policy, record_type, now)` refuses when `now` is behind the newest entry. It takes the entries of that type that still have a payload, oldest first, in batches of `PURGE_BATCH` (500) per transaction. It asks `decide({"action":"retention_delete","record_type", "age_days"})` for each, with whole days rounded down, and stops at the first deny, which is always recorded as a `policy_decision`. For the allowed entries it appends one `retention` entry `{record_type, seqs, oldest_age_days, youngest_age_days, policy_version}`, then sets their `payload = NULL`. Only `purge` writes `retention` entries (`append` and `before` refuse that type), and they are never purged. Rows and hashes are never deleted. | This follows the matrix row: the decision lives in the policy (strictest profile wins, a missing value refuses), and the evidence is a deletion record in the chain with the policy version. Keeping rows and hashes means truncation detection survives retention. The placeholder profile refuses everything, so nothing can be deleted until the owner sets values. |
+| D8 | **Logical retention clearing**: `purge(policy, record_type, now)` refuses when `now` is behind the newest entry. It takes the entries of that type that still have a payload, oldest first, in batches of `PURGE_BATCH` (500) per transaction. It asks `decide({"action":"retention_delete","record_type", "age_days"})` for each, with whole days rounded down, and stops at the first deny, which is always recorded as a `policy_decision`. For the allowed entries it appends one `retention` entry `{record_type, seqs, oldest_age_days, youngest_age_days, policy_version}`, then sets their `payload = NULL`. Only `purge` writes `retention` entries (`append` and `before` refuse that type), and they are never purged. Rows and hashes are never deleted. | This follows the matrix row: the decision lives in the policy (strictest profile wins, a missing value refuses), and the evidence is a deletion record in the chain with the policy version. Keeping rows and hashes means truncation detection survives retention. The placeholder profile refuses everything, so nothing can be deleted until the owner approves values and the storage-erasure/snapshot-expiry procedure. The CLI reports `payloads_cleared`, not physical deletions; WAL, freed pages and copies are outside this logical operation. |
 | D9 | `verify` accepts a `retention` entry only if it has `record_type`, `seqs` and `policy_version`, and every listed seq is an earlier entry of that record type (never a `retention` entry). It reports `payload removed without a retention record` for any NULL payload no valid `retention` entry lists. | Otherwise a hand-written or forged deletion record would be a silent way to erase content. A malformed one can only come from raw writes, so failing `verify` on it is the right alert. |
 | D10 | `record_decision(input, &Decision)` appends `run_audit` `{"kind":"policy_decision","input","decision"}`, where the decision carries `policy_version` (policy D4). Record types are lower-case letters and underscores. They are the keys of the compliance profile's `retention_days` (`run_audit`, `prompts`, `model_outputs`, …), plus `retention`. | One shape for every decision, so an auditor can find which rules decided. The record type naming matches the policy's `retention_days.<record_type>` lookup, so retention works per type without a mapping table. |
-| D11 | `open` creates the database file mode `0600` before SQLite opens it, and SQLite gives the `-wal` and `-shm` files the same mode. The directory `/var/lib/kod` is `0700`, owned by the kod service user on the audit host. Only the kod user reads the live database. Owner and auditors read the snapshot the off-host verifier (D12) has just verified, on the checkpoint host (`/srv/kod-verify/audit.db`, mode 0600 under the checkpoint account, readable by an auditors group). | "Readable only by owner and auditors" is an OS permission, not an application feature. Payloads sit in the WAL before a checkpoint, so its mode matters as much as the database's. Root on the audit host could serve the verifier an honest copy while doctoring the live file, so auditors read the copy that was verified, not the live one. Build a reader role when auditors need more. |
-| D12 | **Off-host verifier**: an hourly job on the checkpoint host, under the checkpoint account, pulls a `VACUUM INTO` copy of the database and runs `kod-audit --db <copy> --checkpoints <its own checkpoint store> verify --released-policies <dir>`. `verify` works on any copy. | The audit host controls its own view of the checkpoints, so only a verifier that reads them from the other side can catch a rewrite by someone with host access. The test `the_off_host_verifier_catches_a_rewrite_behind_a_forged_mount` pins the difference. |
+| D11 | `open` creates the database file mode `0600` before SQLite opens it, and SQLite gives the `-wal` and `-shm` files the same mode. The directory `/var/lib/kod` is `0700`, owned by the kod service user on the audit host. Only the kod user reads the live database. Owner and auditors read the snapshot the off-host verifier (D12) has just verified, on the checkpoint host (a private `/srv/kod-verify/run.*/audit.db` with a `VERIFIED` marker). Only the checkpoint account has access by default; grant named owner/auditor accounts read-only access to successful snapshots through the approved access procedure. | "Readable only by owner and auditors" is an OS permission, not an application feature. Payloads sit in the WAL before a checkpoint, so its mode matters as much as the database's. Root on the audit host could serve the verifier an honest copy while doctoring the live file, so auditors read the copy that was verified, not the live one. Build a reader role when auditors need more. |
+| D12 | **Off-host verifier**: an hourly job under the independent checkpoint account first runs `capture-checkpoints --output NEW_DIR` against its trusted checkpoint store, then pulls a `VACUUM INTO` database copy into the same private run directory. It verifies that copy against the **frozen** checkpoint set and released policies, then writes `VERIFIED` only on success. | Freezing checkpoints before the DB snapshot prevents a legitimate later checkpoint from being mistaken for truncation. Every captured checkpoint must still match; never ignore anchors merely because they exceed the copied head. `captured_checkpoints_accept_an_older_snapshot_after_live_appends`, `captured_checkpoints_still_detect_a_truncated_snapshot` and the forged-mount test pin these boundaries. |
 | D13 | **Released policies**: the checkpoint host keeps every released policy directory, one subdirectory per version, never deleted. `verify_retention(&[Policy])` (CLI `verify --released-policies DIR`) checks that each `retention` entry's `policy_version` is one of them and re-runs that policy's `decide` for every listed seq, with the age from the retention entry's `at` minus the entry's `at`. `purge` stamps its entries with its own `now`, so the ages match what it asked. | A forged but well-formed deletion record then fails automatically instead of waiting for an auditor. Keeping every released policy also makes the profiles behind each deletion recoverable: `policy_version` hashes `compliance.json`. |
 
 ## Execution
@@ -87,9 +87,9 @@ The modes follow [ADR 0001](../../adr/0001-per-task-execution-mode.md): a task t
 ## Review Focus
 
 1. **Several processes writing at once** (the gateway, the dispatcher and the CLI on one host) must produce one linear chain with no forks or gaps. Pinned by Task 2 `concurrent_writers_keep_one_linear_chain`.
-2. **The store being down, locked by another writer, missing or not a database** must make the append fail, and the guarded external call must never run; and the audit job itself (verify, a large purge) must not be what locks it. Pinned by Task 2 `when_the_store_is_down_the_external_write_is_refused` and `a_store_that_cannot_be_opened_is_an_error`, Task 3 `verify_does_not_take_the_write_lock`, and Task 4 `large_purges_run_in_batches`.
-3. **A full rewrite with every hash recomputed, hidden behind a forged checkpoint mount, a replaced empty log, a junk checkpoint, or a checkpoint written while verify runs**: the off-host verify must fail, a tampered log must never be checkpointed, and a race or a foreign file must not raise a false alarm. Pinned by Task 3 `a_rewritten_chain_is_caught_by_the_checkpoint`, `the_off_host_verifier_catches_a_rewrite_behind_a_forged_mount`, `a_replaced_empty_log_is_caught`, `an_unreadable_checkpoint_store_fails_verification`, `a_checkpoint_taken_during_verify_is_not_reported_as_truncation` and `foreign_files_in_the_checkpoint_store_are_ignored`.
-4. **Secrets in odd places**: after `KEY=`, `--token=` or `/`, with spaces or a colon (`key = x`, YAML, JSON text, headers), in flags (`--password x`, `-u user:pass`), as Stripe keys or PGP private keys, in env dumps, clone URLs and query strings, in nested arrays and objects, as object keys, and a private key cut off before its END line. Ordinary text that resembles a prefix or assignment (`task-list`, `sk-learn`, `max_tokens=4096`, `host:8443/a@b`) must be left alone. Pinned by Task 1 `tokens_after_punctuation_are_redacted`, `names_match_without_separators_or_case`, `spaced_and_colon_assignments_are_redacted`, `credential_headers_are_redacted`, `credentials_in_command_flags_are_redacted`, `any_private_key_label_is_redacted`, `stripe_keys_are_redacted`, `sensitive_assignments_and_env_dumps_are_redacted`, `urls_are_redacted`, `every_string_and_key_in_a_payload_is_redacted`, `private_key_blocks_are_redacted_even_without_an_end` and `ordinary_text_is_left_alone`, and Task 2 `secrets_are_redacted_before_storage`.
+2. **The store being down, locked by another writer, missing or not a database** must make the append fail, and the guarded external call must never run; and the audit job itself (verify, a large purge) must not be what locks it. Pinned by Task 2 `when_the_store_is_down_the_external_write_is_refused` and `a_store_that_cannot_be_opened_is_an_error`, Task 3 `verify_does_not_take_the_write_lock`, and Task 4 `large_purges_run_in_batches`. Task 2 `oversized_payloads_are_refused_before_waiting_for_the_write_lock` also requires over-limit caller payloads to fail before lock contention and before the external callback.
+3. **A full rewrite with every hash recomputed, hidden behind a forged checkpoint mount, a replaced empty log, a junk checkpoint, or a checkpoint written while verify runs**: the off-host verify must fail, a tampered log must never be checkpointed, and a race or a foreign file must not raise a false alarm. Pinned by Task 3 `a_rewritten_chain_is_caught_by_the_checkpoint`, `the_off_host_verifier_catches_a_rewrite_behind_a_forged_mount`, `a_replaced_empty_log_is_caught`, `an_unreadable_checkpoint_store_fails_verification`, `a_checkpoint_taken_during_verify_is_not_reported_as_truncation` and `foreign_files_in_the_checkpoint_store_are_ignored`. Task 3's unit tests `staged_checkpoint_is_invisible_until_published` and `interrupted_staging_does_not_poison_the_store` cover publication; Task 4's two captured-checkpoint snapshot tests cover off-host ordering and real truncation.
+4. **Secrets in odd places**: after `KEY=`, `--token=` or `/`, with spaces or a colon (`key = x`, YAML, JSON text, headers), in flags (`--password x`, `-u user:pass`), as Stripe keys or PGP private keys, in env dumps, clone URLs and query strings, in nested arrays and objects, as object keys, and a private key cut off before its END line. Ordinary text that resembles a prefix or assignment (`task-list`, `sk-learn`, `max_tokens=4096`, `host:8443/a@b`) must be left alone. Pinned by Task 1 `tokens_after_punctuation_are_redacted`, `names_match_without_separators_or_case`, `spaced_and_colon_assignments_are_redacted`, `credential_headers_are_redacted`, `credentials_in_command_flags_are_redacted`, `any_private_key_label_is_redacted`, `stripe_keys_are_redacted`, `sensitive_assignments_and_env_dumps_are_redacted`, `urls_are_redacted`, `every_string_and_key_in_a_payload_is_redacted`, `private_key_blocks_are_redacted_even_without_an_end` and `ordinary_text_is_left_alone`, and Task 2 `secrets_are_redacted_before_storage`. `long_non_matching_tokens_are_left_alone` must also complete under the five-second built-test-binary budget in Task 1.
 5. **A forged deletion record, a payload erased by hand, a wrong clock, or a refusal mid-purge** must not lose evidence:
    - `append` refuses `retention`, the store refuses to clear an uncovered payload, `verify` flags a malformed or overreaching deletion record, and `verify_retention` flags a well-formed one that no released policy allows;
    - a NULL payload with no valid retention record is flagged;
@@ -157,8 +157,6 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-
-[dev-dependencies]
 tempfile = "3"
 ```
 
@@ -396,6 +394,12 @@ fn stripe_keys_are_redacted() {
         assert_eq!(redact(&format!("key {secret}")), format!("key {REDACTED}"));
     }
 }
+
+#[test]
+fn long_non_matching_tokens_are_left_alone() {
+    let text = "_".repeat(128 * 1024);
+    assert_eq!(redact(&text), text);
+}
 ```
 
 - [ ] **Step 3: Run it and see it fail**
@@ -575,11 +579,14 @@ fn token_at(text: &str, i: usize) -> Option<usize> {
         } else {
             head == p.as_bytes()
         };
+        if !hit {
+            return None;
+        }
         let body = bytes[i + p.len()..]
             .iter()
             .take_while(|b| is_token_byte(**b))
             .count();
-        (hit && body >= MIN_BODY).then_some(i + p.len() + body)
+        (body >= MIN_BODY).then_some(i + p.len() + body)
     })
 }
 
@@ -689,7 +696,7 @@ fn url_password_at(text: &str, i: usize) -> Option<usize> {
 - [ ] **Step 5: Run it and see it pass**
 
 Run: `cargo test -p kod-audit --test redact && cargo clippy -p kod-audit --all-targets -- -D warnings && cargo fmt --all --check`
-Expected: 13 passed, no warnings, no diff.
+Expected: 14 passed, no warnings, no diff. Also run the built `redact` test binary's `long_non_matching_tokens_are_left_alone` test under `timeout 5s`, excluding Cargo compilation from the budget. This bounds processing of 128 KiB of nonmatching token characters; the previous suffix scan took quadratic time.
 
 - [ ] **Step 6: Commit**
 
@@ -714,7 +721,7 @@ git commit -m "kod-audit: crate skeleton and secret redaction"
   - `AuditLog::append(&self, &str, &Value) -> Result<u64>`, which refuses `RETENTION`.
   - `AuditLog::record_decision(&self, &Value, &Decision) -> Result<u64>`.
   - `AuditLog::before<T>(&self, &str, &Value, impl FnOnce() -> T) -> Result<T>`.
-  - Crate-private helpers used by Tasks 3 and 4: `sha256_hex(&[u8]) -> String`, `append_in(&Transaction, &str, &Value, at: i64) -> Result<u64>` (`append` passes `now()?`; `purge` passes its own `now`), and `AuditLog::tx(&self, TransactionBehavior, impl FnOnce(&Transaction) -> Result<T>) -> Result<T>` (one transaction: Immediate for writers, Deferred for readers).
+  - Crate-private helpers used by Tasks 3 and 4: `sha256_hex(&[u8]) -> String`, `prepare_payload(&Value) -> Result<String>`, `append_text_in(&Transaction, &str, &str, at: i64) -> Result<u64>` (`append` prepares before locking and passes `now()?`), and `AuditLog::tx(&self, TransactionBehavior, impl FnOnce(&Transaction) -> Result<T>) -> Result<T>` (one transaction: Immediate for writers, Deferred for readers). Task 4 adds `append_in` for retention's bounded internal payloads.
   - Table `audit(seq, at, record_type, payload, payload_sha256, hash)` with the triggers `audit_append_only`, `audit_no_delete` and `audit_only_purge`.
 
 - [ ] **Step 1: Write the failing test**
@@ -935,6 +942,23 @@ fn a_store_that_cannot_be_opened_is_an_error() {
     std::fs::write(dir.path().join("junk.db"), "not a database, just junk text").unwrap();
     assert!(AuditLog::open(&dir.path().join("junk.db")).is_err());
 }
+
+#[test]
+fn oversized_payloads_are_refused_before_waiting_for_the_write_lock() {
+    let f = fixture();
+    let blocker = Connection::open(f.db()).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let called = Cell::new(false);
+    let payload = json!({"output": "_".repeat(kod_audit::MAX_PAYLOAD_BYTES)});
+    let err = f
+        .log
+        .before(RUN_AUDIT, &payload, || called.set(true))
+        .unwrap_err();
+    assert!(err.to_string().contains("payload exceeds"), "{err:#}");
+    assert!(!called.get());
+    blocker.execute_batch("ROLLBACK").unwrap();
+    assert_eq!(f.chain_len(), 0);
+}
 ```
 
 - [ ] **Step 2: Run it and see it fail**
@@ -979,6 +1003,8 @@ pub const RUN_AUDIT: &str = "run_audit";
 pub const RETENTION: &str = "retention";
 /// How long a write waits for another writer before it fails.
 pub const BUSY_TIMEOUT: Duration = Duration::from_secs(2);
+/// Maximum serialized payload size, checked before redaction and locking.
+pub const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS audit (
@@ -1054,12 +1080,18 @@ pub fn now() -> Result<i64> {
     Ok(d.as_secs() as i64)
 }
 
-pub(crate) fn append_in(
-    tx: &Transaction,
-    record_type: &str,
-    payload: &Value,
-    at: i64,
-) -> Result<u64> {
+fn prepare_payload(payload: &Value) -> Result<String> {
+    if serde_json::to_vec(payload)?.len() > MAX_PAYLOAD_BYTES {
+        bail!("audit payload exceeds {MAX_PAYLOAD_BYTES} bytes");
+    }
+    let text = serde_json::to_string(&redact::redact_value(payload))?;
+    if text.len() > MAX_PAYLOAD_BYTES {
+        bail!("redacted audit payload exceeds {MAX_PAYLOAD_BYTES} bytes");
+    }
+    Ok(text)
+}
+
+fn append_text_in(tx: &Transaction, record_type: &str, text: &str, at: i64) -> Result<u64> {
     if record_type.is_empty()
         || !record_type
             .bytes()
@@ -1067,7 +1099,6 @@ pub(crate) fn append_in(
     {
         bail!("record type must be lower-case letters and underscores: {record_type:?}");
     }
-    let text = serde_json::to_string(&redact::redact_value(payload))?;
     let (last, prev): (i64, String) = tx
         .query_row(
             "SELECT seq, hash FROM audit ORDER BY seq DESC LIMIT 1",
@@ -1142,8 +1173,9 @@ impl AuditLog {
         if record_type == RETENTION {
             bail!("retention records are written only by purge");
         }
+        let text = prepare_payload(payload)?;
         self.tx(TransactionBehavior::Immediate, |tx| {
-            append_in(tx, record_type, payload, now()?)
+            append_text_in(tx, record_type, &text, now()?)
         })
     }
 
@@ -1173,7 +1205,7 @@ impl AuditLog {
 - [ ] **Step 4: Run it and see it pass**
 
 Run: `cargo test -p kod-audit && cargo clippy -p kod-audit --all-targets -- -D warnings && cargo fmt --all --check`
-Expected: log 11 passed and redact 13 passed. `when_the_store_is_down_the_external_write_is_refused` takes about 2 s (the busy timeout).
+Expected: log 12 passed and redact 14 passed. `when_the_store_is_down_the_external_write_is_refused` takes about 2 s (the busy timeout).
 
 - [ ] **Step 5: Commit**
 
@@ -1585,6 +1617,7 @@ Create `crates/kod-audit/src/checkpoint.rs`:
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::{fs, io::Write, path::PathBuf};
+use tempfile::NamedTempFile;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Checkpoint {
@@ -1597,32 +1630,40 @@ pub struct Checkpoint {
 }
 
 pub trait CheckpointTarget {
-    /// Stores a checkpoint. Must fail if one with the same seq exists.
+    /// Publishes a complete, durable checkpoint atomically, without overwrite.
     fn put(&self, cp: &Checkpoint) -> Result<()>;
     /// Every stored checkpoint, in seq order. Fails on anything unreadable.
     fn list(&self) -> Result<Vec<Checkpoint>>;
 }
 
-/// One file per checkpoint, created with create_new and then made read-only.
+/// One file per checkpoint, staged and synced before no-overwrite publication.
 /// It is the test fake, and the production adapter when the directory is a
 /// write-once mount owned by another account.
 pub struct DirTarget {
     pub dir: PathBuf,
 }
 
+impl DirTarget {
+    fn stage(&self, cp: &Checkpoint) -> Result<NamedTempFile> {
+        let mut f = tempfile::Builder::new()
+            .prefix(".checkpoint-")
+            .tempfile_in(&self.dir)?;
+        f.write_all(&serde_json::to_vec(cp)?)?;
+        let mut perms = f.as_file().metadata()?.permissions();
+        perms.set_readonly(true);
+        f.as_file().set_permissions(perms)?;
+        f.as_file().sync_all()?;
+        Ok(f)
+    }
+}
+
 impl CheckpointTarget for DirTarget {
     fn put(&self, cp: &Checkpoint) -> Result<()> {
         let path = self.dir.join(format!("{:020}.json", cp.seq));
-        let mut f = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
+        self.stage(cp)?
+            .persist_noclobber(&path)
             .with_context(|| format!("write-once checkpoint {}", path.display()))?;
-        f.write_all(&serde_json::to_vec(cp)?)?;
-        f.sync_all()?;
-        let mut perms = f.metadata()?.permissions();
-        perms.set_readonly(true);
-        fs::set_permissions(&path, perms)?;
+        fs::File::open(&self.dir)?.sync_all()?;
         Ok(())
     }
 
@@ -1651,6 +1692,48 @@ impl CheckpointTarget for DirTarget {
         }
         out.sort_by_key(|cp| cp.seq);
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn staged_checkpoint_is_invisible_until_published() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = DirTarget {
+            dir: dir.path().to_owned(),
+        };
+        let cp = Checkpoint {
+            seq: 1,
+            hash: "a".repeat(64),
+            at: 0,
+        };
+        let staged = target.stage(&cp).unwrap();
+        assert!(target.list().unwrap().is_empty());
+        drop(staged);
+        assert!(target.list().unwrap().is_empty());
+        target.put(&cp).unwrap();
+        assert_eq!(target.list().unwrap(), vec![cp.clone()]);
+        assert!(target.put(&cp).is_err());
+        assert_eq!(target.list().unwrap(), vec![cp]);
+    }
+
+    #[test]
+    fn interrupted_staging_does_not_poison_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = DirTarget {
+            dir: dir.path().to_owned(),
+        };
+        fs::write(dir.path().join(".checkpoint-interrupted"), "{\"seq\":").unwrap();
+        let cp = Checkpoint {
+            seq: 1,
+            hash: "a".repeat(64),
+            at: 0,
+        };
+        target.put(&cp).unwrap();
+        assert_eq!(target.list().unwrap(), vec![cp]);
     }
 }
 ```
@@ -1812,7 +1895,7 @@ impl AuditLog {
 - [ ] **Step 4: Run them and see them pass**
 
 Run: `cargo test -p kod-audit && cargo clippy -p kod-audit --all-targets -- -D warnings && cargo fmt --all --check`
-Expected: integrity 15 passed, log 11 passed, redact 13 passed.
+Expected: checkpoint unit tests 2 passed, integrity 15 passed, log 12 passed, redact 14 passed.
 
 - [ ] **Step 5: Commit**
 
@@ -1830,13 +1913,13 @@ git commit -m "kod-audit: write-once checkpoints and tamper and truncation check
 
 **Interfaces:**
 - Consumes:
-  - From Tasks 2 and 3: `AuditLog::{tx, rows, verify, checkpoint}`, `append_in`, `RETENTION`, `RUN_AUDIT`, `now`, `checkpoint::DirTarget` and `common::fixture`.
+  - From Tasks 2 and 3: `AuditLog::{tx, rows, verify, checkpoint}`, `prepare_payload`, `append_text_in`, `RETENTION`, `RUN_AUDIT`, `now`, `checkpoint::DirTarget` and `common::fixture`. This task adds the `append_in` wrapper for retention records.
   - From kod-policy: `Policy::load(&Path) -> Result<Policy>`, `Policy::version(&self) -> &str`, `Policy::decide(&self, &Value) -> Decision`.
   - The repo's `policy/` directory, whose placeholder `compliance.json` is `{"profiles":{"placeholder":{}}}`.
 - Produces:
   - `AuditLog::purge(&self, &Policy, record_type: &str, now: i64) -> Result<usize>` and `PURGE_BATCH: usize` (500).
   - `AuditLog::verify_retention(&self, released: &[Policy]) -> Result<usize>`, the number of retention entries checked.
-  - The binary `kod-audit [--db PATH] --checkpoints DIR (verify [--released-policies DIR] | checkpoint | purge [--policy DIR] --record-type TYPE)`, which prints one JSON line and exits non-zero on any error.
+  - The binary `kod-audit [--db PATH] --checkpoints DIR (verify [--released-policies DIR] | checkpoint | capture-checkpoints --output NEW_DIR | purge [--policy DIR] --record-type TYPE)`, which prints one JSON line and exits non-zero on any error. `capture-checkpoints` never opens the database.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2113,11 +2196,15 @@ use std::{path::Path, process::Command};
 
 /// Runs the kod-audit binary against the fixture; returns (exit ok, stdout JSON).
 fn run(f: &common::Fixture, args: &[&str]) -> (bool, Value) {
+    run_at(&f.db(), &f.target.dir, args)
+}
+
+fn run_at(db: &Path, checkpoints: &Path, args: &[&str]) -> (bool, Value) {
     let out = Command::new(env!("CARGO_BIN_EXE_kod-audit"))
         .arg("--db")
-        .arg(f.db())
+        .arg(db)
         .arg("--checkpoints")
-        .arg(&f.target.dir)
+        .arg(checkpoints)
         .args(args)
         .output()
         .unwrap();
@@ -2160,7 +2247,71 @@ fn purge_refuses_under_the_placeholder_profile() {
         &["purge", "--policy", policy, "--record-type", RUN_AUDIT],
     );
     assert!(ok, "{v}");
-    assert_eq!(v, json!({"ok": true, "deleted": 0}));
+    assert_eq!(v, json!({"ok": true, "payloads_cleared": 0}));
+}
+
+#[test]
+fn captured_checkpoints_accept_an_older_snapshot_after_live_appends() {
+    let f = fixture();
+    f.log.append(RUN_AUDIT, &json!({"n": 1})).unwrap();
+    f.log.checkpoint(&f.target).unwrap();
+    let frozen = f.dir.path().join("frozen");
+    let missing_db = f.dir.path().join("not-yet.db");
+    let (ok, v) = run_at(
+        &missing_db,
+        &f.target.dir,
+        &["capture-checkpoints", "--output", frozen.to_str().unwrap()],
+    );
+    assert!(ok, "{v}");
+    assert!(!missing_db.exists());
+    let snapshot = f.dir.path().join("snapshot.db");
+    rusqlite::Connection::open(f.db())
+        .unwrap()
+        .execute("VACUUM INTO ?1", [snapshot.to_str().unwrap()])
+        .unwrap();
+    f.log.append(RUN_AUDIT, &json!({"n": 2})).unwrap();
+    f.log.checkpoint(&f.target).unwrap();
+    let (ok, v) = run_at(&snapshot, &frozen, &["verify"]);
+    assert!(ok, "{v}");
+    assert_eq!(v["entries"], 1);
+    assert_eq!(v["last_checkpoint"], 1);
+}
+
+#[test]
+fn captured_checkpoints_still_detect_a_truncated_snapshot() {
+    let f = fixture();
+    f.log.append(RUN_AUDIT, &json!({"n": 1})).unwrap();
+    let snapshot = f.dir.path().join("snapshot.db");
+    rusqlite::Connection::open(f.db())
+        .unwrap()
+        .execute("VACUUM INTO ?1", [snapshot.to_str().unwrap()])
+        .unwrap();
+    f.log.append(RUN_AUDIT, &json!({"n": 2})).unwrap();
+    f.log.checkpoint(&f.target).unwrap();
+    let frozen = f.dir.path().join("frozen");
+    let (ok, v) = run(
+        &f,
+        &["capture-checkpoints", "--output", frozen.to_str().unwrap()],
+    );
+    assert!(ok, "{v}");
+    let (ok, v) = run_at(&snapshot, &frozen, &["verify"]);
+    assert!(!ok, "{v}");
+    assert!(
+        v["error"].as_str().unwrap().contains("checkpoint at seq 2"),
+        "{v}"
+    );
+}
+
+#[test]
+fn checkpoint_capture_never_reuses_a_previous_directory() {
+    let f = fixture();
+    let frozen = f.dir.path().join("frozen");
+    std::fs::create_dir(&frozen).unwrap();
+    let (ok, v) = run(
+        &f,
+        &["capture-checkpoints", "--output", frozen.to_str().unwrap()],
+    );
+    assert!(!ok, "{v}");
 }
 
 #[test]
@@ -2224,7 +2375,18 @@ Expected: compile errors, `unresolved import kod_audit::PURGE_BATCH`, `no method
 
 - [ ] **Step 3: Implement retention and the CLI**
 
-In `crates/kod-audit/src/lib.rs`, add `mod retention;` on the line after `pub mod redact;`, and `pub use retention::PURGE_BATCH;` on the line before `pub use verify::Verified;`.
+In `crates/kod-audit/src/lib.rs`, add `mod retention;` on the line after `pub mod redact;`, and `pub use retention::PURGE_BATCH;` on the line before `pub use verify::Verified;`. Add this helper for retention's bounded, internally generated records (ordinary caller payloads are prepared before locking by `append`):
+
+```rust
+pub(crate) fn append_in(
+    tx: &Transaction,
+    record_type: &str,
+    payload: &Value,
+    at: i64,
+) -> Result<u64> {
+    append_text_in(tx, record_type, &prepare_payload(payload)?, at)
+}
+```
 
 Create `crates/kod-audit/src/retention.rs`:
 
@@ -2235,7 +2397,7 @@ use kod_policy::Policy;
 use rusqlite::{Transaction, TransactionBehavior, params};
 use serde_json::{Value, json};
 
-/// Payloads deleted per transaction, so a purge never holds the write lock
+/// Payloads logically cleared per transaction, so a purge never holds the write lock
 /// long enough to time out a gateway append.
 pub const PURGE_BATCH: usize = 500;
 
@@ -2247,7 +2409,8 @@ impl AuditLog {
     /// deletes, before clearing the payloads (the store refuses to clear a
     /// payload no retention entry covers). Rows and hashes stay, so the chain
     /// still verifies. Refuses to run when `now` is behind the newest entry:
-    /// the clock is wrong. Returns how many payloads were deleted.
+    /// the clock is wrong. Returns how many payloads were logically cleared,
+    /// not how many were erased from storage or expired from backups.
     pub fn purge(&self, policy: &Policy, record_type: &str, now: i64) -> Result<usize> {
         if record_type == RETENTION {
             bail!("retention records are kept for the life of the log");
@@ -2309,7 +2472,7 @@ impl AuditLog {
     }
 }
 
-/// One batch: returns how many payloads it deleted and whether the policy
+/// One batch: returns how many payloads it cleared and whether the policy
 /// refused one.
 fn purge_batch(
     tx: &Transaction,
@@ -2381,7 +2544,11 @@ Create `crates/kod-audit/src/main.rs`:
 ```rust
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use kod_audit::{AuditLog, checkpoint::DirTarget, now};
+use kod_audit::{
+    AuditLog,
+    checkpoint::{CheckpointTarget, DirTarget},
+    now,
+};
 use kod_policy::Policy;
 use serde_json::json;
 use std::{path::PathBuf, process::ExitCode};
@@ -2401,6 +2568,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Freeze the trusted checkpoint set before taking an off-host DB snapshot
+    CaptureCheckpoints {
+        /// New private directory; existing directories are refused
+        #[arg(long)]
+        output: PathBuf,
+    },
     /// Check the chain and every checkpoint
     Verify {
         /// Directory holding one policy directory per released version; when
@@ -2420,12 +2593,22 @@ enum Command {
 }
 
 fn run(cli: Cli) -> Result<serde_json::Value> {
-    let log = AuditLog::open(&cli.db)?;
     let target = DirTarget {
         dir: cli.checkpoints,
     };
     Ok(match cli.command {
+        Command::CaptureCheckpoints { output } => {
+            use std::os::unix::fs::DirBuilderExt;
+            let checkpoints = target.list()?;
+            std::fs::DirBuilder::new().mode(0o700).create(&output)?;
+            let frozen = DirTarget { dir: output };
+            for cp in &checkpoints {
+                frozen.put(cp)?;
+            }
+            json!({"ok": true, "checkpoints": checkpoints.len()})
+        }
         Command::Verify { released_policies } => {
+            let log = AuditLog::open(&cli.db)?;
             let v = log.verify(&target)?;
             let mut out =
                 json!({"ok": true, "entries": v.entries, "last_checkpoint": v.last_checkpoint});
@@ -2438,17 +2621,21 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             }
             out
         }
-        Command::Checkpoint => json!({"ok": true, "checkpoint": log.checkpoint(&target)?}),
+        Command::Checkpoint => {
+            let log = AuditLog::open(&cli.db)?;
+            json!({"ok": true, "checkpoint": log.checkpoint(&target)?})
+        }
         Command::Purge {
             policy,
             record_type,
         } => {
+            let log = AuditLog::open(&cli.db)?;
             // Separate transactions: an entry appended in between is checked
             // by the next verify, and purge clears only payloads its own
             // retention records cover.
             log.verify(&target)?;
             let policy = Policy::load(&policy)?;
-            json!({"ok": true, "deleted": log.purge(&policy, &record_type, now()?)?})
+            json!({"ok": true, "payloads_cleared": log.purge(&policy, &record_type, now()?)?})
         }
     })
 }
@@ -2470,7 +2657,7 @@ fn main() -> ExitCode {
 - [ ] **Step 4: Run everything and see it pass**
 
 Run: `cargo test --all && cargo clippy --all-targets -- -D warnings && cargo fmt --all --check`
-Expected: cli 3, integrity 15, log 11, redact 13 and retention 8 passed, plus every other crate's tests.
+Expected: checkpoint unit tests 2, cli 6, integrity 15, log 12, redact 14 and retention 8 passed (57 audit tests), plus every other crate's tests.
 
 - [ ] **Step 5: Add the runbook section**
 
@@ -2496,17 +2683,23 @@ ExecStart=/usr/local/bin/kod-audit --checkpoints /mnt/kod-checkpoints verify
 ExecStart=/bin/sh -c 'rc=0; for t in run_audit prompts model_outputs; do /usr/local/bin/kod-audit --checkpoints /mnt/kod-checkpoints purge --policy /etc/kod/policy --record-type "$t" || rc=1; done; exit $rc'
 ```
 
-The authoritative check runs on the checkpoint host, under the checkpoint account, reading its own checkpoint store (not the audit host's mount). Hourly, with `OnFailure=` alerting the owner:
+The authoritative check runs on the checkpoint host, under the checkpoint account. It freezes its trusted checkpoint set **before** requesting the database snapshot. Checkpoints published later belong to the next check; a copied database must cover every frozen checkpoint, so actual truncation is still refused. Hourly, with `OnFailure=` alerting the owner:
 
 ```
+set -eu
 umask 077
+verify_work=$(mktemp -d /srv/kod-verify/run.XXXXXX)
+kod-audit --checkpoints /srv/kod-checkpoints capture-checkpoints --output "$verify_work/checkpoints"
 ssh kod@audit-host rm -f /var/lib/kod/snap.db
 printf "VACUUM INTO '/var/lib/kod/snap.db';" | ssh kod@audit-host sqlite3 /var/lib/kod/audit.db
-scp kod@audit-host:/var/lib/kod/snap.db /srv/kod-verify/audit.db
-kod-audit --db /srv/kod-verify/audit.db --checkpoints /srv/kod-checkpoints verify --released-policies /srv/kod-policies
+scp kod@audit-host:/var/lib/kod/snap.db "$verify_work/audit.db"
+kod-audit --db "$verify_work/audit.db" --checkpoints "$verify_work/checkpoints" verify --released-policies /srv/kod-policies
+touch "$verify_work/VERIFIED"
 ```
 
-`/srv/kod-policies` holds every released `policy/` directory, one subdirectory per version (for example the release tag), copied there when it is released and never deleted: each `retention` record is checked against the policy it names. Owner and auditors read `/srv/kod-verify/audit.db` after a passing run, never the live database on the audit host.
+`/srv/kod-policies` holds every released `policy/` directory, one subdirectory per version (for example the release tag), copied there when it is released and never deleted: each `retention` record is checked against the policy it names. Owner and auditors read only run directories with a `VERIFIED` marker, never the live database. Run this job as one systemd oneshot so remote snapshot creation cannot overlap another invocation.
+
+Retention currently means **logical payload clearing**, not storage erasure. `payloads_cleared` counts SQL values set to NULL; old bytes can remain in WAL frames, freed pages, the remote `snap.db`, these run directories, and backups. Keep the placeholder profile refusing deletions until the owner approves both retention values and a documented erasure/copy-expiry procedure. That procedure must name the SQLite secure-delete/checkpoint or compaction strategy and its verification, the owner and expiry of every snapshot/backup, and how failed or offline copies are handled. A WAL checkpoint alone does not erase freed pages or copies. Expire failed run directories too; retain checkpoint hashes separately from payload-bearing copies. Test storage recovery and copy expiry with synthetic markers before enabling a non-placeholder profile. This plan does not implement or claim physical erasure.
 
 Checkpoints that only the audit host reads catch accidents, not someone with root there: root can mount a forged directory over `/mnt/kod-checkpoints`. Until the checkpoint account and this job exist, the integrity exit criterion is not met.
 
@@ -2524,8 +2717,8 @@ git commit -m "kod-audit: retention through the compliance profile, CLI and runb
 
 After Task 4, one fresh reviewer reads the whole branch against the spec sections listed under **Spec** and against this plan's Decisions and Review Focus. The reviewer checks in particular:
 
-- Every write to the table goes through `append_in` inside `AuditLog::tx`. Only `purge` writes `retention` entries, and the only `UPDATE` is its `payload = NULL`, after the `retention` entry that lists those seqs.
-- Redaction runs before serialization, and no code path stores an unredacted payload.
+- Every insert goes through `append_text_in` inside `AuditLog::tx`; `purge` calls it through `append_in`. Ordinary caller payloads are size-checked and redacted before acquiring the write lock. Only `purge` writes `retention` entries, and the only `UPDATE` is its `payload = NULL`, after the `retention` entry that lists those seqs.
+- Redaction runs before storage; the in-memory serialization used for the size check is never persisted. No code path stores an unredacted payload.
 - `before` cannot run its closure after a failed append, and no error is swallowed (no `let _ =`, no `.ok()` on a write).
 - `verify` lists checkpoints before reading a Deferred snapshot, checks the seq continuity, the payload hash, the entry hash, every `retention` entry's shape and coverage, the NULL payloads and every checkpoint, and `checkpoint` refuses a log that fails it.
 - Redaction is the one `redact` function, applied to values and keys.
@@ -2541,7 +2734,7 @@ After Task 4, one fresh reviewer reads the whole branch against the spec section
   - Tamper evidence, not tamper-proofing: the Honest ceiling section, and `truncation_after_the_last_checkpoint_is_not_detectable` pins the ceiling.
   - Prompts and outputs redacted before storage: Task 1 and Task 2 (D4).
   - Readable only by owner and auditors: D11, 0600 database, WAL and shm files (`the_store_files_are_private`).
-  - Deleted at the end of the profile's retention: Task 4 (D8) and the daily purge timer.
+  - SQL-visible payloads cleared at the end of the profile's retention: Task 4 (D8). Storage erasure and snapshot/backup expiry remain a prerequisite for enabling a non-placeholder profile.
   - Audit write fails, so the external write is refused: Task 2 `before` (D7). Gateway wiring is sub-plan 5.
   - Tampering, truncation and store-outage tests: Tasks 2 and 3.
   - Each decision recorded with its policy version: `record_decision` (Task 2, D10).
@@ -2556,8 +2749,8 @@ After Task 4, one fresh reviewer reads the whole branch against the spec section
 
 ## Open items
 
-- **Checkpoint storage, its account and the off-host verifier** (the backup owner, per the overview). **Blocks the integrity exit criterion.** It could be a WORM directory on the backup host owned by a separate account (`DirTarget`, no new code) or an S3 Object Lock bucket (a second `CheckpointTarget`). Until it's set up, and the D12 job runs there, checkpoints only catch accidents, not someone with host access. Write-once is simulated by `create_new` plus a read-only mode until then.
-- **Compliance profile values**: `retention_days` per record type in `policy/compliance.json`. Until then `purge` refuses and records why.
+- **Checkpoint storage, its account and the off-host verifier** (the backup owner, per the overview). **Blocks the integrity exit criterion.** Validate D5's complete publication, durability, no-overwrite and account-separation contract on the selected storage. A directory adapter is suitable only if the deployment actually supplies that contract, including permitted staging and directory sync; an S3 Object Lock target needs a second adapter. The local fake and read-only modes do not establish protection from host access. Run the D12 job from the independent account before claiming that protection.
+- **Compliance profile values and storage/copy expiry**: `retention_days` per record type in `policy/compliance.json`, plus the approved SQLite erasure and snapshot/backup-expiry procedure described in the runbook. Keep the placeholder refusal until both are settled. A successful logical purge is not evidence of physical erasure.
 - **Auditor access**: accounts in the auditors group on the checkpoint host (D11), once auditors are named.
 - **Profiles in the deletion record**: the matrix lists record type, age, profiles and policy version. The policy API exposes no profile list, so the record carries `policy_version`, which pins `compliance.json`; the released policy directories kept under D13 give the profiles back. The spec owner accepts that, or the policy crate adds a profile list and `purge` records it.
 - **Eval-suite cases**: the spec puts tampering, truncation and store-outage cases in the eval suite. This plan covers them as crate tests, which meet the overview's row 4 exit criteria. Wiring them into `crates/kod-eval` waits until the eval suite runs harness cases.
