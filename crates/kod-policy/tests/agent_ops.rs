@@ -379,3 +379,19 @@ fn every_agent_write_is_refused_for_a_canceled_run() {
         );
     }
 }
+
+#[test]
+fn linked_ids_must_be_lists() {
+    let mut r = run();
+    r["linked_docs"] = json!({"x": "doc-1"});
+    r["linked_tickets"] = json!({"x": "KOD-2"});
+    let mut read = req("read", json!({"target": {"kind": "doc", "id": "doc-1"}}));
+    read["run"] = r.clone();
+    denied(read, "does not meet the rule");
+    let mut write = req(
+        "tracker_write",
+        json!({"kind": "comment", "target": {"ticket": "KOD-2"}}),
+    );
+    write["run"] = r;
+    denied(write, "does not meet the rule");
+}

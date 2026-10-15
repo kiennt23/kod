@@ -9,9 +9,8 @@ default_requester_approval := "not_sole"
 # Policy::load refuses a team key that isn't lower-case and trimmed, and any
 # setting other than allowed, not_sole or forbidden, so the lookup only
 # canonicalises the caller's team.
-team_settings(team) := object.get(data.config.teams, lower(trim_space(team)), {}) if is_string(team)
-
-team_settings(team) := {} if not is_string(team)
+# A merge without a named team is refused (see the deny rule below).
+team_settings(team) := object.get(data.config.teams, lower(trim_space(team)), {}) if named(team)
 
 requester_rule := object.get(team_settings(input.team), "requester_approval", default_requester_approval)
 
@@ -21,7 +20,11 @@ human_approval(a) if {
 }
 
 # GitHub logins are case-insensitive, so every login is compared lower-cased.
-human_approvers := {lower(a.login) | some a in input.approvals; human_approval(a)}
+human_approvers := {lower(a.login) |
+	is_array(input.approvals)
+	some a in input.approvals
+	human_approval(a)
+}
 
 requester_login := lower(input.requester) if named(input.requester)
 
@@ -38,8 +41,20 @@ owners contains login if {
 	login := lower(p)
 }
 
+deny contains "approvals must be a list" if {
+	input.action in {"merge", "harness_change"}
+	input.approvals
+	not is_array(input.approvals)
+}
+
+deny contains "merge needs a named team" if {
+	input.action == "merge"
+	not named(input.team)
+}
+
 deny contains "every approval must be from a named human; agents never approve" if {
 	input.action in {"merge", "harness_change"}
+	is_array(input.approvals)
 	some a in input.approvals
 	not human_approval(a)
 }

@@ -160,6 +160,7 @@ grant if {
 	is_agent
 	input.target.kind == "doc"
 	named(input.target.id)
+	is_array(input.run.linked_docs)
 	input.target.id in input.run.linked_docs
 }
 
@@ -173,6 +174,7 @@ own_or_linked(t) if {
 
 own_or_linked(t) if {
 	named(t)
+	is_array(input.run.linked_tickets)
 	t in input.run.linked_tickets
 }
 

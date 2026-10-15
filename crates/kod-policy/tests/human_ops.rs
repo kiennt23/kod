@@ -254,3 +254,28 @@ fn logins_compare_case_insensitively() {
     allowed(harness(vec![human("KienNT23")]));
     allowed(cancel("all", json!({"kind": "human", "login": "KIENNT23"})));
 }
+
+#[test]
+fn approvals_must_be_a_list() {
+    let obj = json!({"x": {"login": "bob", "agent": false}});
+    denied(
+        set(merge(vec![]), "/approvals", obj.clone()),
+        "approvals must be a list",
+    );
+    denied(
+        json!({"action": "harness_change", "approvals": {"x": {"login": "kiennt23", "agent": false}}}),
+        "approvals must be a list",
+    );
+}
+
+#[test]
+fn a_merge_needs_a_named_team() {
+    let p = team_setting("forbidden");
+    for team in [json!(""), json!("  "), Value::Null, json!(7)] {
+        denied_by(
+            &p,
+            set(merge(vec![human("alice"), human("bob")]), "/team", team),
+            "merge needs a named team",
+        );
+    }
+}
