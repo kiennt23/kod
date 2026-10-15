@@ -1,0 +1,9 @@
+{
+  "contexts": ["offline_spike", "offline_eval"],
+  "classes": ["placeholder"],
+  "runners": {
+    "claude-code": { "plans": ["team", "enterprise"] },
+    "codex": { "plans": ["business", "enterprise"] },
+    "cursor": { "plans": ["business"] }
+  }
+}

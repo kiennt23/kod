@@ -1,0 +1,56 @@
+{
+  "risk_classes": {
+    "low": 0,
+    "medium": 1,
+    "high": 2
+  },
+  "allowed_classes": [
+    "low",
+    "medium"
+  ],
+  "default_path_rules": [
+    {
+      "prefix": "auth/",
+      "class": "high"
+    },
+    {
+      "prefix": "payments/",
+      "class": "high"
+    },
+    {
+      "prefix": "crypto/",
+      "class": "high"
+    },
+    {
+      "prefix": "pii/",
+      "class": "high"
+    },
+    {
+      "prefix": "migrations/",
+      "class": "high"
+    },
+    {
+      "prefix": "infra/",
+      "class": "high"
+    },
+    {
+      "prefix": ".github/",
+      "class": "high"
+    },
+    {
+      "prefix": ".kod/",
+      "class": "high"
+    },
+    {
+      "prefix": "policy/",
+      "class": "high"
+    },
+    {
+      "prefix": "codeowners",
+      "class": "high"
+    }
+  ],
+  "repo_path_rules": {},
+  "wip_limit": 1,
+  "bounce_limit": 2
+}
