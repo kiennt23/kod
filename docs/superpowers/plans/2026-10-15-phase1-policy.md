@@ -24,14 +24,14 @@ These choices were left open by the spec and the overview. Each one is made here
 | D4 | `policy_version` is `sha256:<64 hex>;regorus=<version>`. The hash covers the loaded files in file-name order, each as `name`, a NUL byte, its length as a u64 little-endian, then its bytes. Files that aren't loaded (anything other than `*.rego` and `*.json`, and subdirectories) aren't hashed. `REGORUS_VERSION` is a const kept equal to the pin by a test that reads `Cargo.lock`. `.gitattributes` has `policy/** text eol=lf`, so a CRLF checkout can't change the hash. Data files load as `data.config.<name>`, rules as `data.kod`, so a data file can never shadow a rule. | The audit log (sub-plan 4) records this with each decision, so an auditor can find the exact rules and engine. Hashing names and lengths means a rename or moving bytes between files changes the version. An engine bump with unchanged files is still a new version. |
 | D5 | Default deny by construction. `allow` is true only when some `grant` body for the action holds and the `deny` set is empty. Grants state every condition positively. Every comparison of two input values first checks that one side is a string (`is_string`), so `null == null` and missing-equals-missing never match. Deny rules explain refusals and can veto. With no matching deny reason, the reason is `<action>: the request does not meet the rule for this action`. | The usual "allow unless denied" style lets a missing field silently pass a `!=` check (undefined in Rego). A grant that lists what must be true can't be satisfied by leaving fields out. |
 | D6 | Each matrix row has one action name (table below). Two rows are enforced outside the policy engine: local commands (the sandbox) and sign and release (trusted CI runners). They are known actions that are always denied with the enforcer named. | Then every row has a policy answer and a test, and no caller can treat a policy allow as authority for something the policy doesn't enforce. |
-| D7 | Two actions are not matrix rows: `delegate` (the delegation policy, called by the dispatcher) and `retention_delete` (the compliance profile, called by the audit store). Both are in scope because the overview gives this sub-plan the delegation policy and the compliance profile. `retention_delete` is always denied while the profile is a placeholder. | The matrix lists what agents and humans do. Admission and record deletion are harness operations the spec puts under "Configurable policies". Whether to add them as matrix rows is an open item for the owner. |
+| D7 | `delegate` (dispatcher admission) and `retention_delete` (audit record deletion) are matrix rows, added by this plan to the spec on the owner's decision. `retention_delete` is always denied while the profile is a placeholder. | Every operation the policy grants has a matrix row stating its scope, approval, enforcement, evidence and failure behavior. |
 | D8 | Model routing: a run may use an endpoint only if it is allowed for **every** class the run read. An unknown class, an empty list or a missing list is refused. The placeholder table has one class, `placeholder`, with one endpoint, `placeholder`. | The spec says a run uses the strictest class of anything it read. Requiring the endpoint for every class is the same when the table is ordered strict-to-lenient, and never weaker when it isn't, and it needs no ranking of classes. The names say "not decided yet" so nobody mistakes them for real values (overview: one class and one endpoint until the routing values are set). |
 | D9 | Publish clearance is one team-wide list, `publish.cleared_classes` (placeholder: `["placeholder"]`). The publish rule checks repo, branch `agent/<ticket>-<run>`, draft, a live run and the run's classes. Refusing publish when the audit write fails, and idempotency, stay with the gateway (sub-plan 5). | One team, one set of repos: a per-repo list is a config shape for a problem we don't have yet (add it when a second repo with different clearance appears). The gateway writes the audit record of a decision before acting on it, so the policy can't see whether that write worked. |
-| D10 | Delegation: `risk_classes` ranks `low` 0, `medium` 1, `high` 2. The effective class is the highest of the ticket's class and every path rule it matches. Paths are normalised for matching: trimmed, lower-cased, `\` read as `/`, empty and `.` segments dropped. A rule matches at the repo root or below any directory (`src/auth/x` like `auth/x`). A path that isn't a string, is empty after normalising, or has a `..` segment is refused. Phase 1 delegates `low` and `medium`. `wip_in_progress` and `bounces` must be numbers `>= 0`. Placeholder path rules, all `high`, are the design's examples: `auth/`, `payments/`, `crypto/`, `migrations/`, `infra/`, `.github/`, `policy/`, `codeowners`. The harness itself is deferred to the real list. `wip_limit` is 1 (overview placeholder) and `bounce_limit` is 2 (spec default). **The ticket's paths are an early filter only.** `publish` carries the diff's `changed_paths`, and a changed path whose rule class isn't delegated refuses the publish, whatever the ticket said. The dispatcher passes its current WIP count and bounce count; making admission atomic is its job. | Path rules only raise the class, so a path written to dodge a rule must be raised or refused, not ignored. The ticket author picks the ticket's paths, so only the diff can enforce "a change that touches auth/ is high". The policy states the rule; the dispatcher (sub-plan 6) holds the lock. |
+| D10 | Delegation: `risk_classes` ranks `low` 0, `medium` 1, `high` 2. The effective class is the highest of the ticket's class and every path rule it matches. Paths are normalised for matching: trimmed, lower-cased, `\` read as `/`, empty and `.` segments dropped. A rule matches at the repo root or below any directory (`src/auth/x` like `auth/x`). A path that isn't a string, is empty after normalising, or has a `..` segment is refused. Phase 1 delegates `low` and `medium`. `wip_in_progress` and `bounces` must be numbers `>= 0`. Path rules are config, not code: `default_path_rules` apply to every repo and `repo_path_rules.<repo>` add a repo's own rules (adding is always safe, since rules only raise). The delegate input names `ticket.repo`, and a ticket without one is refused; publish uses `run.repo`. The placeholder defaults, all `high`, each with a `covers` note, are the owner's list: `auth/`, `payments/`, `crypto/`, `pii/` (personal or regulated data), `migrations/`, `infra/`, `.github/` (CI), `.kod/` (the harness itself), `policy/`, `codeowners`. The real paths are set per repo in `repo_path_rules`. `wip_limit` is 1 (overview placeholder) and `bounce_limit` is 2 (spec default). **The ticket's paths are an early filter only.** `publish` carries the diff's `changed_paths`, and a changed path whose rule class isn't delegated refuses the publish, whatever the ticket said. The dispatcher passes its current WIP count and bounce count; making admission atomic is its job. | Path rules only raise the class, so a path written to dodge a rule must be raised or refused, not ignored. The ticket author picks the ticket's paths, so only the diff can enforce "a change that touches auth/ is high". The policy states the rule; the dispatcher (sub-plan 6) holds the lock. |
 | D11 | Logins are GitHub logins, compared lower-cased on both sides (GitHub logins are case-insensitive). Callers map tracker ids to GitHub logins before asking (sub-plan 7, through 6a's `is_team_member` mapping). `requester_approval` is read per team from `teams.json` (`{"<team>": {"requester_approval": "..."}}`); a team with no setting gets `not_sole`. Only approvals with `"agent": false` and a string `login` count. Any other approval (an agent, or no flag) denies the merge outright. An unknown setting denies. `allowed`: at least one human approval. `not_sole`: at least one human approval from someone other than the requester. `forbidden`: at least one human approval, and the requester isn't among them. | The spec's three settings and default. An agent approval should never be on a PR at all, so its presence is a refusal, not just "doesn't count". |
 | D12 | The compliance profile is `compliance.json`, `{"profiles": {"<name>": {...}}}`. The placeholder has one profile, `placeholder`, with no values. `retention_delete` is allowed only when every active profile has a numeric `retention_days.<record_type>` and the record is at least as old as the longest of them. Any missing value denies, and the reason names the profile and the key. | The spec: more than one profile can be active and the strictest wins; for retention that is the longest period. A missing value must refuse, so the placeholder refuses all deletion, as the overview asks for sub-plan 4. |
 | D13 | Vendor-login requests (`subscription_model_request`): allowed only in `offline_spike` or `offline_eval`, for runners `claude-code` (plans `team`, `enterprise`), `codex` (`business`, `enterprise`) and `cursor` (`business`), with a seat whose `workspace` equals the approved workspace recorded for that runner and a string `account`, and only for the classes in `subscription.classes` (placeholder `["placeholder"]`). No workspace is recorded yet, so every such request is denied with "no approved workspace is recorded for runner X". `kod-loop` has no seat and is always refused. | The spec's credential exception (offline only until security accepts more), the business plans it names, and its eligibility check (valid credentials for the wrong workspace are refused). An unrecorded workspace is a missing value, so it denies. |
-| D14 | `people.json` holds `owner` (`kiennt23`, the GitHub login), `backup` (`null` until named) and `tech_leads` (`[]`). `harness_change` needs a human approval from every named owner and backup (today the owner only). The kill switch (`cancel` with scope `all`) is the owner or backup. Cancelling one run is the owner, backup, a tech lead, or a label removal of that run's ticket (`target.run` equals `run.id`). **The kill switch must not depend on the policy:** the dispatcher (sub-plan 6) honours the owner's kill switch without asking the policy when the policy fails to load or evaluate, since a fail-closed policy would otherwise block an emergency stop. | The spec's Ownership section: the owner holds the kill switch, the backup covers, and harness changes need both once the backup is named (overview). The matrix lists tech leads and label removal under cancel; a label removal cancels its own run only. |
+| D14 | `people.json` holds `owner` (`kiennt23`, the GitHub login), `backup` (`null` until named) and `tech_leads` (`[]`). `harness_change` needs a human approval from every named owner and backup (today the owner only). The kill switch (`cancel` with scope `all`) is the owner, backup or a tech lead. Restarting after it (`resume`, scope `all`) is the owner or backup only. Cancelling one run is the owner, backup, a tech lead, or a label removal of that run's ticket (`target.run` equals `run.id`). **The kill switch must not depend on the policy:** the dispatcher (sub-plan 6) honours the owner's kill switch without asking the policy when the policy fails to load or evaluate, since a fail-closed policy would otherwise block an emergency stop. | The owner's decision on PR 11: anyone who might see an incident first can stop everything, and only the accountable owner (or backup) restarts. Harness changes need both once the backup is named (overview). A label removal cancels its own run only. |
 | D15 | Tests are Rust integration tests in the crate (`cargo test`), not `opa test`. Tests that need a non-placeholder value load a temp copy of `policy/` with one data file replaced (`common::policy_with`). | One toolchain in CI, and the tests exercise the same `Policy` API the callers use. The allow paths that placeholders block are still tested. |
 
 **Action names** (D6, D7). The `input` fields are the contract each caller builds; Tasks 2 to 4 define them in full.
@@ -49,8 +49,9 @@ These choices were left open by the spec and the overview. Each one is made here
 | Change the harness, policy or CI config | `harness_change` | 7 (`protected-paths`) |
 | Cancel a run or pull the kill switch | `cancel` | 6 |
 | Sign and release | `sign_release` (always denied: trusted CI enforces it) | none |
-| (delegation policy) | `delegate` | 6 |
-| (compliance profile, retention) | `retention_delete` | 4 |
+| Restart after the kill switch | `resume` | 6 |
+| Admit a ticket for delegation | `delegate` | 6 |
+| Delete audit records at the end of retention | `retention_delete` | 4 |
 
 ## Execution
 
@@ -83,7 +84,7 @@ The modes follow [ADR 0001](../../adr/0001-per-task-execution-mode.md): a task t
 4. **A broken policy directory or an evaluation error** (empty or missing directory, Rego that doesn't parse, invalid JSON, no `decision` rule, a decision of the wrong shape, a builtin error at request time) must fail at load or deny with a `policy error` reason, never allow. Pinned by Task 1 `a_broken_policy_fails_to_load` and `evaluation_errors_deny`, and Task 4 `a_malformed_ticket_is_a_policy_error_deny`.
 5. **An agent approval, or the requester as the only approver**, must block a merge under the matching setting, and an unknown setting must deny. Requester and approver logins that differ only in case are the same person. Pinned by Task 3 `agent_approvals_block_the_merge`, `not_sole_is_the_default_and_needs_another_human`, `forbidden_refuses_any_requester_approval`, `an_unknown_requester_setting_is_refused` and `logins_compare_case_insensitively`.
 6. **Publish outside its own scope** (another repo, a branch other than `agent/<ticket>-<run>`, a non-draft PR, a canceled run, `null` repos on both sides) must be refused. Pinned by Task 2 `publish_anywhere_else_is_refused`, `publish_needs_an_explicit_live_run` and `null_ids_never_match`.
-7. **The kill switch and harness changes**: only the owner or backup pulls the kill switch, a label removal cancels only its own run, and a harness change needs every named owner and backup. The dispatcher honours the owner's kill switch even when the policy fails (D14). Pinned by Task 3 `who_may_cancel_a_run_or_pull_the_kill_switch` and `a_harness_change_needs_the_owner_and_the_backup_once_named`.
+7. **The kill switch and harness changes**: the owner, backup or a tech lead pulls the kill switch, only the owner or backup restarts, a label removal cancels only its own run, and a harness change needs every named owner and backup. The dispatcher honours the owner's kill switch even when the policy fails (D14). Pinned by Task 3 `who_may_cancel_a_run_or_pull_the_kill_switch`, `only_the_owner_or_backup_restarts_after_the_kill_switch` and `a_harness_change_needs_the_owner_and_the_backup_once_named`.
 
 ---
 
@@ -506,8 +507,7 @@ reasons := sort(deny) if {
 }
 
 # Every action the policy knows: one per row of the action and permission
-# matrix, plus delegate (delegation policy) and retention_delete
-# (compliance profile).
+# matrix.
 known_actions := {
 	"local_command",
 	"model_request",
@@ -519,6 +519,7 @@ known_actions := {
 	"merge",
 	"harness_change",
 	"cancel",
+	"resume",
 	"sign_release",
 	"delegate",
 	"retention_delete",
@@ -1417,6 +1418,7 @@ git commit -m "kod-policy: agent operations, model routing and the subscription 
   - `merge`: `{"team": "<team>", "requester": "<login>", "approvals": [{"login": "<login>", "agent": false}, ..]}`. The requester comes from the tracker (6a's adapter).
   - `harness_change`: `{"approvals": [{"login", "agent": false}, ..]}`.
   - `cancel`: `{"scope": "run"|"all", "actor": {"kind": "human", "login"} | {"kind": "label_removal"}, "run": {"id"}, "target": {"run"}}`. A label removal cancels only `target.run == run.id`, the run of the ticket that lost its label. Every login is a GitHub login (callers map tracker ids), compared lower-cased.
+  - `resume`: `{"scope": "all", "actor": {"kind": "human", "login"}}`. Restart after the kill switch: owner or backup only.
   - Data: `data.config.people.{owner, backup, tech_leads}`, `data.config.teams.<team>.requester_approval`.
   - Rego rules later tasks may use: `owners` (set of lower-cased logins), `human_approvers` (set of lower-cased logins).
 
@@ -1600,8 +1602,46 @@ fn who_may_cancel_a_run_or_pull_the_kill_switch() {
         json!({"owner": "kiennt23", "backup": "bk", "tech_leads": ["tl"]}),
     );
     allowed_by(&p, cancel("run", tech_lead.clone()));
-    denied_by(&p, cancel("all", tech_lead), "does not meet the rule");
+    allowed_by(&p, cancel("all", tech_lead));
     allowed_by(&p, cancel("all", json!({"kind": "human", "login": "bk"})));
+}
+
+fn resume(actor: Value) -> Value {
+    json!({"action": "resume", "scope": "all", "actor": actor})
+}
+
+#[test]
+fn only_the_owner_or_backup_restarts_after_the_kill_switch() {
+    let p = policy_with(
+        "people.json",
+        json!({"owner": "kiennt23", "backup": "bk", "tech_leads": ["tl"]}),
+    );
+    allowed_by(&p, resume(json!({"kind": "human", "login": "KienNT23"})));
+    allowed_by(&p, resume(json!({"kind": "human", "login": "bk"})));
+    denied_by(
+        &p,
+        resume(json!({"kind": "human", "login": "tl"})),
+        "does not meet the rule",
+    );
+    denied_by(
+        &p,
+        resume(json!({"kind": "label_removal"})),
+        "does not meet the rule",
+    );
+    denied_by(
+        &p,
+        resume(json!({"kind": "agent"})),
+        "does not meet the rule",
+    );
+    denied_by(
+        &p,
+        set(
+            resume(json!({"kind": "human", "login": "bk"})),
+            "/scope",
+            json!("run"),
+        ),
+        "does not meet the rule",
+    );
 }
 
 #[test]
@@ -1627,7 +1667,7 @@ fn logins_compare_case_insensitively() {
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p kod-policy --test human_ops`
-Expected: FAIL. No `merge`, `harness_change` or `cancel` grant exists yet.
+Expected: FAIL. No `merge`, `harness_change`, `cancel` or `resume` grant exists yet.
 
 - [ ] **Step 3: Write the data files**
 
@@ -1759,7 +1799,8 @@ deny contains sprintf("harness change needs approval from %v", [p]) if {
 
 # cancel: one run by the owner, backup, a tech lead, or a label removal
 # (only the run of the ticket that lost its label); every run (the kill
-# switch) by the owner or backup. The dispatcher must still honour the
+# switch) by the owner, backup or a tech lead. resume (restart after the
+# kill switch) by the owner or backup only. The dispatcher must still honour the
 # owner's kill switch when the policy fails to load or evaluate: a
 # fail-closed policy must never block an emergency stop.
 
@@ -1792,6 +1833,13 @@ grant if {
 	input.action == "cancel"
 	input.scope == "all"
 	input.actor.kind == "human"
+	actor_login in cancelers
+}
+
+grant if {
+	input.action == "resume"
+	input.scope == "all"
+	input.actor.kind == "human"
 	actor_login in owners
 }
 ```
@@ -1820,9 +1868,9 @@ git commit -m "kod-policy: merge with requester_approval, harness changes and ca
 **Interfaces:**
 - Consumes: Task 1's `Policy` and helpers; `grant` and `deny` from `kod.rego`.
 - Produces, as input contracts for sub-plans 6 and 4:
-  - `delegate`: `{"ticket": {"risk_class": "low"|"medium"|"high", "paths": [..], "acceptance_criteria": true, "bounces": <number>}, "wip_in_progress": <number>}`. `paths` is optional (repo-relative paths the ticket names, an early filter only); `bounces` is the story's count of rework requests. Task 4 also adds the `publish` veto on `changed_paths` (Task 2's contract).
+  - `delegate`: `{"ticket": {"repo": "<owner>/<name>", "risk_class": "low"|"medium"|"high", "paths": [..], "acceptance_criteria": true, "bounces": <number>}, "wip_in_progress": <number>}`. `paths` is optional (repo-relative paths the ticket names, an early filter only); `bounces` is the story's count of rework requests. Task 4 also adds the `publish` veto on `changed_paths` (Task 2's contract).
   - `retention_delete`: `{"record_type": "<type>", "age_days": <number>}`.
-  - Data: `data.config.delegation.{risk_classes, allowed_classes, path_rules[{prefix, class}], wip_limit, bounce_limit}`, `data.config.compliance.profiles.<name>.retention_days.<record_type>`.
+  - Data: `data.config.delegation.{risk_classes, allowed_classes, default_path_rules[{prefix, class, covers}], repo_path_rules.<repo>[{prefix, class}], wip_limit, bounce_limit}`, `data.config.compliance.profiles.<name>.retention_days.<record_type>`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1855,7 +1903,7 @@ fn known_actions() -> BTreeSet<String> {
 fn delegate() -> Value {
     json!({
         "action": "delegate",
-        "ticket": {"risk_class": "low", "paths": ["docs/readme.md"], "acceptance_criteria": true, "bounces": 0},
+        "ticket": {"repo": "acme/app", "risk_class": "low", "paths": ["docs/readme.md"], "acceptance_criteria": true, "bounces": 0},
         "wip_in_progress": 0
     })
 }
@@ -1918,6 +1966,67 @@ fn a_path_rule_raises_the_class() {
         "/ticket/paths",
         json!(["src/authors.rs", "docs/oauth.md"]),
     ));
+}
+
+#[test]
+fn every_placeholder_path_rule_raises_to_high() {
+    for path in [
+        "auth/x",
+        "payments/x",
+        "crypto/x",
+        "pii/x",
+        "migrations/x",
+        "infra/x",
+        ".github/x",
+        ".kod/x",
+        "policy/x",
+        "CODEOWNERS",
+        "docs/CODEOWNERS",
+    ] {
+        denied(
+            set(delegate(), "/ticket/paths", json!([path])),
+            "risk class high is not delegated in this phase",
+        );
+    }
+}
+
+/// policy/delegation.json with `repo_path_rules` replaced.
+fn with_repo_rules(rules: Value) -> kod_policy::Policy {
+    let text = std::fs::read_to_string(common::policy_dir().join("delegation.json")).unwrap();
+    let mut config: Value = serde_json::from_str(&text).unwrap();
+    config["repo_path_rules"] = rules;
+    policy_with("delegation.json", config)
+}
+
+#[test]
+fn a_repos_own_path_rules_add_to_the_defaults() {
+    let p = with_repo_rules(json!({"acme/app": [{"prefix": "billing/", "class": "high"}]}));
+    let billing = set(delegate(), "/ticket/paths", json!(["billing/invoice.rs"]));
+    denied_by(
+        &p,
+        billing.clone(),
+        "path billing/invoice.rs raises the risk class to high",
+    );
+    allowed_by(&p, set(billing, "/ticket/repo", json!("acme/other")));
+    denied_by(
+        &p,
+        set(delegate(), "/ticket/paths", json!(["auth/x"])),
+        "risk class high is not delegated in this phase",
+    );
+    denied_by(
+        &p,
+        publish(json!(["billing/invoice.rs"])),
+        "publish: path billing/invoice.rs raises the risk class to high",
+    );
+}
+
+#[test]
+fn a_ticket_needs_a_repo() {
+    denied(unset(delegate(), "/ticket/repo"), "ticket has no repo");
+    denied(
+        set(delegate(), "/ticket/repo", Value::Null),
+        "ticket has no repo",
+    );
 }
 
 #[test]
@@ -2103,6 +2212,10 @@ const ACTIONS: &[(&str, &str)] = &[
         "cancel",
         "human_ops::who_may_cancel_a_run_or_pull_the_kill_switch",
     ),
+    (
+        "resume",
+        "human_ops::only_the_owner_or_backup_restarts_after_the_kill_switch",
+    ),
     ("sign_release", "api::external_rows_are_never_granted"),
     ("delegate", "delegation::*"),
     (
@@ -2188,40 +2301,59 @@ Expected: FAIL. No `delegate` or `retention_delete` grant exists yet, and the sp
     "low",
     "medium"
   ],
-  "path_rules": [
+  "default_path_rules": [
     {
       "prefix": "auth/",
-      "class": "high"
+      "class": "high",
+      "covers": "auth"
     },
     {
       "prefix": "payments/",
-      "class": "high"
+      "class": "high",
+      "covers": "payments"
     },
     {
       "prefix": "crypto/",
-      "class": "high"
+      "class": "high",
+      "covers": "crypto"
+    },
+    {
+      "prefix": "pii/",
+      "class": "high",
+      "covers": "personal or regulated data"
     },
     {
       "prefix": "migrations/",
-      "class": "high"
+      "class": "high",
+      "covers": "data migrations"
     },
     {
       "prefix": "infra/",
-      "class": "high"
+      "class": "high",
+      "covers": "infrastructure"
     },
     {
       "prefix": ".github/",
-      "class": "high"
+      "class": "high",
+      "covers": "CI"
+    },
+    {
+      "prefix": ".kod/",
+      "class": "high",
+      "covers": "the harness itself (its config in a product repo)"
     },
     {
       "prefix": "policy/",
-      "class": "high"
+      "class": "high",
+      "covers": "policy"
     },
     {
       "prefix": "codeowners",
-      "class": "high"
+      "class": "high",
+      "covers": "CODEOWNERS"
     }
   ],
+  "repo_path_rules": {},
   "wip_limit": 1,
   "bounce_limit": 2
 }
@@ -2251,7 +2383,16 @@ risk := data.config.delegation.risk_classes
 
 ticket_paths := object.get(object.get(input, "ticket", {}), "paths", [])
 
-path_rules := data.config.delegation.path_rules
+# The defaults hold for every repo; a repo's own rules (set in config, per
+# repo) add to them. Rules only raise the class, so adding is always safe.
+rules_for(repo) := array.concat(
+	data.config.delegation.default_path_rules,
+	object.get(data.config.delegation.repo_path_rules, repo, []),
+)
+
+ticket_repo := object.get(object.get(input, "ticket", {}), "repo", null)
+
+run_repo := object.get(object.get(input, "run", {}), "repo", null)
 
 skip_segment(seg) if seg in {"", "."}
 
@@ -2279,9 +2420,9 @@ path_matches(cp, prefix) if contains(cp, concat("", ["/", lower(prefix)]))
 
 bad_paths_in(paths) := {p | some p in paths; bad_path(p)}
 
-ranks_in(paths) := {risk[r.class] |
+ranks_in(paths, rules) := {risk[r.class] |
 	some p in paths
-	some r in path_rules
+	some r in rules
 	path_matches(clean_path(p), r.prefix)
 }
 
@@ -2289,7 +2430,7 @@ class_allowed(c) if c in data.config.delegation.allowed_classes
 
 bad_paths := bad_paths_in(ticket_paths) if is_array(ticket_paths)
 
-raised_ranks := ranks_in(ticket_paths) if is_array(ticket_paths)
+raised_ranks := ranks_in(ticket_paths, rules_for(ticket_repo)) if is_array(ticket_paths)
 
 effective_rank := max(raised_ranks | {risk[input.ticket.risk_class]})
 
@@ -2304,6 +2445,7 @@ has_criteria if input.ticket.acceptance_criteria == true
 
 grant if {
 	input.action == "delegate"
+	is_string(input.ticket.repo)
 	is_array(ticket_paths)
 	count(bad_paths) == 0
 	class_delegated
@@ -2314,6 +2456,11 @@ grant if {
 	is_number(input.ticket.bounces)
 	input.ticket.bounces >= 0
 	input.ticket.bounces < data.config.delegation.bounce_limit
+}
+
+deny contains "ticket has no repo" if {
+	input.action == "delegate"
+	not is_string(ticket_repo)
 }
 
 deny contains "ticket has no risk class" if {
@@ -2338,7 +2485,7 @@ deny contains sprintf("path %v raises the risk class to %v", [p, r.class]) if {
 	not class_delegated
 	is_array(ticket_paths)
 	some p in ticket_paths
-	some r in path_rules
+	some r in rules_for(ticket_repo)
 	path_matches(clean_path(p), r.prefix)
 	risk[r.class] > risk[input.ticket.risk_class]
 }
@@ -2389,7 +2536,7 @@ deny contains sprintf("publish: path %v raises the risk class to %v", [p, r.clas
 	input.action == "publish"
 	is_array(input.changed_paths)
 	some p in input.changed_paths
-	some r in path_rules
+	some r in rules_for(run_repo)
 	path_matches(clean_path(p), r.prefix)
 	not class_allowed(r.class)
 }
@@ -2454,7 +2601,7 @@ to:
 - [ ] **Step 7: Run the whole suite and the CI checks**
 
 Run: `cargo fmt --all --check && cargo clippy --all-targets -- -D warnings && cargo test --all`
-Expected: all pass. `kod-policy` runs `api` (10), `agent_ops` (15), `human_ops` (9) and `delegation` (11) tests.
+Expected: all pass. `kod-policy` runs `api` (10), `agent_ops` (15), `human_ops` (10) and `delegation` (14) tests.
 
 - [ ] **Step 8: Commit**
 
@@ -2485,7 +2632,8 @@ After Task 4, one fresh reviewer reads the whole branch against the spec section
   - Requester approval: `allowed`, `not_sole` (default), `forbidden`, and agents never approve (Task 3, D11).
   - Compliance profile: a placeholder, missing values deny, strictest wins (Task 4, D12).
   - Credential exception and eligibility check: offline contexts only, business plans, recorded workspace (Task 2, D13).
-  - Ownership: owner and backup for harness changes and the kill switch (Task 3, D14).
+  - Ownership: owner and backup for harness changes and restart; owner, backup and tech leads for the kill switch (Task 3, D14).
+  - Matrix rows for `delegate` and `retention_delete` (Task 4, D7), each with tests.
   - Policy version as a content hash for the audit log (Task 1, D4). regorus pinned and its license checked (Task 1, D2).
 - **Placeholders.** The only placeholder values are the configuration ones the scope asks for (`placeholder` class, endpoint and profile, no recorded workspace, `backup: null`, `tech_leads: []`, `teams: {}`), and each is pinned by a test. No plan step is left open.
 - **Type consistency.**
@@ -2498,8 +2646,6 @@ After Task 4, one fresh reviewer reads the whole branch against the spec section
 
 ## Open items
 
-- **Compliance profile values**, **routing values** (data classes and endpoints), **team settings** for `requester_approval`, **tech leads**, the **backup owner** and the **real path rules** per product repo (the placeholder list is the design's examples; the harness path is not in it yet): each is a data-file change, reviewed like code. Until then the rules that read them deny or use the spec's defaults.
-- **Matrix rows for `delegate` and `retention_delete`** (D7): the spec's matrix doesn't list the dispatcher admitting a ticket or the audit store deleting expired records. The owner decides whether to add rows.
+- **Compliance profile values**, **routing values** (data classes and endpoints), **team settings** for `requester_approval`, **tech leads**, the **backup owner** and the **real path rules** per product repo (`repo_path_rules`; the defaults are placeholders): each is a data-file change, reviewed like code. Until then the rules that read them deny or use the spec's defaults.
 - **Harness changes before the backup is named** (D14): the rule needs the owner's approval, and GitHub doesn't let an author approve their own PR, so an owner-authored harness change can't pass `harness_change` until a second named approver exists.
 - **Approved seat workspaces** for subscription mode (D13): record them once the spike's eligibility check is done.
-- **Kill-switch actors** (D14): the matrix lists owner, tech lead and label removal under cancel; this plan gives the kill switch (all runs) to the owner and backup only. The owner confirms.

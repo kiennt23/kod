@@ -556,7 +556,7 @@ The class names, the mapping and the endpoint list are ours to set. Unknown or m
 | Medium | Features and bug fixes in non-critical services, covered by tests | No | Yes |
 | High | Auth, payments, crypto, handling of personal or regulated data, data migrations, infrastructure and CI, the harness itself | No | No. Human-led, with agent help only in IDE pairing |
 
-The tech lead sets the class during planning, and a ticket without one is refused. Path rules can raise the class automatically: a change that touches auth/ is high, whatever the ticket says.
+The tech lead sets the class during planning, and a ticket without one is refused. Path rules can raise the class automatically: a change that touches auth/ is high, whatever the ticket says. The path rules are config, set per repo, with defaults covering auth, payments, crypto, personal or regulated data, migrations, infrastructure, CI, the harness itself, policy and CODEOWNERS.
 
 The delegation policy also sets the bounce limit: how many rework requests a story may raise before the dispatcher stops delegating it and assigns it to the tech lead (default 2).
 
@@ -570,7 +570,7 @@ A harness in a regulated setting needs a named person who is accountable for it,
 
 - Approves changes to the harness and its policies, and reviews all harness Rust
 
-- Holds the kill switch and leads response to incidents involving agents
+- Holds the kill switch and leads response to incidents involving agents. Tech leads and the backup can also pull the kill switch; only the owner or backup restarts after it
 
 - Upgrades pinned versions (runner, model, toolchain) after an eval run
 
@@ -651,7 +651,10 @@ Every operation Kod can perform, where it is enforced and what happens when it i
 | Publish to GitHub (agent, through the gateway's publish operation) | The ticket's repo, branch agent/\<ticket\>-\<run\>, one draft PR | None to open; a merge needs approval | Gateway publish operation, the only holder of the git token | Commit SHA, PR, pinned inputs | Refused if the run is canceled, the audit write fails or the target isn't cleared for the data |
 | Approve and merge a PR (humans only) | The PR's head commit | The team's requester rule; CODEOWNERS for protected paths | GitHub rules and required checks | Approvals and check results bound to the head commit | Merge blocked |
 | Change the harness, policy or CI config (humans) | Harness and policy repos, CI config | Two approvals: owner and backup | CODEOWNERS and the protected-paths check | PR and approvals | Merge blocked |
-| Cancel a run or pull the kill switch (owner, tech lead, label removal) | One run, or all runs | None | Dispatcher and gateway | Cancel event | Gateway refuses every write from a canceled run |
+| Cancel a run or pull the kill switch (owner, backup, tech lead; label removal for its own run) | One run, or all runs (humans only) | None | Dispatcher and gateway; the dispatcher honours the owner's kill switch even if the policy fails | Cancel event | Gateway refuses every write from a canceled run |
+| Restart after the kill switch (owner or backup) | All runs | None | Dispatcher | Restart event | Runs stay stopped |
+| Admit a ticket for delegation (dispatcher) | Tickets with a repo, a risk class the phase delegates after path rules raise it, acceptance criteria, under the WIP and bounce limits | The tech lead sets the risk class and adds the agent label | Dispatcher and delegation policy | Ticket, classes, path rules hit, policy version | Not delegated; the ticket stays with humans with the refusal reasons |
+| Delete audit records at the end of retention (audit store) | Records older than the longest retention of every active compliance profile | None per deletion; the profile itself needs two approvals | Audit store and compliance profile | Deletion record in the hash chain: record type, age, profiles, policy version | Record kept; a missing retention value refuses deletion |
 | Sign and release (trusted CI only) | Release artifacts built from main | Release gate (G7) | Trusted runners; keys exist only there | Signatures, provenance | Release blocked |
 
 ## Audit integrity
