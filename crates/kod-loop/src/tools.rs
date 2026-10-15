@@ -7,7 +7,7 @@ use std::{
     io::{Read, Seek, SeekFrom},
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     sync::{
         Mutex,
         atomic::{AtomicU64, Ordering},
@@ -192,50 +192,59 @@ fn run(ws: &Path, timeout: Duration, input: &Value) -> Result<String, String> {
         .process_group(0)
         .spawn()
         .map_err(err)?;
-    let start = Instant::now();
-    let status = loop {
-        if let Some(s) = child.try_wait().map_err(err)? {
-            break match s.code() {
-                Some(c) => format!("[exit code {c}]"),
-                None => "[killed by a signal]".to_owned(),
-            };
-        }
-        let flooded = out.metadata().map_err(err)?.len() > MAX_OUTPUT;
-        if flooded || start.elapsed() >= timeout {
-            let note = if kill_group(child.id()) {
-                ""
-            } else {
-                "; some of its child processes may still be running"
-            };
-            // The leader too, in case the group signal failed, so wait() returns.
-            let _ = child.kill();
-            let _ = child.wait();
-            let why = if flooded {
-                "the output limit was exceeded"
-            } else {
-                "the command hit the time limit"
-            };
-            break format!("[killed after {}s: {why}{note}]", start.elapsed().as_secs());
-        }
-        thread::sleep(Duration::from_millis(20));
-    };
+    let pid = child.id();
+    let status = wait_for(&mut child, &out, timeout);
+    // Cleanup runs on every path, an early error from wait_for included.
     // Leftover background children are killed too, detached ones included
     // (sweep_orphans): they would otherwise keep changing the workspace during
     // later turns.
-    // ponytail: the leader is already reaped here, so if its group is empty and
-    // the kernel reuses the pid for a new group leader, this hits that group.
-    // Negligible in a one-run sandbox; if it matters, signal before reaping
-    // (try_wait, then waitid with WNOWAIT).
-    let status = if kill_group(child.id()) & sweep_orphans() {
-        status
+    // ponytail: on a normal exit the leader is already reaped here, so if its
+    // group is empty and the kernel reuses the pid for a new group leader, this
+    // hits that group. Negligible in a one-run sandbox; if it matters, signal
+    // before reaping (try_wait, then waitid with WNOWAIT).
+    let killed = kill_group(pid);
+    // The leader too, in case the group signal failed, so wait() returns.
+    let _ = child.kill();
+    let _ = child.wait();
+    let note = if killed & sweep_orphans() {
+        ""
     } else {
-        format!("{status} [its background processes could not be killed]")
+        " [its background processes could not be killed]"
     };
+    let status = status.map_err(|e| format!("{e}{note}"))? + note;
     let mut text = read_capped(&mut out).map_err(err)?;
     if !text.is_empty() && !text.ends_with('\n') {
         text.push('\n');
     }
     Ok(format!("{text}{status}"))
+}
+
+/// Polls until the command exits, floods its output or runs out of time, and
+/// returns its status line. The caller kills and reaps whatever is left.
+fn wait_for(child: &mut Child, out: &File, timeout: Duration) -> Result<String, String> {
+    let err = |e: std::io::Error| format!("running the command: {e}");
+    let start = Instant::now();
+    loop {
+        if let Some(s) = child.try_wait().map_err(err)? {
+            return Ok(match s.code() {
+                Some(c) => format!("[exit code {c}]"),
+                None => "[killed by a signal]".to_owned(),
+            });
+        }
+        let flooded = out.metadata().map_err(err)?.len() > MAX_OUTPUT;
+        if flooded || start.elapsed() >= timeout {
+            let why = if flooded {
+                "the output limit was exceeded"
+            } else {
+                "the command hit the time limit"
+            };
+            return Ok(format!(
+                "[killed after {}s: {why}]",
+                start.elapsed().as_secs()
+            ));
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 static RUN: Mutex<()> = Mutex::new(());
@@ -260,9 +269,16 @@ fn become_subreaper() {}
 /// a command: killing one reparents its own children here for the next pass.
 /// Returns false if one could not be killed.
 #[cfg(target_os = "linux")]
+const SWEEP_LIMIT: Duration = Duration::from_secs(5);
+#[cfg(target_os = "linux")]
 fn sweep_orphans() -> bool {
     let me = std::process::id().to_string();
+    // A fork storm could refill the list forever; give up and report it.
+    let deadline = Instant::now() + SWEEP_LIMIT;
     loop {
+        if Instant::now() >= deadline {
+            return false;
+        }
         let children: Vec<libc::pid_t> = fs::read_dir("/proc")
             .into_iter()
             .flatten()

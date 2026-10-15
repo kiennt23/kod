@@ -335,9 +335,10 @@ pub fn compare(baseline: &Path, candidate: &Path) -> Result<(String, bool)> {
                 Err(e) => Err(e).with_context(|| format!("reading {}", p.display())),
             }
         };
-        let missing = |f: &str| {
+        let missing = |d: &Path, f: &str| {
             anyhow::anyhow!(
-                "case {id}: inputs/{f} is missing from a run; rerun it with this kod-eval"
+                "case {id}: inputs/{f} is missing from run {}; rerun it with this kod-eval",
+                d.display()
             )
         };
         let differs = |f: &str| {
@@ -345,10 +346,8 @@ pub fn compare(baseline: &Path, candidate: &Path) -> Result<(String, bool)> {
                 "case {id}: inputs/{f} differs between the runs; compare runs of the same inputs"
             )
         };
-        let (Some(bc), Some(cc)) = (read(baseline, "case.toml")?, read(candidate, "case.toml")?)
-        else {
-            return Err(missing("case.toml"));
-        };
+        let bc = read(baseline, "case.toml")?.ok_or_else(|| missing(baseline, "case.toml"))?;
+        let cc = read(candidate, "case.toml")?.ok_or_else(|| missing(candidate, "case.toml"))?;
         if bc != cc {
             return Err(differs("case.toml"));
         }
@@ -359,14 +358,23 @@ pub fn compare(baseline: &Path, candidate: &Path) -> Result<(String, bool)> {
             #[serde(default)]
             expected_end_state: EndState,
         }
-        let saved: Saved = toml::from_str(&String::from_utf8_lossy(&bc))
-            .with_context(|| format!("case {id}: parsing inputs/case.toml"))?;
+        let saved: Saved = toml::from_str(&String::from_utf8_lossy(&bc)).with_context(|| {
+            format!(
+                "case {id}: parsing inputs/case.toml of run {}",
+                baseline.display()
+            )
+        })?;
         let (bp, cp) = (
             read(baseline, "heldout.patch")?,
             read(candidate, "heldout.patch")?,
         );
-        if saved.expected_end_state == EndState::Done && (bp.is_none() || cp.is_none()) {
-            return Err(missing("heldout.patch"));
+        if saved.expected_end_state == EndState::Done {
+            if bp.is_none() {
+                return Err(missing(baseline, "heldout.patch"));
+            }
+            if cp.is_none() {
+                return Err(missing(candidate, "heldout.patch"));
+            }
         }
         if bp != cp {
             return Err(differs("heldout.patch"));
