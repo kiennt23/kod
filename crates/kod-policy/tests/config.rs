@@ -80,6 +80,31 @@ fn malformed_path_rule_config_fails_to_load() {
         ),
         (
             "repo_path_rules",
+            json!({"acme app": [rule("billing/")]}),
+            "repo_path_rules key \"acme app\" must be lower-case owner/name",
+        ),
+        (
+            "repo_path_rules",
+            json!({"acmeapp": [rule("billing/")]}),
+            "repo_path_rules key \"acmeapp\" must be lower-case owner/name",
+        ),
+        (
+            "repo_path_rules",
+            json!({"acme/app/x": [rule("billing/")]}),
+            "repo_path_rules key \"acme/app/x\" must be lower-case owner/name",
+        ),
+        (
+            "repo_path_rules",
+            json!({"acme/": [rule("billing/")]}),
+            "repo_path_rules key \"acme/\" must be lower-case owner/name",
+        ),
+        (
+            "repo_path_rules",
+            json!({"/app": [rule("billing/")]}),
+            "repo_path_rules key \"/app\" must be lower-case owner/name",
+        ),
+        (
+            "repo_path_rules",
             json!({"acme/app": rule("billing/")}),
             "repo_path_rules.acme/app must be a list of rules",
         ),

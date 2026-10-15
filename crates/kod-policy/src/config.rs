@@ -122,6 +122,14 @@ fn canonical_key(k: &str) -> bool {
     k == k.trim().to_lowercase()
 }
 
+/// `owner/name`: lower-case, one `/`, both parts non-empty, no whitespace.
+fn repo_key(k: &str) -> bool {
+    canonical_key(k)
+        && !k.contains(char::is_whitespace)
+        && k.split_once('/')
+            .is_some_and(|(o, n)| !o.is_empty() && !n.is_empty() && !n.contains('/'))
+}
+
 fn login(v: &Value) -> bool {
     v.as_str()
         .is_some_and(|s| !s.is_empty() && !s.contains(char::is_whitespace))
@@ -197,7 +205,7 @@ fn delegation(d: &Value) -> Result<()> {
         .and_then(Value::as_object)
         .context("delegation.json: repo_path_rules must be an object")?;
     for (repo, rules) in repos {
-        if !canonical_key(repo) {
+        if !repo_key(repo) {
             bail!(
                 "delegation.json: repo_path_rules key {repo:?} must be lower-case owner/name with no spaces"
             );
