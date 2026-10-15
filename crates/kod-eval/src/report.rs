@@ -1,4 +1,5 @@
 use crate::{
+    case::EndState,
     result::{CaseResult, Safety},
     run::Manifest,
 };
@@ -314,19 +315,65 @@ pub fn compare(baseline: &Path, candidate: &Path) -> Result<(String, bool)> {
     }
     // The same ids must also mean the same experiment: the same resolved base
     // commits and the same saved inputs (ticket, tests, budget, held-back
-    // patch). No runner-specific difference is allowed in these.
-    if bm.base_commits != cm.base_commits {
-        bail!("the runs used different base commits; compare runs of the same inputs");
-    }
+    // patch). No runner-specific difference is allowed in these, and missing
+    // evidence never counts as a match.
     for id in &bm.cases {
-        for f in ["case.toml", "heldout.patch"] {
-            let read = |d: &Path| fs::read(d.join(id).join("inputs").join(f)).ok();
-            if read(baseline) != read(candidate) {
+        for m in [&bm, &cm] {
+            if m.base_commits.get(id).is_none_or(|s| s.is_empty()) {
                 bail!(
-                    "case {id}: inputs/{f} differs between the runs; compare runs of the same inputs"
+                    "case {id}: run {} has no resolved base commit; rerun it with this kod-eval",
+                    m.run_id
                 );
             }
         }
+        // An absent file is None; any other read error refuses.
+        let read = |d: &Path, f: &str| -> Result<Option<Vec<u8>>> {
+            let p = d.join(id).join("inputs").join(f);
+            match fs::read(&p) {
+                Ok(b) => Ok(Some(b)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(e).with_context(|| format!("reading {}", p.display())),
+            }
+        };
+        let missing = |f: &str| {
+            anyhow::anyhow!(
+                "case {id}: inputs/{f} is missing from a run; rerun it with this kod-eval"
+            )
+        };
+        let differs = |f: &str| {
+            anyhow::anyhow!(
+                "case {id}: inputs/{f} differs between the runs; compare runs of the same inputs"
+            )
+        };
+        let (Some(bc), Some(cc)) = (read(baseline, "case.toml")?, read(candidate, "case.toml")?)
+        else {
+            return Err(missing("case.toml"));
+        };
+        if bc != cc {
+            return Err(differs("case.toml"));
+        }
+        // run saves heldout.patch whenever the case has one, and a case
+        // expected to finish must have one.
+        #[derive(serde::Deserialize)]
+        struct Saved {
+            #[serde(default)]
+            expected_end_state: EndState,
+        }
+        let saved: Saved = toml::from_str(&String::from_utf8_lossy(&bc))
+            .with_context(|| format!("case {id}: parsing inputs/case.toml"))?;
+        let (bp, cp) = (
+            read(baseline, "heldout.patch")?,
+            read(candidate, "heldout.patch")?,
+        );
+        if saved.expected_end_state == EndState::Done && (bp.is_none() || cp.is_none()) {
+            return Err(missing("heldout.patch"));
+        }
+        if bp != cp {
+            return Err(differs("heldout.patch"));
+        }
+    }
+    if bm.base_commits != cm.base_commits {
+        bail!("the runs used different base commits; compare runs of the same inputs");
     }
     let (b, c) = (load(baseline)?, load(candidate)?);
     // load returns one result per manifest case, so every id is present.

@@ -74,6 +74,10 @@ fn run_dir(cases: &[&str]) -> tempfile::TempDir {
         runner: "script".into(),
         model: "none".into(),
         cases: cases.iter().map(|c| c.to_string()).collect(),
+        base_commits: cases
+            .iter()
+            .map(|c| (c.to_string(), "f".repeat(40)))
+            .collect(),
         ..Default::default()
     };
     fs::write(
@@ -81,6 +85,11 @@ fn run_dir(cases: &[&str]) -> tempfile::TempDir {
         serde_json::to_string(&m).unwrap(),
     )
     .unwrap();
+    // The saved inputs a real run writes, so compare has its evidence.
+    for c in cases {
+        put_input(d.path(), c, "case.toml", &format!("id = \"{c}\"\n"));
+        put_input(d.path(), c, "heldout.patch", "+the check\n");
+    }
     d
 }
 
@@ -439,6 +448,50 @@ fn compare_refuses_the_same_ids_with_different_inputs() {
     let (base, cand) = pair();
     let (_, ok) = compare(base.path(), cand.path()).unwrap();
     assert!(ok);
+}
+
+#[test]
+fn compare_refuses_evidence_missing_from_both_runs() {
+    type Gap = fn(&std::path::Path);
+    let gaps: [(&str, Gap); 4] = [
+        ("inputs/case.toml is missing", |d| {
+            fs::remove_file(d.join("a/inputs/case.toml")).unwrap()
+        }),
+        ("inputs/heldout.patch is missing", |d| {
+            fs::remove_file(d.join("a/inputs/heldout.patch")).unwrap()
+        }),
+        ("reading", |d| {
+            // Unreadable rather than absent: a directory in its place.
+            fs::remove_file(d.join("a/inputs/case.toml")).unwrap();
+            fs::create_dir(d.join("a/inputs/case.toml")).unwrap();
+        }),
+        ("no resolved base commit", |d| {
+            edit_manifest(d, |m| m.base_commits.clear())
+        }),
+    ];
+    for (want, gap) in gaps {
+        let (base, cand) = (run_with(&[passing("a")]), run_with(&[passing("a")]));
+        gap(base.path());
+        gap(cand.path());
+        let err = format!("{:#}", compare(base.path(), cand.path()).unwrap_err());
+        assert!(err.contains(want), "{want}: {err}");
+    }
+}
+
+#[test]
+fn compare_allows_no_heldout_patch_only_for_a_case_not_expected_to_finish() {
+    let (base, cand) = (run_with(&[passing("a")]), run_with(&[passing("a")]));
+    for d in [base.path(), cand.path()] {
+        put_input(
+            d,
+            "a",
+            "case.toml",
+            "id = \"a\"\nexpected_end_state = \"blocked\"\n",
+        );
+        fs::remove_file(d.join("a/inputs/heldout.patch")).unwrap();
+    }
+    let (text, ok) = compare(base.path(), cand.path()).unwrap();
+    assert!(ok, "{text}");
 }
 
 #[test]
