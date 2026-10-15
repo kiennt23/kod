@@ -27,7 +27,7 @@ These choices were left open by the spec and the overview. Each one is made here
 | D7 | `delegate` (dispatcher admission) and `retention_delete` (audit record deletion) are matrix rows, added by this plan to the spec on the owner's decision. `retention_delete` is always denied while the profile is a placeholder. | Every operation the policy grants has a matrix row stating its scope, approval, enforcement, evidence and failure behavior. |
 | D8 | Model routing: a run may use an endpoint only if it is allowed for **every** class the run read. An unknown class, an empty list or a missing list is refused. The placeholder table has one class, `placeholder`, with one endpoint, `placeholder`. | The spec says a run uses the strictest class of anything it read. Requiring the endpoint for every class is the same when the table is ordered strict-to-lenient, and never weaker when it isn't, and it needs no ranking of classes. The names say "not decided yet" so nobody mistakes them for real values (overview: one class and one endpoint until the routing values are set). |
 | D9 | Publish clearance is one team-wide list, `publish.cleared_classes` (placeholder: `["placeholder"]`). The publish rule checks repo, branch `agent/<ticket>-<run>`, draft, a live run and the run's classes. Refusing publish when the audit write fails, and idempotency, stay with the gateway (sub-plan 5). | One team, one set of repos: a per-repo list is a config shape for a problem we don't have yet (add it when a second repo with different clearance appears). The gateway writes the audit record of a decision before acting on it, so the policy can't see whether that write worked. |
-| D10 | Delegation: `risk_classes` ranks `low` 0, `medium` 1, `high` 2. The effective class is the highest of the ticket's class and every path rule it matches. Paths are normalised for matching: trimmed, lower-cased, `\` read as `/`, empty and `.` segments dropped. A rule matches at the repo root or below any directory (`src/auth/x` like `auth/x`). A path that isn't a string, is empty after normalising, or has a `..` segment is refused. Phase 1 delegates `low` and `medium`. `wip_in_progress` and `bounces` must be numbers `>= 0`. Path rules are config, not code: `default_path_rules` apply to every repo and `repo_path_rules.<repo>` add a repo's own rules (adding is always safe, since rules only raise). Keys are lower-case `owner/name`, and the lookup lower-cases the repo, because GitHub names are case-insensitive. A rule whose class isn't in `risk_classes` (a typo such as `hgh`) refuses the delegate or publish instead of dropping out. The delegate input names `ticket.repo`, and a ticket without one is refused; publish uses `run.repo`. The placeholder defaults, all `high`, each with a `covers` note, are the owner's list: `auth/`, `payments/`, `crypto/`, `pii/` (personal or regulated data), `migrations/`, `infra/`, `.github/` (CI), `.kod/` (the harness itself), `policy/`, `codeowners`. The real paths are set per repo in `repo_path_rules`. `wip_limit` is 1 (overview placeholder) and `bounce_limit` is 2 (spec default). **The ticket's paths are an early filter only.** `publish` carries the diff's `changed_paths`, and a changed path whose rule class isn't delegated refuses the publish, whatever the ticket said. The dispatcher passes its current WIP count and bounce count; making admission atomic is its job. | Path rules only raise the class, so a path written to dodge a rule must be raised or refused, not ignored. The ticket author picks the ticket's paths, so only the diff can enforce "a change that touches auth/ is high". The policy states the rule; the dispatcher (sub-plan 6) holds the lock. |
+| D10 | Delegation: `risk_classes` ranks `low` 0, `medium` 1, `high` 2. The effective class is the highest of the ticket's class and every path rule it matches. Paths are normalised for matching: trimmed, lower-cased, `\` read as `/`, empty and `.` segments dropped. A rule matches at the repo root or below any directory (`src/auth/x` like `auth/x`). A path that isn't a string, is empty after normalising, or has a `..` segment is refused. Phase 1 delegates `low` and `medium`. `wip_in_progress` and `bounces` must be numbers `>= 0`. Path rules are config, not code: `default_path_rules` apply to every repo and `repo_path_rules.<repo>` add a repo's own rules (adding is always safe, since rules only raise). **Malformed path-rule config refuses the whole policy at load** (`Policy::load`, in Rust, before Rego sees it): every rule in `default_path_rules` and each `repo_path_rules` entry must be exactly `{prefix, class}`, with a non-empty prefix and a class from `risk_classes`, and every repo key must be lower-case `owner/name` with no spaces. The error names the file, the entry and the problem. The ticket and run repo are lower-cased and trimmed for the lookup, because GitHub names are case-insensitive. The delegate input names `ticket.repo`, and a ticket without one is refused; publish uses `run.repo`. The placeholder defaults, all `high` are the owner's list: `auth/`, `payments/`, `crypto/`, `pii/` (personal or regulated data), `migrations/`, `infra/`, `.github/` (CI), `.kod/` (the harness itself), `policy/`, `codeowners`. The real paths are set per repo in `repo_path_rules`. `wip_limit` is 1 (overview placeholder) and `bounce_limit` is 2 (spec default). **The ticket's paths are an early filter only.** `publish` carries the diff's `changed_paths`, and a changed path whose rule class isn't delegated refuses the publish, whatever the ticket said. The dispatcher passes its current WIP count and bounce count; making admission atomic is its job. | Path rules only raise the class, so a path written to dodge a rule must be raised or refused, not ignored. The ticket author picks the ticket's paths, so only the diff can enforce "a change that touches auth/ is high". The policy states the rule; the dispatcher (sub-plan 6) holds the lock. |
 | D11 | Logins are GitHub logins, compared lower-cased on both sides (GitHub logins are case-insensitive). Callers map tracker ids to GitHub logins before asking (sub-plan 7, through 6a's `is_team_member` mapping). `requester_approval` is read per team from `teams.json` (`{"<team>": {"requester_approval": "..."}}`); a team with no setting gets `not_sole`. Only approvals with `"agent": false` and a string `login` count. Any other approval (an agent, or no flag) denies the merge outright. An unknown setting denies. `allowed`: at least one human approval. `not_sole`: at least one human approval from someone other than the requester. `forbidden`: at least one human approval, and the requester isn't among them. | The spec's three settings and default. An agent approval should never be on a PR at all, so its presence is a refusal, not just "doesn't count". |
 | D12 | The compliance profile is `compliance.json`, `{"profiles": {"<name>": {...}}}`. The placeholder has one profile, `placeholder`, with no values. `retention_delete` is allowed only when every active profile has a numeric `retention_days.<record_type>` and the record is at least as old as the longest of them. Any missing value denies, and the reason names the profile and the key. | The spec: more than one profile can be active and the strictest wins; for retention that is the longest period. A missing value must refuse, so the placeholder refuses all deletion, as the overview asks for sub-plan 4. |
 | D13 | Vendor-login requests (`subscription_model_request`): allowed only in `offline_spike` or `offline_eval`, for runners `claude-code` (plans `team`, `enterprise`), `codex` (`business`, `enterprise`) and `cursor` (`business`), with a seat whose `workspace` equals the approved workspace recorded for that runner and a string `account`, and only for the classes in `subscription.classes` (placeholder `["placeholder"]`). No workspace is recorded yet, so every such request is denied with "no approved workspace is recorded for runner X". `kod-loop` has no seat and is always refused. | The spec's credential exception (offline only until security accepts more), the business plans it names, and its eligibility check (valid credentials for the wrong workspace are refused). An unrecorded workspace is a missing value, so it denies. |
@@ -79,7 +79,7 @@ The modes follow [ADR 0001](../../adr/0001-per-task-execution-mode.md): a task t
 ## Review Focus
 
 1. **A missing, null or wrongly typed field** (an input that isn't an object, `null` ticket ids on both sides, `canceled` left out or `"false"` as a string, `data_classes` as a string) must deny, never allow. Pinned by Task 1 `input_that_is_not_an_object_is_denied` and `a_missing_or_unknown_action_is_denied`, and Task 2 `null_ids_never_match`, `publish_needs_an_explicit_live_run` and `an_unknown_or_missing_data_class_is_refused`.
-2. **A path written to dodge a path rule, or a diff that touches a high-risk path the ticket never named** (`./auth/x`, `Auth/x`, `auth\x`, ` auth/x`, `src/auth/x`, `src/../auth/x`, a path that isn't a string, `paths` or `changed_paths` given as a string or left out) must not lower the risk class: the ticket is raised or refused, and the publish is refused. Pinned by Task 4 `path_tricks_cannot_dodge_a_path_rule` and `publish_refuses_a_diff_that_touches_a_high_risk_path`.
+2. **A path written to dodge a path rule, or a diff that touches a high-risk path the ticket never named** (`./auth/x`, `Auth/x`, `auth\x`, ` auth/x`, `src/auth/x`, `src/../auth/x`, a path that isn't a string, `paths` or `changed_paths` given as a string or left out) must not lower the risk class: the ticket is raised or refused, and the publish is refused. A malformed or mis-keyed path-rule config is refused at load, never skipped. Pinned by Task 4 `path_tricks_cannot_dodge_a_path_rule`, `publish_refuses_a_diff_that_touches_a_high_risk_path` and `malformed_path_rule_config_fails_to_load`.
 3. **A placeholder or missing configuration value** (no recorded seat workspace, a `null` workspace sent by the caller, a compliance profile without the key, no active profile) must deny with a reason that names what is missing, and must never match a `null` in the input. Pinned by Task 2 `subscription_is_refused_until_a_workspace_is_recorded` and `a_null_or_wrong_workspace_never_matches`, and Task 4 `retention_delete_is_refused_while_the_profile_is_a_placeholder` and `a_missing_value_in_any_active_profile_denies`.
 4. **A broken policy directory or an evaluation error** (empty or missing directory, Rego that doesn't parse, invalid JSON, no `decision` rule, a decision of the wrong shape, a builtin error at request time) must fail at load or deny with a `policy error` reason, never allow. Pinned by Task 1 `a_broken_policy_fails_to_load` and `evaluation_errors_deny`, and Task 4 `a_malformed_ticket_is_a_policy_error_deny`.
 5. **An agent approval, or the requester as the only approver**, must block a merge under the matching setting, and an unknown setting must deny. Requester and approver logins that differ only in case are the same person. Pinned by Task 3 `agent_approvals_block_the_merge`, `not_sole_is_the_default_and_needs_another_human`, `forbidden_refuses_any_requester_approval`, `an_unknown_requester_setting_is_refused` and `logins_compare_case_insensitively`.
@@ -596,7 +596,8 @@ pub struct Policy {
 impl Policy {
     /// Loads every `*.rego` and `*.json` file directly in `dir`. A data file
     /// `<name>.json` becomes `data.config.<name>`. Fails if there is no Rego, a
-    /// file doesn't parse, or the rules don't yield a decision.
+    /// file doesn't parse, `delegation.json` has a malformed path rule, or
+    /// the rules don't yield a decision.
     pub fn load(dir: &Path) -> Result<Policy> {
         let mut files = Vec::new();
         for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
@@ -637,6 +638,9 @@ impl Policy {
                     .add_policy(name.to_string(), text)
                     .map_err(|e| anyhow!("{name}: {e}"))?;
             }
+        }
+        if let Some(delegation) = data.get("delegation") {
+            check_path_rules(delegation)?;
         }
         let data = Value::Object(Map::from_iter([(
             "config".to_string(),
@@ -691,6 +695,54 @@ impl Policy {
         let json = value.to_json_str().map_err(|e| anyhow!("{e}"))?;
         serde_json::from_str(&json).with_context(|| format!("not a decision: {json}"))
     }
+}
+
+/// Path rules decide which changes count as high risk, so a malformed rule
+/// must refuse the whole policy at load, not silently drop out of matching.
+/// Every rule is exactly `{prefix, class}`: a non-empty prefix and a class
+/// from `risk_classes`. `repo_path_rules` keys are lower-case `owner/name`.
+fn check_path_rules(delegation: &Value) -> Result<()> {
+    let classes = delegation.get("risk_classes").and_then(Value::as_object);
+    let check = |at: &str, rules: Option<&Value>| -> Result<()> {
+        let rules = rules
+            .and_then(Value::as_array)
+            .with_context(|| format!("delegation.json: {at} must be a list of rules"))?;
+        for (i, rule) in rules.iter().enumerate() {
+            let at = format!("delegation.json: {at}[{i}]");
+            let rule = rule
+                .as_object()
+                .with_context(|| format!("{at}: a rule must be an object"))?;
+            if let Some(key) = rule
+                .keys()
+                .find(|k| !matches!(k.as_str(), "prefix" | "class"))
+            {
+                bail!("{at}: unexpected key {key}");
+            }
+            let prefix = rule.get("prefix").and_then(Value::as_str);
+            if !prefix.is_some_and(|p| !p.trim().is_empty()) {
+                bail!("{at}: prefix must be a non-empty string");
+            }
+            let class = rule.get("class").and_then(Value::as_str);
+            if !class.is_some_and(|c| classes.is_some_and(|known| known.contains_key(c))) {
+                bail!("{at}: class must be one of risk_classes");
+            }
+        }
+        Ok(())
+    };
+    check("default_path_rules", delegation.get("default_path_rules"))?;
+    let repos = delegation
+        .get("repo_path_rules")
+        .and_then(Value::as_object)
+        .context("delegation.json: repo_path_rules must be an object")?;
+    for (repo, rules) in repos {
+        if *repo != repo.trim().to_lowercase() {
+            bail!(
+                "delegation.json: repo_path_rules key {repo:?} must be lower-case owner/name with no spaces"
+            );
+        }
+        check(&format!("repo_path_rules.{repo}"), Some(rules))?;
+    }
+    Ok(())
 }
 ```
 
@@ -1885,7 +1937,8 @@ git commit -m "kod-policy: merge with requester_approval, harness changes and ca
 - Produces, as input contracts for sub-plans 6 and 4:
   - `delegate`: `{"ticket": {"repo": "<owner>/<name>", "risk_class": "low"|"medium"|"high", "paths": [..], "acceptance_criteria": true, "bounces": <number>}, "wip_in_progress": <number>}`. `paths` is optional (repo-relative paths the ticket names, an early filter only); `bounces` is the story's count of rework requests. Task 4 also adds the `publish` veto on `changed_paths` (Task 2's contract).
   - `retention_delete`: `{"record_type": "<type>", "age_days": <number>}`.
-  - Data: `data.config.delegation.{risk_classes, allowed_classes, default_path_rules[{prefix, class, covers}], repo_path_rules.<lower-case owner/name>[{prefix, class}], wip_limit, bounce_limit}`, `data.config.compliance.profiles.<name>.retention_days.<record_type>`.
+  - Load-time check: `check_path_rules` in `lib.rs` (Task 1) refuses malformed path rules; Task 4 owns its test, since `delegation.json` lands here.
+  - Data: `data.config.delegation.{risk_classes, allowed_classes, default_path_rules[{prefix, class}], repo_path_rules.<lower-case owner/name>[{prefix, class}], wip_limit, bounce_limit}`, `data.config.compliance.profiles.<name>.retention_days.<record_type>`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2030,6 +2083,11 @@ fn a_repos_own_path_rules_add_to_the_defaults() {
         set(billing.clone(), "/ticket/repo", json!("Acme/App")),
         "path billing/invoice.rs raises the risk class to high",
     );
+    denied_by(
+        &p,
+        set(billing.clone(), "/ticket/repo", json!(" acme/app ")),
+        "path billing/invoice.rs raises the risk class to high",
+    );
     allowed_by(&p, set(billing, "/ticket/repo", json!("acme/other")));
     denied_by(
         &p,
@@ -2056,15 +2114,76 @@ fn a_repos_own_path_rules_add_to_the_defaults() {
     );
 }
 
+/// The error `Policy::load` gives for policy/delegation.json with `key`
+/// replaced.
+fn load_error(key: &str, value: Value) -> String {
+    let text = std::fs::read_to_string(common::policy_dir().join("delegation.json")).unwrap();
+    let mut config: Value = serde_json::from_str(&text).unwrap();
+    config[key] = value;
+    let dir = common::copy_policy();
+    std::fs::write(dir.path().join("delegation.json"), config.to_string()).unwrap();
+    match kod_policy::Policy::load(dir.path()) {
+        Ok(_) => panic!("{key} = {value_text} loaded", value_text = config[key]),
+        Err(e) => format!("{e:#}"),
+    }
+}
+
 #[test]
-fn a_path_rule_with_an_unknown_class_is_refused() {
-    let p = with_repo_rules(json!({"acme/app": [{"prefix": "billing/", "class": "hgh"}]}));
-    denied_by(&p, delegate(), "path rule billing/ has unknown class hgh");
-    denied_by(
-        &p,
-        publish(json!(["src/lib.rs"])),
-        "path rule billing/ has unknown class hgh",
-    );
+fn malformed_path_rule_config_fails_to_load() {
+    let repo = |rule: Value| json!({"acme/app": [rule]});
+    for (key, value, problem) in [
+        (
+            "repo_path_rules",
+            repo(json!({"prefix": "billing/"})),
+            "repo_path_rules.acme/app[0]: class must be one of risk_classes",
+        ),
+        (
+            "repo_path_rules",
+            repo(json!({"prefix": "billing/", "class": "hgh"})),
+            "repo_path_rules.acme/app[0]: class must be one of risk_classes",
+        ),
+        (
+            "repo_path_rules",
+            repo(json!({"class": "high"})),
+            "repo_path_rules.acme/app[0]: prefix must be a non-empty string",
+        ),
+        (
+            "repo_path_rules",
+            repo(json!({"prefix": "", "class": "high"})),
+            "repo_path_rules.acme/app[0]: prefix must be a non-empty string",
+        ),
+        (
+            "repo_path_rules",
+            repo(json!({"prefix": "billing/", "class": "high", "clas": "high"})),
+            "repo_path_rules.acme/app[0]: unexpected key clas",
+        ),
+        (
+            "repo_path_rules",
+            json!({"Acme/App": [{"prefix": "billing/", "class": "high"}]}),
+            "repo_path_rules key \"Acme/App\" must be lower-case owner/name",
+        ),
+        (
+            "repo_path_rules",
+            json!({" acme/app": [{"prefix": "billing/", "class": "high"}]}),
+            "repo_path_rules key \" acme/app\" must be lower-case owner/name",
+        ),
+        (
+            "repo_path_rules",
+            json!({"acme/app": {"prefix": "billing/", "class": "high"}}),
+            "repo_path_rules.acme/app must be a list of rules",
+        ),
+        (
+            "default_path_rules",
+            json!([{"prefix": "auth/"}]),
+            "default_path_rules[0]: class must be one of risk_classes",
+        ),
+    ] {
+        let error = load_error(key, value);
+        assert!(
+            error.contains("delegation.json") && error.contains(problem),
+            "{problem}: {error}"
+        );
+    }
 }
 
 #[test]
@@ -2351,53 +2470,43 @@ Expected: FAIL. No `delegate` or `retention_delete` grant exists yet, and the sp
   "default_path_rules": [
     {
       "prefix": "auth/",
-      "class": "high",
-      "covers": "auth"
+      "class": "high"
     },
     {
       "prefix": "payments/",
-      "class": "high",
-      "covers": "payments"
+      "class": "high"
     },
     {
       "prefix": "crypto/",
-      "class": "high",
-      "covers": "crypto"
+      "class": "high"
     },
     {
       "prefix": "pii/",
-      "class": "high",
-      "covers": "personal or regulated data"
+      "class": "high"
     },
     {
       "prefix": "migrations/",
-      "class": "high",
-      "covers": "data migrations"
+      "class": "high"
     },
     {
       "prefix": "infra/",
-      "class": "high",
-      "covers": "infrastructure"
+      "class": "high"
     },
     {
       "prefix": ".github/",
-      "class": "high",
-      "covers": "CI"
+      "class": "high"
     },
     {
       "prefix": ".kod/",
-      "class": "high",
-      "covers": "the harness itself (its config in a product repo)"
+      "class": "high"
     },
     {
       "prefix": "policy/",
-      "class": "high",
-      "covers": "policy"
+      "class": "high"
     },
     {
       "prefix": "codeowners",
-      "class": "high",
-      "covers": "CODEOWNERS"
+      "class": "high"
     }
   ],
   "repo_path_rules": {},
@@ -2432,9 +2541,11 @@ ticket_paths := object.get(object.get(input, "ticket", {}), "paths", [])
 
 # The defaults hold for every repo; a repo's own rules (set in config, per
 # repo) add to them. Rules only raise the class, so adding is always safe.
-# repo_path_rules keys are lower-case owner/name: GitHub names are
-# case-insensitive, so the lookup lower-cases the repo.
-repo_rules(repo) := object.get(data.config.delegation.repo_path_rules, lower(repo), []) if is_string(repo)
+# repo_path_rules keys are lower-case owner/name (Policy::load refuses any
+# other key, and any rule that isn't exactly {prefix, class} with a known
+# class). GitHub names are case-insensitive, so the lookup lower-cases and
+# trims the repo.
+repo_rules(repo) := object.get(data.config.delegation.repo_path_rules, lower(trim_space(repo)), []) if is_string(repo)
 
 repo_rules(repo) := [] if not is_string(repo)
 
@@ -2565,20 +2676,6 @@ deny contains "bounce limit reached: assign the story to the tech lead" if {
 	input.action == "delegate"
 	is_number(input.ticket.bounces)
 	input.ticket.bounces >= data.config.delegation.bounce_limit
-}
-
-# A rule whose class is unknown (a typo in repo config) refuses the
-# request instead of silently dropping out of the rank.
-deny contains sprintf("path rule %v has unknown class %v", [r.prefix, r.class]) if {
-	input.action == "delegate"
-	some r in rules_for(ticket_repo)
-	not risk[r.class]
-}
-
-deny contains sprintf("path rule %v has unknown class %v", [r.prefix, r.class]) if {
-	input.action == "publish"
-	some r in rules_for(run_repo)
-	not risk[r.class]
 }
 
 # publish: the diff's own paths decide, whatever the ticket said. A change
