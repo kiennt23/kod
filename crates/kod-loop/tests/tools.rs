@@ -6,7 +6,6 @@ use serde_json::{Value, json};
 use std::{
     fs,
     path::Path,
-    process::Command,
     thread,
     time::{Duration, Instant},
 };
@@ -170,15 +169,15 @@ fn runaway_command_is_killed_with_its_children() {
 /// ubuntu-24.04, whose /bin/sh is dash like the bookworm sandbox's.
 fn assert_group_dead(dir: &std::path::Path, files: &[&str]) {
     for f in files {
-        let pid = fs::read_to_string(dir.join(f)).unwrap();
-        let alive = || {
-            Command::new("kill")
-                .args(["-0", pid.trim()])
-                .stderr(std::process::Stdio::null())
-                .status()
-                .unwrap()
-                .success()
-        };
+        let pid: libc::pid_t = fs::read_to_string(dir.join(f))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // kill(pid, 0) rather than spawning kill(1): on Linux `run` reaps every
+        // child of this process, which would race a spawned checker.
+        // SAFETY: signal 0 only checks that the process exists.
+        let alive = || unsafe { libc::kill(pid, 0) } == 0;
         let deadline = Instant::now() + Duration::from_secs(5);
         while alive() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(50));
@@ -225,4 +224,26 @@ fn endless_output_is_killed_before_the_timeout() {
         r.text.len()
     );
     assert!(r.text.len() < OUTPUT_CAP + 200, "{}", r.text.len());
+}
+
+/// setsid and a double fork leave the command's process group; they must
+/// still be killed, or they keep changing the workspace in later turns.
+#[cfg(target_os = "linux")]
+#[test]
+fn detached_children_are_killed_when_the_command_exits() {
+    let d = tempfile::tempdir().unwrap();
+    let r = call(
+        d.path(),
+        "run",
+        json!({"command": "setsid sh -c 'sleep 1; echo survived > detached.txt' >/dev/null 2>&1 & \
+            setsid sh -c '(sleep 1; echo survived > forked.txt) &' >/dev/null 2>&1 & sleep 0.2"}),
+    );
+    assert!(r.text.ends_with("[exit code 0]"), "{}", r.text);
+    thread::sleep(Duration::from_secs(2));
+    for f in ["detached.txt", "forked.txt"] {
+        assert!(
+            !d.path().join(f).exists(),
+            "{f} was written after the command ended"
+        );
+    }
 }

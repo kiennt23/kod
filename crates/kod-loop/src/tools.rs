@@ -8,7 +8,10 @@ use std::{
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -174,6 +177,10 @@ fn run(ws: &Path, timeout: Duration, input: &Value) -> Result<String, String> {
     let command = arg(input, "command")?;
     let err = |e: std::io::Error| format!("running the command: {e}");
     let mut out = scratch().map_err(err)?;
+    // One command at a time per process: the sweep below kills every child of
+    // this process, which must never include another call's live command.
+    let _one = RUN.lock().unwrap_or_else(|e| e.into_inner());
+    become_subreaper();
     let mut child = Command::new("sh")
         .arg("-c")
         .arg(command)
@@ -212,13 +219,14 @@ fn run(ws: &Path, timeout: Duration, input: &Value) -> Result<String, String> {
         }
         thread::sleep(Duration::from_millis(20));
     };
-    // Leftover background children are killed too: they would otherwise keep
-    // changing the workspace during later turns.
+    // Leftover background children are killed too, detached ones included
+    // (sweep_orphans): they would otherwise keep changing the workspace during
+    // later turns.
     // ponytail: the leader is already reaped here, so if its group is empty and
     // the kernel reuses the pid for a new group leader, this hits that group.
     // Negligible in a one-run sandbox; if it matters, signal before reaping
     // (try_wait, then waitid with WNOWAIT).
-    let status = if kill_group(child.id()) {
+    let status = if kill_group(child.id()) & sweep_orphans() {
         status
     } else {
         format!("{status} [its background processes could not be killed]")
@@ -228,6 +236,65 @@ fn run(ws: &Path, timeout: Duration, input: &Value) -> Result<String, String> {
         text.push('\n');
     }
     Ok(format!("{text}{status}"))
+}
+
+static RUN: Mutex<()> = Mutex::new(());
+
+/// Makes this process the reaper of its orphaned descendants, so a command's
+/// children that leave its process group (setsid, double fork) are reparented
+/// here instead of to init, where sweep_orphans finds them.
+// ponytail: Linux only (prctl). Elsewhere (macOS dev builds) only the process
+// group is killed, so setsid'd descendants survive the command. On Linux a
+// descendant escapes only by changing uid; the sandbox runs one uid and the
+// container bounds the whole case anyway.
+#[cfg(target_os = "linux")]
+fn become_subreaper() {
+    // SAFETY: prctl with integer arguments only sets a flag on this process.
+    unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
+}
+#[cfg(not(target_os = "linux"))]
+fn become_subreaper() {}
+
+/// SIGKILLs and reaps every child of this process until none is left. Called
+/// with RUN held after the command is reaped, so every child is a leftover of
+/// a command: killing one reparents its own children here for the next pass.
+/// Returns false if one could not be killed.
+#[cfg(target_os = "linux")]
+fn sweep_orphans() -> bool {
+    let me = std::process::id().to_string();
+    loop {
+        let children: Vec<libc::pid_t> = fs::read_dir("/proc")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| {
+                let pid = e.file_name().to_str()?.parse().ok()?;
+                let stat = fs::read_to_string(e.path().join("stat")).ok()?;
+                // The parent pid is the second field after the ")" of comm.
+                let ppid = stat.rsplit_once(')')?.1.split_whitespace().nth(1)?;
+                (ppid == me).then_some(pid)
+            })
+            .collect();
+        if children.is_empty() {
+            return true;
+        }
+        for pid in children {
+            // SAFETY: kill and waitpid take integers; the pid is our child, so
+            // it cannot be reused until waitpid reaps it.
+            unsafe {
+                if libc::kill(pid, libc::SIGKILL) != 0
+                    && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+                {
+                    return false;
+                }
+                libc::waitpid(pid, std::ptr::null_mut(), 0);
+            }
+        }
+    }
+}
+#[cfg(not(target_os = "linux"))]
+fn sweep_orphans() -> bool {
+    true
 }
 
 /// SIGKILLs the command's process group (its id is the leader's pid, from
