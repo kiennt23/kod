@@ -635,12 +635,15 @@ name = "kod-eval"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "clap",
  "kod-llm-proxy",
+ "kod-loop",
  "roxmltree",
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
  "toml",
 ]
 

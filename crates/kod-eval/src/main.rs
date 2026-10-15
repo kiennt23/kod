@@ -48,10 +48,10 @@ enum Cli {
         /// Only this case id
         #[arg(long)]
         only: Option<String>,
-        /// claude-code or script
+        /// claude-code, kod-loop or script
         #[arg(long, default_value = "claude-code")]
         runner: String,
-        /// Pinned model id; required for claude-code
+        /// Pinned model id; required for claude-code and kod-loop
         #[arg(long)]
         model: Option<String>,
         /// Shell command; required for the script runner
@@ -93,6 +93,15 @@ fn main() -> Result<()> {
             let runner = match (runner.as_str(), model, script) {
                 ("claude-code", Some(model), _) => Runner::ClaudeCode { model },
                 ("claude-code", None, _) => bail!("--model is required: pin the model id"),
+                ("kod-loop", Some(model), _) => Runner::KodLoop {
+                    model,
+                    max_tokens: run::ProxyLimits::from_env(
+                        |k| std::env::var(k).ok(),
+                        String::new(),
+                    )?
+                    .max_tokens,
+                },
+                ("kod-loop", None, _) => bail!("--model is required: pin the model id"),
                 ("script", _, Some(command)) => Runner::Script { command },
                 ("script", _, None) => bail!("--script is required for the script runner"),
                 (other, ..) => bail!("unknown runner {other}"),

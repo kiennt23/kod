@@ -93,3 +93,22 @@ fn only_a_recorded_zero_passes_the_process_gate() {
     assert!(process_gate(Some("")).is_err());
     assert!(process_gate(None).unwrap_err().contains("no process check"));
 }
+
+#[test]
+fn proxy_upstream_defaults_to_anthropic_and_is_passed_and_recorded() {
+    let lim = ProxyLimits::from_env(|_| None, "m".into()).unwrap();
+    assert_eq!(lim.upstream, "https://api.anthropic.com");
+    let lim = ProxyLimits::from_env(
+        |k| (k == "KOD_UPSTREAM").then(|| "http://10.0.0.1:9".to_owned()),
+        "m".into(),
+    )
+    .unwrap();
+    let a = proxy_args("p", "r", &lim, "img").join(" ");
+    assert!(a.contains("-e KOD_UPSTREAM=http://10.0.0.1:9 "), "{a}");
+    // Manifests from before this field still load.
+    let old: ProxyLimits = serde_json::from_str(
+        r#"{"allowed_models":"m","allowed_paths":"/v1/messages","max_tokens":1,"max_body":1,"max_requests":1,"max_concurrent":1}"#,
+    )
+    .unwrap();
+    assert_eq!(old.upstream, "");
+}
