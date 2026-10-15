@@ -21,6 +21,7 @@ repository.
 - `crates/kod-eval`: the `kod-eval` CLI (cases, runs, scoring, reports, kill switch).
 - `crates/kod-llm-proxy`: the only way out of the sandbox. It holds the model key and enforces the allowed models, token cap, request budget and concurrency.
 - `images/sandbox`, `images/proxy`: container images.
+- `crates/kod-loop`: our agent loop, a runner built into every sandbox image (`--runner kod-loop`).
 
 How a case runs:
 1. The agent works in a container with no git history and no network except the proxy.
@@ -38,9 +39,10 @@ Run on a dedicated Linux host with Docker (see the runbook for why).
 cargo install --path crates/kod-eval --locked   # puts kod-eval in ~/.cargo/bin
 docker build -t kod-llm-proxy --build-arg RUST_VERSION=1.99.0 -f images/proxy/Dockerfile .
 docker build -t kod-sandbox-rust \
+  --build-arg RUST_VERSION=1.99.0 \
   --build-arg BASE=rust:1.99.0-bookworm@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6 \
   --build-arg NODE_VERSION=22.23.3 --build-arg CLAUDE_CODE_VERSION=2.1.296 \
-  --build-arg NEXTEST_VERSION=0.9.148 images/sandbox  # pinned in evals/VERSIONS.md; keep the two in step
+  --build-arg NEXTEST_VERSION=0.9.148 -f images/sandbox/Dockerfile .  # pinned in evals/VERSIONS.md; keep the two in step
 
 # 2. Turn a merged change into a case, then check it (records required_tests).
 #    The test command is the Rust one from docs/eval-set.md: the workspace is
@@ -69,7 +71,7 @@ Every command takes `--help`. Tune prompts on `--split dev` only. Run
 cargo test --all
 cargo clippy --all-targets -- -D warnings
 # Docker end-to-end and kill-switch tests (build kod-llm-proxy and kod-sandbox-test first, see .github/workflows/ci.yml)
-KOD_API_KEY=dummy KOD_DOCKER_TESTS=1 cargo test -p kod-eval --test docker --test kill_switch
+KOD_API_KEY=dummy KOD_DOCKER_TESTS=1 cargo test -p kod-eval --test docker --test kill_switch --test kod_loop
 ```
 
 Every change goes through a pull request.

@@ -54,10 +54,16 @@ pub const GIT_SHA: &str = match option_env!("KOD_GIT_SHA") {
     None => "unknown",
 };
 
+/// The model API the proxy uses when KOD_UPSTREAM is not set.
+pub const DEFAULT_UPSTREAM: &str = "https://api.anthropic.com";
+
 /// What every case's proxy enforces in a run, passed to it as values and
 /// recorded in the manifest. Unset variables take kod-llm-proxy's defaults.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ProxyLimits {
+    /// Where the proxy sends model traffic (KOD_UPSTREAM).
+    #[serde(default)]
+    pub upstream: String,
     pub allowed_models: String,
     pub allowed_paths: String,
     pub max_tokens: u64,
@@ -74,6 +80,7 @@ impl ProxyLimits {
             })
         };
         Ok(ProxyLimits {
+            upstream: get("KOD_UPSTREAM").unwrap_or_else(|| DEFAULT_UPSTREAM.into()),
             allowed_models,
             allowed_paths: get("KOD_ALLOWED_PATHS")
                 .unwrap_or_else(|| "/v1/messages,/v1/messages/count_tokens".into()),
@@ -218,6 +225,12 @@ pub fn run_all(cases: &[EvalCase], runner: &Runner, s: &Settings) -> Result<Path
     );
     let models = [vec![runner.model().to_owned()], s.extra_models.clone()].concat();
     let limits = ProxyLimits::from_env(|k| std::env::var(k).ok(), models.join(","))?;
+    if limits.upstream != DEFAULT_UPSTREAM {
+        eprintln!(
+            "note: KOD_UPSTREAM is {}; model traffic and the real API key go there",
+            limits.upstream
+        );
+    }
     let mut sandbox_image_ids = BTreeMap::new();
     let mut base_commits = BTreeMap::new();
     for c in cases {
@@ -309,6 +322,7 @@ pub fn proxy_args(name: &str, run_id: &str, lim: &ProxyLimits, image: &str) -> V
     ]);
     args.extend(sv(&["-e", "KOD_API_KEY"]));
     for kv in [
+        format!("KOD_UPSTREAM={}", lim.upstream),
         format!("KOD_ALLOWED_PATHS={}", lim.allowed_paths),
         format!("KOD_MAX_TOKENS={}", lim.max_tokens),
         format!("KOD_MAX_BODY={}", lim.max_body),

@@ -64,3 +64,82 @@ fn claude_env_points_at_the_proxy_with_a_dummy_key() {
     assert_eq!(get("ANTHROPIC_BASE_URL"), Some(PROXY_URL));
     assert_eq!(get("ANTHROPIC_API_KEY"), Some("sk-kod-dummy"));
 }
+
+fn kod_loop() -> Runner {
+    Runner::KodLoop {
+        model: "claude-sonnet-5-5".into(),
+        max_tokens: 4096,
+    }
+}
+
+#[test]
+fn kod_loop_command_and_env() {
+    let r = kod_loop();
+    assert_eq!((r.name(), r.model()), ("kod-loop", "claude-sonnet-5-5"));
+    assert_eq!(
+        r.command(&common::case("c1")),
+        [
+            "kod-loop",
+            "--model",
+            "claude-sonnet-5-5",
+            "--max-turns",
+            "40",
+            "--max-tokens",
+            "4096"
+        ]
+    );
+    // The base URL only: no key, not even a dummy one.
+    assert_eq!(
+        r.env(),
+        vec![("ANTHROPIC_BASE_URL".to_owned(), PROXY_URL.to_owned())]
+    );
+}
+
+#[test]
+fn kod_loop_end_state_reads_the_outcome_line() {
+    use kod_loop::EndState as Loop;
+    for s in [
+        Loop::Done,
+        Loop::Blocked,
+        Loop::NeedsHuman,
+        Loop::OverBudget,
+    ] {
+        let line = serde_json::to_string(&kod_loop::Outcome {
+            end_state: s,
+            summary: "x".into(),
+            turns: 1,
+            usage: kod_loop::Usage::default(),
+            error: None,
+        })
+        .unwrap();
+        let (got, cost) = kod_loop().end_state(0, &line);
+        assert_eq!(
+            serde_json::to_value(got).unwrap(),
+            serde_json::to_value(s).unwrap(),
+            "{line}"
+        );
+        assert_eq!(cost, None);
+    }
+}
+
+#[test]
+fn kod_loop_garbled_or_failed_output_needs_a_human() {
+    let done = r#"{"end_state":"done","summary":"","turns":1,"usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"error":null}"#;
+    let twice = format!("{done}\n{done}");
+    for (code, out) in [
+        (0, ""),
+        (0, "not json"),
+        (0, twice.as_str()),
+        (0, r#"{"end_state":"finished"}"#),
+        (0, r#"{"end_state":"done""#),
+        (0, "[]"),
+        (1, done),
+        (137, done),
+    ] {
+        assert_eq!(
+            kod_loop().end_state(code, out).0,
+            EndState::NeedsHuman,
+            "{code} {out}"
+        );
+    }
+}

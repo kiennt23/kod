@@ -1,9 +1,21 @@
 # One image per product language. BASE is that language's toolchain image,
-# for example rust:<version>-bookworm. Claude Code is installed only when
-# CLAUDE_CODE_VERSION is set, on Node.js NODE_VERSION from nodejs.org (checked
-# against its SHASUMS256.txt; distribution Node.js is too old), and
-# cargo-nextest only when NEXTEST_VERSION is set (Rust images). EXTRA_PACKAGES is for test images.
+# for example rust:<version>-bookworm; it must be Debian bookworm or newer
+# with glibc, because kod-loop is built on rust:<RUST_VERSION>-slim-bookworm.
+# Build from the repo root: docker build -f images/sandbox/Dockerfile .
+# RUST_VERSION is the harness toolchain (rust-toolchain.toml). Claude Code is
+# installed only when CLAUDE_CODE_VERSION is set, on Node.js NODE_VERSION from
+# nodejs.org (checked against its SHASUMS256.txt; distribution Node.js is too
+# old), and cargo-nextest only when NEXTEST_VERSION is set (Rust images).
+# EXTRA_PACKAGES is for test images.
+ARG RUST_VERSION
 ARG BASE=debian:bookworm-slim
+
+FROM rust:${RUST_VERSION}-slim-bookworm AS loop
+WORKDIR /src
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates crates
+RUN cargo build --release --locked -p kod-loop
+
 FROM ${BASE}
 ARG CLAUDE_CODE_VERSION=""
 ARG EXTRA_PACKAGES=""
@@ -25,9 +37,11 @@ RUN apt-get update \
     fi \
  && rm -rf /var/lib/apt/lists/* \
  && useradd --create-home --uid 10001 agent
-COPY nextest.toml /etc/kod/nextest.toml
+COPY images/sandbox/nextest.toml /etc/kod/nextest.toml
+COPY --from=loop /src/target/release/kod-loop /usr/local/bin/kod-loop
+COPY crates/kod-loop/system.md /etc/kod/kod-loop/system.md
 # Cargo's own state (registry cache, locks) goes in /tmp, which the agent can
 # write in both agent and score mode.
 ENV CARGO_HOME=/tmp/cargo
-COPY --chmod=0755 entrypoint.sh /usr/local/bin/kod-entrypoint
+COPY --chmod=0755 images/sandbox/entrypoint.sh /usr/local/bin/kod-entrypoint
 ENTRYPOINT ["/usr/local/bin/kod-entrypoint"]
