@@ -33,7 +33,7 @@ These choices were left open by the spec and the overview. Each one is made here
 | D13 | Vendor-login requests (`subscription_model_request`): allowed only in `offline_spike` or `offline_eval`, for runners `claude-code` (plans `team`, `enterprise`), `codex` (`business`, `enterprise`) and `cursor` (`business`), with a seat whose `workspace` equals the approved workspace recorded for that runner and a string `account`, and only for the classes in `subscription.classes` (placeholder `["placeholder"]`). No workspace is recorded yet, so every such request is denied with "no approved workspace is recorded for runner X". `kod-loop` has no seat and is always refused. | The spec's credential exception (offline only until security accepts more), the business plans it names, and its eligibility check (valid credentials for the wrong workspace are refused). An unrecorded workspace is a missing value, so it denies. |
 | D14 | `people.json` holds `owner` (`kiennt23`, the GitHub login), `backup` (`null` until named) and `tech_leads` (`[]`). `harness_change` needs a human approval from every named owner and backup (today the owner only). The kill switch (`cancel` with scope `all`) is the owner, backup or a tech lead. Restarting after it (`resume`, scope `all`) is the owner or backup only. Cancelling one run is the owner, backup, a tech lead, or a label removal of that run's ticket (`target.run` equals `run.id`). **The kill switch must not depend on the policy:** when the policy fails to load or evaluate, the dispatcher (sub-plan 6) still honours a kill switch from the owner or the backup, whose identities are configured in the dispatcher itself, since a fail-closed policy would otherwise block an emergency stop. Tech leads go through the policy, so a policy failure blocks their stop. `people.json` must name an owner login, a backup that is `null` or a login, and tech leads that are logins (D16), so an empty login can't be configured. | The owner's decision on PR 11: anyone who might see an incident first can stop everything, and only the accountable owner (or backup) restarts. Harness changes need both once the backup is named (overview). A label removal cancels its own run only. |
 | D15 | Tests are Rust integration tests in the crate (`cargo test`), not `opa test`. Tests that need a non-placeholder value load a temp copy of `policy/` with one data file replaced (`common::policy_with`). | One toolchain in CI, and the tests exercise the same `Policy` API the callers use. The allow paths that placeholders block are still tested. |
-| D16 | **`Policy::load` is the single gate for the data files** (`src/config.rs`, Rust, before Rego sees them). Every data file the rules read is required: `compliance`, `delegation`, `people`, `publish`, `routing`, `subscription` and `teams` (`.json`). Every value whose wrong shape would let a request through, or make a rule match nothing it should, is checked: `delegation` (non-empty `risk_classes` with distinct integer ranks, `allowed_classes` drawn from them, `wip_limit` and `bounce_limit` non-negative integers, the path rules of D10), `people` (D14), `teams` (D11) and `compliance` (each profile an object; a `retention_days` present is an object of non-negative numbers). Values the rules only test for membership are left to the rules, since missing or malformed they match nothing and the request is denied: `routing.classes.<class>.endpoints`, `subscription.{contexts, classes, runners.<runner>.{plans, workspace}}`, `publish.cleared_classes`, and a missing retention period (the placeholder profile). Rego doesn't re-check what the gate guarantees. Any violation fails the load with an error naming the file, the entry and the problem. | One boundary owns config validity. A per-field deny in Rego only covers the fields someone remembered; a gate that runs before anything is decided refuses a bad config before it can skip a rule. Examples the gate closes: `"bounce_limit": "2"` (Rego orders every number below every string, so `bounces < "2"` always holds), a negative retention period, a mis-cased team key or a `requestor_approval` typo. |
+| D16 | **`Policy::load` is the single gate for the data files** (`src/config.rs`, Rust, before Rego sees them). Every data file the rules read is required: `compliance`, `delegation`, `people`, `publish`, `routing`, `subscription` and `teams` (`.json`). Every `data.config` value the rules read is checked, so none reaches Rego unvalidated: `delegation` (non-empty `risk_classes` with distinct integer ranks, `allowed_classes` drawn from them, `wip_limit` and `bounce_limit` non-negative integers, the path rules of D10), `people` (D14), `teams` (D11), `compliance` (each profile an object; a `retention_days` present is an object of non-negative numbers; a missing period is the placeholder and denies in the rules), `routing` (a non-empty object of lower-case class keys, each exactly `{endpoints}`), `subscription` (`contexts` and `classes`; `runners` an object of exactly `{plans, workspace?}`, with `workspace` absent, `null` or a name) and `publish` (`cleared_classes`). Every list is a list of names (non-empty strings with no spaces at the ends); an object where a list is expected is refused, because `in` would match its values. On the input side, every caller identifier compared with config or with another input (logins, `ticket.repo`, `run.repo`, the seat workspace and account) goes through one Rego helper, `named` in kod.rego, so a blank value is no value. Rego doesn't re-check what the gate guarantees. Any violation fails the load with an error naming the file, the entry and the problem. | One boundary owns config validity. A per-field deny in Rego only covers the fields someone remembered; a gate that runs before anything is decided refuses a bad config before it can skip a rule. Examples the gate closes: `"bounce_limit": "2"` (Rego orders every number below every string, so `bounces < "2"` always holds), a negative retention period, a mis-cased team key, a `requestor_approval` typo, and a `""` workspace that would match a seat reporting `""`. |
 
 **Action names** (D6, D7). The `input` fields are the contract each caller builds; Tasks 2 to 4 define them in full.
 
@@ -72,7 +72,7 @@ The modes follow [ADR 0001](../../adr/0001-per-task-execution-mode.md): a task t
 - New dependencies are limited to: `regorus = { version = "=0.13.0", default-features = false, features = ["std", "arc"] }` and `sha2 = "0.10"` in kod-policy. `anyhow`, `serde`, `serde_json` and the dev-dependency `tempfile` are already in the workspace.
 - Rego is v1 syntax (regorus's default: `if`, `contains`, `in`, `every`). Every Rego file is `package kod`. The Rust API reads only `data.kod.decision`.
 - Data lives under `data.config`: a data file `policy/<name>.json` is loaded as `data.config.<name>`. Rules live under `data.kod`, so no data file can shadow a rule.
-- `Policy::load` is the only place data files are validated (D16). A new data file, or a new value read by a rule, comes with its load check in `src/config.rs` and a test in `tests/config.rs`, unless a missing or malformed value can only make the rule deny.
+- `Policy::load` is the only place data files are validated (D16). A new data file, or a new value read by a rule, comes with its load check in `src/config.rs` and a test in `tests/config.rs`, with no exception for values the rules only test for membership.
 - Default deny: a request is allowed only through a `grant` body for its action, with an empty `deny` set. Every comparison between two input values guards one side with `is_string` (or `is_number`).
 - Rule names that define a single value are defined once. Where a value has fallbacks, use `else := ... if { ... }` chains: regorus doesn't support an `else` without a body.
 - No real values are invented. Unknown values are named `placeholder`, or left out so that the rule reading them denies.
@@ -82,7 +82,7 @@ The modes follow [ADR 0001](../../adr/0001-per-task-execution-mode.md): a task t
 
 1. **A missing, null or wrongly typed field** (an input that isn't an object, `null` ticket ids on both sides, `canceled` left out or `"false"` as a string, `data_classes` as a string) must deny, never allow. Pinned by Task 1 `input_that_is_not_an_object_is_denied` and `a_missing_or_unknown_action_is_denied`, and Task 2 `null_ids_never_match`, `publish_needs_an_explicit_live_run` and `an_unknown_or_missing_data_class_is_refused`.
 2. **A path written to dodge a path rule, or a diff that touches a high-risk path the ticket never named** (`./auth/x`, `Auth/x`, `auth\x`, ` auth/x`, `src/auth/x`, `src/../auth/x`, a path that isn't a string, `paths` or `changed_paths` given as a string or left out) must not lower the risk class: the ticket is raised or refused, and the publish is refused. A malformed, mis-keyed or un-normalised path-rule config, or an empty default list, is refused at load, never skipped. Pinned by Task 4 `path_tricks_cannot_dodge_a_path_rule` and `publish_refuses_a_diff_that_touches_a_high_risk_path`, and Task 1 `malformed_path_rule_config_fails_to_load`.
-3. **A placeholder or missing configuration value** (no recorded seat workspace, a `null` workspace sent by the caller, a compliance profile without the key, no active profile) must deny with a reason that names what is missing, and must never match a `null` in the input. A missing data file, or a value whose wrong shape could allow (a string limit, a negative retention period), fails the load. Pinned by Task 1 `every_data_file_the_rules_read_is_required`, `delegation_classes_and_limits_must_be_well_formed` and `retention_periods_must_be_non_negative_numbers`, Task 2 `subscription_is_refused_until_a_workspace_is_recorded` and `a_null_or_wrong_workspace_never_matches`, and Task 4 `retention_delete_is_refused_while_the_profile_is_a_placeholder` and `a_missing_value_in_any_active_profile_denies`.
+3. **A placeholder or missing configuration value** (no recorded seat workspace, a `null` workspace sent by the caller, a compliance profile without the key, no active profile) must deny with a reason that names what is missing, and must never match a `null` or blank string in the input. A missing data file, a blank or mis-shaped routing, subscription or publish value, or a value whose wrong shape could allow (a string limit, a negative retention period), fails the load. Pinned by Task 1 `every_data_file_the_rules_read_is_required`, `delegation_classes_and_limits_must_be_well_formed`, `retention_periods_must_be_non_negative_numbers` and `routing_subscription_and_publish_hold_only_names`, Task 4 `a_ticket_needs_a_repo`, Task 2 `subscription_is_refused_until_a_workspace_is_recorded` and `a_null_or_wrong_workspace_never_matches`, and Task 4 `retention_delete_is_refused_while_the_profile_is_a_placeholder` and `a_missing_value_in_any_active_profile_denies`.
 4. **A broken policy directory or an evaluation error** (empty or missing directory, Rego that doesn't parse, invalid JSON, no `decision` rule, a decision of the wrong shape, a builtin error at request time) must fail at load or deny with a `policy error` reason, never allow. Pinned by Task 1 `a_broken_policy_fails_to_load` and `evaluation_errors_deny`, and Task 4 `a_malformed_ticket_is_a_policy_error_deny`.
 5. **An agent approval, or the requester as the only approver**, must block a merge under the matching setting; an unknown or mis-keyed setting fails the load. Requester and approver logins that differ only in case are the same person, and so are teams. Pinned by Task 3 `agent_approvals_block_the_merge`, `not_sole_is_the_default_and_needs_another_human`, `forbidden_refuses_any_requester_approval`, `the_team_lookup_ignores_case_and_spaces` and `logins_compare_case_insensitively`, and Task 1 `team_settings_must_be_known_and_canonical`.
 6. **Publish outside its own scope** (another repo, a branch other than `agent/<ticket>-<run>`, a non-draft PR, a canceled run, `null` repos on both sides) must be refused. Pinned by Task 2 `publish_anywhere_else_is_refused`, `publish_needs_an_explicit_live_run` and `null_ids_never_match`.
@@ -130,7 +130,7 @@ docs/superpowers/plans/2026-10-14-phase1-overview.md        modify (Task 4): lin
 - Produces:
   - `kod_policy::Decision { pub allow: bool, pub reasons: Vec<String>, pub policy_version: String }`, deriving Debug, Clone, PartialEq, Eq and Serialize.
   - `kod_policy::Policy` (Send + Sync) with `pub fn load(dir: &Path) -> anyhow::Result<Policy>`, `pub fn version(&self) -> &str` and `pub fn decide(&self, input: &serde_json::Value) -> Decision`.
-  - Rego in `package kod`: `decision`, `allow`, `reasons`, `default grant := false`, `deny` (a set of strings), `known_actions`, `external`. Later tasks add `grant if { input.action == "<name>"; ... }` bodies and `deny contains ...` rules.
+  - Rego in `package kod`: `decision`, `allow`, `reasons`, `default grant := false`, `deny` (a set of strings), `known_actions`, `external`, and `named(s)` (a string that isn't blank), which every later rule uses before comparing a caller identifier with config or another input. Later tasks add `grant if { input.action == "<name>"; ... }` bodies and `deny contains ...` rules.
   - Test helpers in `tests/common/mod.rs`: `policy_dir() -> PathBuf`, `policy() -> &'static Policy`, `copy_policy() -> tempfile::TempDir`, `policy_with(file: &str, contents: Value) -> Policy`, `decide(Value) -> Decision`, `allowed(Value)`, `denied(Value, &str)`, `allowed_by(&Policy, Value)`, `denied_by(&Policy, Value, &str)`, `set(Value, &str, Value) -> Value`, `unset(Value, &str) -> Value`, `load_error(file: &str, contents: Option<Value>) -> String`, `data_only() -> tempfile::TempDir`.
   - The load gate (`src/config.rs`, D16): every data file and the shapes later tasks rely on. Later tasks read these values and may assume what D16 guarantees; they never re-check it in Rego.
 
@@ -580,6 +580,109 @@ fn retention_periods_must_be_non_negative_numbers() {
         );
     }
 }
+
+#[test]
+fn routing_subscription_and_publish_hold_only_names() {
+    // A name is a non-empty string with no spaces at the ends. An object
+    // where a list is expected is refused: `in` would match its values.
+    let names = "must be a list of non-empty names with no spaces at the ends";
+    let runner = |r: Value| json!({"codex": r});
+    let cases = [
+        (
+            "routing.json",
+            "classes",
+            json!({}),
+            "classes must be a non-empty object".to_string(),
+        ),
+        (
+            "routing.json",
+            "classes",
+            json!({"placeholder": {"endpoints": {"a": "placeholder"}}}),
+            format!("classes.placeholder.endpoints {names}"),
+        ),
+        (
+            "routing.json",
+            "classes",
+            json!({"placeholder": {"endpoints": [""]}}),
+            format!("classes.placeholder.endpoints {names}"),
+        ),
+        (
+            "routing.json",
+            "classes",
+            json!({"placeholder": {"endpoints": ["x"], "x": 1}}),
+            "classes.placeholder: unexpected key x".to_string(),
+        ),
+        (
+            "routing.json",
+            "classes",
+            json!({" placeholder": {"endpoints": ["x"]}}),
+            "class key \" placeholder\" must be lower-case with no spaces".to_string(),
+        ),
+        (
+            "subscription.json",
+            "contexts",
+            json!(["offline_eval", " "]),
+            format!("contexts {names}"),
+        ),
+        (
+            "subscription.json",
+            "classes",
+            json!("placeholder"),
+            format!("classes {names}"),
+        ),
+        (
+            "subscription.json",
+            "runners",
+            json!([]),
+            "runners must be an object".to_string(),
+        ),
+        (
+            "subscription.json",
+            "runners",
+            runner(json!({"plans": {"x": "business"}})),
+            format!("runners.codex.plans {names}"),
+        ),
+        (
+            "subscription.json",
+            "runners",
+            runner(json!({"plans": ["business", ""]})),
+            format!("runners.codex.plans {names}"),
+        ),
+        (
+            "subscription.json",
+            "runners",
+            runner(json!({"plans": ["business"], "workspace": ""})),
+            "runners.codex.workspace must be null or a name".to_string(),
+        ),
+        (
+            "subscription.json",
+            "runners",
+            runner(json!({"plans": ["business"], "workspace": " "})),
+            "runners.codex.workspace must be null or a name".to_string(),
+        ),
+        (
+            "subscription.json",
+            "runners",
+            runner(json!({"plans": ["business"], "worksapce": "ws-1"})),
+            "runners.codex: unexpected key worksapce".to_string(),
+        ),
+        (
+            "publish.json",
+            "cleared_classes",
+            json!({"a": "placeholder"}),
+            format!("cleared_classes {names}"),
+        ),
+        (
+            "publish.json",
+            "cleared_classes",
+            json!([""]),
+            format!("cleared_classes {names}"),
+        ),
+    ];
+    for (file, key, value, problem) in cases {
+        assert_refused(error_with(file, key, value), file, &problem);
+    }
+}
 ```
 
 `crates/kod-policy/tests/api.rs`:
@@ -781,6 +884,14 @@ Expected: FAIL. Every test that loads a policy panics with "not implemented" (`p
 package kod
 
 decision := {"allow": allow, "reasons": reasons}
+
+# An identifier from the caller (login, repo, workspace) that is a string
+# and not blank. Every comparison of such an input with config or with
+# another input goes through this, so "" never matches "".
+named(s) if {
+	is_string(s)
+	trim_space(s) != ""
+}
 
 default allow := false
 
@@ -1118,12 +1229,10 @@ impl Policy {
 
 ```rust
 //! The load-time gate for the data files, run before Rego sees them. Every
-//! file the rules read must be present, and every value whose wrong shape
-//! would let a request through, or make a rule silently match nothing that it
-//! should, is checked here. The rest the rules only test for membership
-//! (routing classes and endpoints, subscription contexts, classes, runners
-//! and plans, publish cleared classes): missing or malformed, they match
-//! nothing and the request is denied.
+//! file the rules read must be present, and every value the rules read is
+//! checked here, so no `data.config` value reaches Rego without passing it.
+//! "Membership only" is not safe on its own: `"" == ""` matches, and `in` on
+//! an object matches its values.
 
 use std::collections::BTreeSet;
 
@@ -1150,7 +1259,76 @@ pub(crate) fn check(data: &Map<String, Value>) -> Result<()> {
     delegation(&data["delegation"])?;
     people(&data["people"])?;
     teams(&data["teams"])?;
-    compliance(&data["compliance"])
+    compliance(&data["compliance"])?;
+    routing(&data["routing"])?;
+    subscription(&data["subscription"])?;
+    names(
+        "publish.json: cleared_classes",
+        data["publish"].get("cleared_classes"),
+    )
+}
+
+/// A non-empty string with no spaces at the ends.
+fn name(v: &Value) -> bool {
+    v.as_str().is_some_and(|s| !s.is_empty() && s == s.trim())
+}
+
+/// A list (not an object: `in` would match its values) of names.
+fn names(at: &str, v: Option<&Value>) -> Result<()> {
+    if !v
+        .and_then(Value::as_array)
+        .is_some_and(|l| l.iter().all(name))
+    {
+        bail!("{at} must be a list of non-empty names with no spaces at the ends");
+    }
+    Ok(())
+}
+
+/// An object whose keys are all in `allowed`.
+fn only_keys<'a>(at: &str, v: &'a Value, allowed: &[&str]) -> Result<&'a Map<String, Value>> {
+    let o = v
+        .as_object()
+        .with_context(|| format!("{at} must be an object"))?;
+    if let Some(key) = o.keys().find(|k| !allowed.contains(&k.as_str())) {
+        bail!("{at}: unexpected key {key}");
+    }
+    Ok(o)
+}
+
+fn routing(r: &Value) -> Result<()> {
+    let classes = r
+        .get("classes")
+        .and_then(Value::as_object)
+        .filter(|c| !c.is_empty())
+        .context("routing.json: classes must be a non-empty object")?;
+    for (class, route) in classes {
+        if !canonical_key(class) || class.is_empty() {
+            bail!("routing.json: class key {class:?} must be lower-case with no spaces");
+        }
+        let at = format!("routing.json: classes.{class}");
+        let route = only_keys(&at, route, &["endpoints"])?;
+        names(&format!("{at}.endpoints"), route.get("endpoints"))?;
+    }
+    Ok(())
+}
+
+fn subscription(s: &Value) -> Result<()> {
+    names("subscription.json: contexts", s.get("contexts"))?;
+    names("subscription.json: classes", s.get("classes"))?;
+    let runners = s
+        .get("runners")
+        .and_then(Value::as_object)
+        .context("subscription.json: runners must be an object")?;
+    for (runner, seat) in runners {
+        let at = format!("subscription.json: runners.{runner}");
+        let seat = only_keys(&at, seat, &["plans", "workspace"])?;
+        names(&format!("{at}.plans"), seat.get("plans"))?;
+        // Absent or null: no workspace recorded yet, so the rules refuse the runner.
+        if !seat.get("workspace").is_none_or(|w| w.is_null() || name(w)) {
+            bail!("{at}.workspace must be null or a name");
+        }
+    }
+    Ok(())
 }
 
 /// The same normalisation as `path_segments` in policy/delegation.rego
@@ -1329,7 +1507,7 @@ If `policy_is_send_and_sync` fails to compile, `regorus::Engine` isn't `Send` ev
 - [ ] **Step 8: Run the tests to verify they pass**
 
 Run: `cargo test -p kod-policy --test api --test config`
-Expected: PASS (`api` 10, `config` 6).
+Expected: PASS (`api` 10, `config` 7).
 
 - [ ] **Step 9: Check licenses and lints**
 
@@ -1569,13 +1747,24 @@ fn null_ids_never_match() {
     denied(read, "does not meet the rule");
 
     // Everything else about this publish is valid: only the repo guard can refuse it.
-    let publish = set(
+    let null_repo = set(
         set(publish(), "/run/repo", Value::Null),
         "/target/repo",
         Value::Null,
     );
-    let d = decide(publish);
+    let d = decide(null_repo);
     assert!(!d.allow, "{d:?}");
+
+    // A blank repo is no repo, even when the target repeats it.
+    for blank in ["", "  "] {
+        let blank_repo = set(
+            set(publish(), "/run/repo", json!(blank)),
+            "/target/repo",
+            json!(blank),
+        );
+        let d = decide(blank_repo);
+        assert!(!d.allow, "{d:?}");
+    }
 }
 
 // tracker_write
@@ -1823,8 +2012,9 @@ sub_class_ok(c) if c in data.config.subscription.classes
 seat_ok if {
 	sub_plan_ok
 	is_string(sub_runner.workspace)
+	named(input.seat.workspace)
 	input.seat.workspace == sub_runner.workspace
-	is_string(input.seat.account)
+	named(input.seat.account)
 }
 
 grant if {
@@ -1954,7 +2144,7 @@ grant if {
 	input.action == "publish"
 	is_agent
 	live_run
-	is_string(input.run.repo)
+	named(input.run.repo)
 	input.target.repo == input.run.repo
 	input.target.branch == run_branch
 	input.target.draft == true
@@ -2120,6 +2310,14 @@ fn a_merge_needs_a_named_requester() {
     let null_requester =
         json!({"action": "merge", "team": "core", "requester": null, "approvals": [human("bob")]});
     denied(null_requester, "does not meet the rule");
+    for blank in ["", "  "] {
+        let p = team_setting("forbidden");
+        denied_by(
+            &p,
+            set(merge(vec![human("bob")]), "/requester", json!(blank)),
+            "does not meet the rule",
+        );
+    }
 }
 
 // harness_change
@@ -2292,15 +2490,15 @@ requester_rule := object.get(team_settings(input.team), "requester_approval", de
 
 human_approval(a) if {
 	a.agent == false
-	is_string(a.login)
+	named(a.login)
 }
 
 # GitHub logins are case-insensitive, so every login is compared lower-cased.
 human_approvers := {lower(a.login) | some a in input.approvals; human_approval(a)}
 
-requester_login := lower(input.requester) if is_string(input.requester)
+requester_login := lower(input.requester) if named(input.requester)
 
-actor_login := lower(input.actor.login) if is_string(input.actor.login)
+actor_login := lower(input.actor.login) if named(input.actor.login)
 
 requester_approved if requester_login in human_approvers
 
@@ -2704,6 +2902,14 @@ fn admission_needs_criteria_capacity_and_bounces_left() {
 }
 
 #[test]
+fn a_ticket_needs_a_repo() {
+    denied(unset(delegate(), "/ticket/repo"), "ticket has no repo");
+    for repo in [Value::Null, json!(""), json!("  ")] {
+        denied(set(delegate(), "/ticket/repo", repo), "ticket has no repo");
+    }
+}
+
+#[test]
 fn a_malformed_ticket_is_a_policy_error_deny() {
     let d = decide(json!({"action": "delegate", "ticket": "KOD-1", "wip_in_progress": 0}));
     assert!(!d.allow, "{d:?}");
@@ -2906,9 +3112,9 @@ ticket_paths := object.get(object.get(input, "ticket", {}), "paths", [])
 # other key, and any rule that isn't exactly {prefix, class} with a known
 # class). GitHub names are case-insensitive, so the lookup lower-cases and
 # trims the repo.
-repo_rules(repo) := object.get(data.config.delegation.repo_path_rules, lower(trim_space(repo)), []) if is_string(repo)
+repo_rules(repo) := object.get(data.config.delegation.repo_path_rules, lower(trim_space(repo)), []) if named(repo)
 
-repo_rules(repo) := [] if not is_string(repo)
+repo_rules(repo) := [] if not named(repo)
 
 rules_for(repo) := array.concat(data.config.delegation.default_path_rules, repo_rules(repo))
 
@@ -2968,7 +3174,7 @@ has_criteria if input.ticket.acceptance_criteria == true
 
 grant if {
 	input.action == "delegate"
-	is_string(input.ticket.repo)
+	named(ticket_repo)
 	is_array(ticket_paths)
 	count(bad_paths) == 0
 	class_delegated
@@ -2983,7 +3189,7 @@ grant if {
 
 deny contains "ticket has no repo" if {
 	input.action == "delegate"
-	not is_string(ticket_repo)
+	not named(ticket_repo)
 }
 
 deny contains "ticket has no risk class" if {
@@ -3124,7 +3330,7 @@ to:
 - [ ] **Step 6: Run the whole suite and the CI checks**
 
 Run: `cargo fmt --all --check && cargo clippy --all-targets -- -D warnings && cargo test --all`
-Expected: all pass. `kod-policy` runs `api` (10), `config` (6), `agent_ops` (15), `human_ops` (10) and `delegation` (13) tests.
+Expected: all pass. `kod-policy` runs `api` (10), `config` (7), `agent_ops` (15), `human_ops` (10) and `delegation` (14) tests.
 
 - [ ] **Step 7: Commit**
 
@@ -3157,7 +3363,7 @@ After Task 4, one fresh reviewer reads the whole branch against the spec section
   - Credential exception and eligibility check: offline contexts only, business plans, recorded workspace (Task 2, D13).
   - Ownership: owner and backup for harness changes and restart; owner, backup and tech leads for the kill switch (Task 3, D14).
   - Matrix rows for `delegate` and `retention_delete` (Task 4, D7), each with tests.
-  - Config validity: `Policy::load` is the one gate for every data file (Task 1, D16). Each `data.config` value the Rego reads was checked: `delegation`, `people`, `teams` and `compliance` retention values are validated at load; routing, subscription, publish and a missing retention period are membership or presence tests that deny when missing or malformed.
+  - Config validity: `Policy::load` is the one gate for every data file (Task 1, D16). Every `data.config` value the Rego reads is validated at load, routing, subscription and publish included (an earlier draft left them to membership tests, which `"" == ""` and `in` over an object defeat). A missing retention period is the one value left to the rules, which deny. Blank caller identifiers are refused by the one `named` helper.
   - Policy version as a content hash for the audit log (Task 1, D4). regorus pinned and its license checked (Task 1, D2).
 - **Placeholders.** The only placeholder values are the configuration ones the scope asks for (`placeholder` class, endpoint and profile, no recorded workspace, `backup: null`, `tech_leads: []`, `teams: {}`), and each is pinned by a test. No plan step is left open.
 - **Type consistency.**
