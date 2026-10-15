@@ -231,3 +231,23 @@ fn values_stop_at_closing_brackets() {
         format!("(token={REDACTED})")
     );
 }
+
+#[test]
+fn brackets_inside_a_secret_do_not_end_it() {
+    for (text, want) in [
+        ("password=abc)def", format!("password={REDACTED}")),
+        ("password=abc]def", format!("password={REDACTED}")),
+        ("password=abc}def", format!("password={REDACTED}")),
+        ("--password=ab)cd", format!("--password={REDACTED}")),
+        (
+            "Authorization: Basic abc)def",
+            format!("Authorization: {REDACTED}"),
+        ),
+        (
+            r#"{"api_key":abcdef123456}"#,
+            format!(r#"{{"api_key":{REDACTED}}}"#),
+        ),
+    ] {
+        assert_eq!(redact(text), want, "{text}");
+    }
+}
