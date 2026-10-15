@@ -885,9 +885,10 @@ package kod
 
 decision := {"allow": allow, "reasons": reasons}
 
-# An identifier from the caller (login, repo, workspace) that is a string
-# and not blank. Every comparison of such an input with config or with
-# another input goes through this, so "" never matches "".
+# An identifier from the caller (a login, repo, workspace, ticket, run or
+# doc id) that is a string and not blank. Every rule that compares such an
+# input with config or with another input checks it with this first, so ""
+# never matches "".
 named(s) if {
 	is_string(s)
 	trim_space(s) != ""
@@ -1755,6 +1756,27 @@ fn null_ids_never_match() {
     let d = decide(null_repo);
     assert!(!d.allow, "{d:?}");
 
+    // A blank ticket or run id is no id, even when the input repeats it.
+    let blank_read = set(
+        req("read", json!({"target": {"kind": "ticket", "id": ""}})),
+        "/run/ticket",
+        json!(""),
+    );
+    denied(blank_read, "does not meet the rule");
+    for (ticket, id) in [("", "r1"), ("KOD-1", ""), ("", "")] {
+        let blank_ids = set(
+            set(
+                set(publish(), "/run/ticket", json!(ticket)),
+                "/run/id",
+                json!(id),
+            ),
+            "/target/branch",
+            json!(format!("agent/{ticket}-{id}")),
+        );
+        let d = decide(blank_ids);
+        assert!(!d.allow, "{d:?}");
+    }
+
     // A blank repo is no repo, even when the target repeats it.
     for blank in ["", "  "] {
         let blank_repo = set(
@@ -2070,7 +2092,7 @@ grant if {
 	input.action == "read"
 	is_agent
 	input.target.kind == "ticket"
-	is_string(input.run.ticket)
+	named(input.run.ticket)
 	input.target.id == input.run.ticket
 }
 
@@ -2078,7 +2100,7 @@ grant if {
 	input.action == "read"
 	is_agent
 	input.target.kind == "doc"
-	is_string(input.target.id)
+	named(input.target.id)
 	input.target.id in input.run.linked_docs
 }
 
@@ -2086,12 +2108,12 @@ grant if {
 # linked to it; create a request linked to the run's ticket.
 
 own_or_linked(t) if {
-	is_string(t)
+	named(t)
 	t == input.run.ticket
 }
 
 own_or_linked(t) if {
-	is_string(t)
+	named(t)
 	t in input.run.linked_tickets
 }
 
@@ -2108,7 +2130,7 @@ grant if {
 	is_agent
 	live_run
 	input.kind == "create_linked"
-	is_string(input.run.ticket)
+	named(input.run.ticket)
 	input.target.parent == input.run.ticket
 }
 
@@ -2126,7 +2148,7 @@ grant if {
 	is_agent
 	live_run
 	input.target.folder == "draft"
-	is_string(input.run.id)
+	named(input.run.id)
 	input.target.owner_run == input.run.id
 }
 
@@ -2134,8 +2156,8 @@ grant if {
 # only data classes cleared for publish.
 
 run_branch := sprintf("agent/%s-%s", [input.run.ticket, input.run.id]) if {
-	is_string(input.run.ticket)
-	is_string(input.run.id)
+	named(input.run.ticket)
+	named(input.run.id)
 }
 
 publish_class_ok(c) if c in data.config.publish.cleared_classes
@@ -2377,12 +2399,22 @@ fn who_may_cancel_a_run_or_pull_the_kill_switch() {
     );
     denied(
         set(
-            set(cancel("run", label), "/run/id", Value::Null),
+            set(cancel("run", label.clone()), "/run/id", Value::Null),
             "/target/run",
             Value::Null,
         ),
         "does not meet the rule",
     );
+    for blank in ["", "  "] {
+        denied(
+            set(
+                set(cancel("run", label.clone()), "/run/id", json!(blank)),
+                "/target/run",
+                json!(blank),
+            ),
+            "does not meet the rule",
+        );
+    }
     denied(cancel("run", stranger.clone()), "does not meet the rule");
     denied(cancel("all", stranger), "does not meet the rule");
     denied(
@@ -2597,7 +2629,7 @@ grant if {
 	input.action == "cancel"
 	input.scope == "run"
 	input.actor.kind == "label_removal"
-	is_string(input.run.id)
+	named(input.run.id)
 	input.target.run == input.run.id
 }
 
