@@ -14,9 +14,18 @@ team_settings(team) := object.get(data.config.teams, lower(trim_space(team)), {}
 
 requester_rule := object.get(team_settings(input.team), "requester_approval", default_requester_approval)
 
+# Match the configuration gate: logins are non-empty and contain no whitespace.
+valid_login(s) if {
+	is_string(s)
+	s != ""
+	every c in split(s, "") {
+		trim_space(c) == c
+	}
+}
+
 human_approval(a) if {
 	a.agent == false
-	named(a.login)
+	valid_login(a.login)
 }
 
 # GitHub logins are case-insensitive, so every login is compared lower-cased.
@@ -26,9 +35,9 @@ human_approvers := {lower(a.login) |
 	human_approval(a)
 }
 
-requester_login := lower(input.requester) if named(input.requester)
+requester_login := lower(input.requester) if valid_login(input.requester)
 
-actor_login := lower(input.actor.login) if named(input.actor.login)
+actor_login := lower(input.actor.login) if valid_login(input.actor.login)
 
 requester_approved if requester_login in human_approvers
 

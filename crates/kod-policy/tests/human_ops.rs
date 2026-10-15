@@ -256,6 +256,66 @@ fn logins_compare_case_insensitively() {
 }
 
 #[test]
+fn whitespace_cannot_turn_self_approval_into_another_person() {
+    for rule in ["not_sole", "forbidden"] {
+        let p = team_setting(rule);
+        for (requester, approver) in [("alice", "alice "), (" alice", "alice")] {
+            let input = json!({"action": "merge", "team": "core", "requester": requester,
+                               "approvals": [human(approver)]});
+            assert!(!p.decide(&input).allow, "{rule}: {input}");
+        }
+    }
+}
+
+#[test]
+fn malformed_requester_logins_are_refused_for_every_team_setting() {
+    for rule in ["allowed", "not_sole", "forbidden"] {
+        let p = team_setting(rule);
+        for login in [
+            "alice ",
+            " alice",
+            "ali ce",
+            "alice\t",
+            "alice\n",
+            "alice\u{a0}",
+        ] {
+            let input = set(merge(vec![human("bob")]), "/requester", json!(login));
+            assert!(!p.decide(&input).allow, "{rule}: {input}");
+        }
+    }
+}
+
+#[test]
+fn malformed_approvals_are_refused_even_with_another_valid_human() {
+    for login in [
+        "alice ",
+        " alice",
+        "ali ce",
+        "alice\t",
+        "alice\n",
+        "alice\u{a0}",
+    ] {
+        denied(
+            merge(vec![human("bob"), human(login)]),
+            "agents never approve",
+        );
+        denied(
+            harness(vec![human("kiennt23"), human(login)]),
+            "agents never approve",
+        );
+    }
+}
+
+#[test]
+fn malformed_actor_logins_cannot_cancel_or_resume() {
+    for login in ["kiennt23 ", " kiennt23", "kiennt23\t", "kiennt23\u{a0}"] {
+        let actor = json!({"kind": "human", "login": login});
+        denied(cancel("all", actor.clone()), "does not meet the rule");
+        denied(resume(actor), "does not meet the rule");
+    }
+}
+
+#[test]
 fn approvals_must_be_a_list() {
     let obj = json!({"x": {"login": "bob", "agent": false}});
     denied(
