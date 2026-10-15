@@ -181,6 +181,9 @@ fn path_tricks_cannot_dodge_a_path_rule() {
         "auth\\login.rs",
         " auth/x",
         "src/./auth/x",
+        "auth",
+        "auth/",
+        "src/auth",
     ] {
         denied(
             set(delegate(), "/ticket/paths", json!([path])),
@@ -193,6 +196,12 @@ fn path_tricks_cannot_dodge_a_path_rule() {
             "is not a clean repo-relative path",
         );
     }
+    // a longer name that merely starts with a rule's text is not that directory
+    allowed(set(
+        delegate(),
+        "/ticket/paths",
+        json!(["authx/y", "src/authx"]),
+    ));
     denied(
         set(delegate(), "/ticket/paths", json!([5])),
         "is not a clean repo-relative path",
@@ -409,6 +418,7 @@ fn publish_refuses_a_diff_that_touches_a_high_risk_path() {
         "./AUTH/login.rs",
         "src/auth/login.rs",
         ".github/workflows/ci.yml",
+        "auth",
     ] {
         denied(
             publish(json!(["src/lib.rs", path])),

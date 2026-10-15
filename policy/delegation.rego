@@ -44,9 +44,11 @@ bad_path(p) if ".." in path_segments(p)
 
 # A rule matches at the top of the repo or below any directory, so
 # src/auth/x is raised like auth/x.
-path_matches(cp, prefix) if startswith(cp, prefix)
+# The path gets a trailing / so a path equal to a directory rule (auth, src/auth)
+# matches its auth/ prefix; authx still does not.
+path_matches(cp, prefix) if startswith(concat("", [cp, "/"]), prefix)
 
-path_matches(cp, prefix) if contains(cp, concat("", ["/", prefix]))
+path_matches(cp, prefix) if contains(concat("", ["/", cp, "/"]), concat("", ["/", prefix]))
 
 bad_paths_in(paths) := {p | some p in paths; bad_path(p)}
 
