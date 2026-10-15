@@ -215,9 +215,10 @@ pub fn run(cfg: &Config, prompt: &str, trace: &mut dyn Write) -> Outcome {
                 "duration_ms": ms(started),
             });
             if name == "run" {
-                // Only the start: a heredoc would put file contents in the trace.
+                // Only the first line: a heredoc body is file contents.
                 let cmd = c["input"]["command"].as_str().unwrap_or("");
-                e["command"] = json!(api::head(cmd, 200));
+                let first = cmd.lines().next().unwrap_or("");
+                e["command"] = json!(api::head(first, 200));
                 e["command_bytes"] = json!(cmd.len());
             }
             event(trace, e);

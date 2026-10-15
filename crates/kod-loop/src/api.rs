@@ -50,7 +50,9 @@ impl Client {
             .get(reqwest::header::RETRY_AFTER)
             .and_then(|v| v.to_str().ok()?.parse::<u64>().ok())
             .map(|secs| Duration::from_secs(secs).min(MAX_RETRY_AFTER));
-        let text = r.text().unwrap_or_default();
+        let text = r.text().map_err(|e| {
+            ApiError::Transient(format!("{status}: reading the body: {e}"), retry_after)
+        })?;
         let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
         let why = format!("{status}: {}", head(&text, 500));
         if status.is_success() {

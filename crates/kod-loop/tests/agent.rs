@@ -359,7 +359,7 @@ fn retry_after_is_honoured_when_longer_than_the_backoff() {
 #[test]
 fn the_trace_keeps_only_the_start_of_a_command() {
     let ws = tempfile::tempdir().unwrap();
-    let long = format!("cat > f.txt <<'EOF'\n{}\nEOF", "s".repeat(1000));
+    let long = format!("echo {}", "s".repeat(1000));
     let (url, _m) = model(vec![
         msg(
             json!([tool("t1", "run", json!({"command": long}))]),
@@ -421,4 +421,57 @@ fn old_tool_results_are_elided_once_the_context_is_large() {
         .unwrap();
     assert!(big.len() > 20_000, "the newest result is sent whole");
     assert_eq!(b[2]["messages"][2]["content"][0]["content"], ELIDED);
+}
+
+#[test]
+fn the_trace_cuts_a_command_at_its_first_line() {
+    let ws = tempfile::tempdir().unwrap();
+    let cmd = "cat > f.txt <<'EOF'\nSECRET-BODY\nEOF";
+    let (url, _m) = model(vec![
+        msg(
+            json!([tool("t1", "run", json!({"command": cmd}))]),
+            "tool_use",
+        ),
+        msg(
+            json!([tool(
+                "t2",
+                "finish",
+                json!({"state": "done", "summary": "ok"})
+            )]),
+            "tool_use",
+        ),
+    ]);
+    let (_, trace) = go(&config(&url, ws.path()), "t");
+    assert_eq!(trace[1]["command"], "cat > f.txt <<'EOF'");
+    assert_eq!(trace[1]["command_bytes"], cmd.len());
+    assert!(!trace.iter().any(|e| e.to_string().contains("SECRET-BODY")));
+}
+
+#[test]
+fn a_failed_body_read_is_retried_not_taken_as_budget() {
+    use std::io::{Read, Write};
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", l.local_addr().unwrap());
+    let good = msg(json!([text("done")]), "end_turn").1.to_string();
+    std::thread::spawn(move || {
+        for i in 0..2 {
+            let (mut s, _) = l.accept().unwrap();
+            // Read the request head and body in one go (it is small).
+            let mut buf = [0; 65536];
+            let _ = s.read(&mut buf);
+            let reply = if i == 0 {
+                // Declares 100 bytes, sends 5, then closes: the body read fails.
+                "HTTP/1.1 429 Too Many Requests\r\ncontent-length: 100\r\n\r\nshort".to_string()
+            } else {
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{good}",
+                    good.len()
+                )
+            };
+            let _ = s.write_all(reply.as_bytes());
+        }
+    });
+    let ws = tempfile::tempdir().unwrap();
+    let (o, _) = go(&config(&url, ws.path()), "t");
+    assert_eq!((o.end_state, o.turns), (EndState::Done, 2), "{:?}", o.error);
 }

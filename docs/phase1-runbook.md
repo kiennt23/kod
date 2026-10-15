@@ -47,6 +47,8 @@ Never look at held-out cases while tuning.
 
 ## Held-out comparison
 
+KOD_MAX_TOKENS must not exceed the model's maximum output tokens; kod-loop does not stream, so a very large cap risks the 600 s request timeout and its retries.
+
 Run once, with the same model id, `KOD_UPSTREAM` and proxy limits (`KOD_MAX_*`)
 as the baseline (`compare` refuses anything else), and with images built from
 the same BASE and pins: `evals/VERSIONS.md` must not have changed between the
