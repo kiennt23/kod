@@ -569,6 +569,14 @@ Agent code runs only in the top zone. Everything it does outside goes through th
 
 **Not recorded:** system calls and file reads inside the sandbox. If evidence must cover those, add sandbox-level tracing later.
 
+### Sandbox isolation
+
+Docker containers share the host kernel. A kernel bug or a container escape would reach the host. For real repos in a regulated setting, that is the weakest layer. gVisor gives each container its own user-space kernel.
+
+- Phase 0 and the offline evals keep plain Docker containers. That is acceptable on sanitized repos.
+- Before the connected pilot (phase 1, step 6b), sandbox containers run under gVisor (`--runtime=runsc`). It is a drop-in Docker runtime: one setting in kod-eval's sandbox args, plus a check that builds and tests still pass under it.
+- If stronger isolation is needed later, the path is a microVM per run: Firecracker or Kata Containers. Host setup is more involved. All other controls stay as they are.
+
 ### Action and permission matrix
 
 Every operation Kod can perform, where it is enforced and what happens when it is refused. An operation not listed here is refused.
@@ -673,3 +681,5 @@ roadmap · 4 phases, gated, not to scale
 - Harness language: Rust for everything we build
 
 - Owner and Rust reviewer: the author of this doc
+
+- Sandbox isolation: plain Docker for phase 0 and offline evals; gVisor (`runsc`) before the connected pilot; a microVM per run (Firecracker or Kata) if stronger isolation is needed later
