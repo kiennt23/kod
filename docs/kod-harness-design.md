@@ -384,6 +384,40 @@ The tracker connects to the harness in two places, so pluggability needs two pie
 
 **Plan:** phase 0 uses Claude Code headless to set the baseline. From phase 1 our own Rust loop is the default runner, built to this contract. Claude Code and Codex stay as conforming runners for comparison and fallback. Phase 2 (IDE) is mostly configuration: the IDE agent points at the same gateway and reads the same AGENTS.md and skills.
 
+## Subscription auth for vendor runners
+
+**Decision:** the owner approved subscription auth for the vendor runners (Claude Code, Codex CLI, Cursor CLI), so the team can use the plans it already pays for instead of per-token API billing. The runner contract gets an auth mode. `api_key` sends model traffic through kod-llm-proxy, as today. `subscription` uses the vendor's own login on a dedicated business seat. kod-loop always uses `api_key` or a cloud provider, because only vendor tools can use a subscription login.
+
+| Tool | Log in once | How each run gets it | Proxy in path? |
+| --- | --- | --- | --- |
+| Claude Code | `claude setup-token` gives a long-lived headless token | Preferred: the proxy injects the token as the request credential, so the sandbox never holds it. Fallback: `CLAUDE_CODE_OAUTH_TOKEN` passed by name | Yes, in the preferred setup |
+| Codex CLI | `codex login` on a ChatGPT plan writes `~/.codex/auth.json`, which refreshes itself | A read-only copy per run. A dedicated host login owns the refresh | To be checked in the spike |
+| Cursor CLI | Create `CURSOR_API_KEY` once in the dashboard | Passed by name | No. Cursor runs models on its own servers. Egress opens to Cursor's domains only |
+
+**Controls:**
+
+- Log in once, not per run. Credentials are stored once on the host and handled like the model key: never on a command line, never in results, and stopped by the kill switch.
+- kod-eval checks every credential before a run. If one has expired or been revoked, it stops with a clear "log in again" message.
+- When the credential is inside the sandbox (Codex, Cursor), egress is allowed only to that vendor's domains, and each run is bounded by its timeout.
+- The run manifest records the auth mode. `kod-eval compare` already refuses runs whose model endpoint or limits differ. It also refuses runs whose auth mode differs.
+- The routing policy decides where subscription mode is allowed. Example: offline evals and low-risk tickets. Restricted data never, unless the plan's data terms cover it.
+
+**What is lost when the proxy can't be in the path:** the per-run model allowlist, token caps, request budget and token counts. What remains is the vendor plan limits plus Kod's turn limit, timeout and kill switch.
+
+**Identity and plans:**
+
+- Use a dedicated business seat for Kod, never a personal one. The audit log records that seat.
+- Business plans only: Claude Team or Enterprise with Claude Code, ChatGPT Business or Enterprise, Cursor Business. Personal plans fail the compliance profile.
+- Before relying on automated use of a seat, confirm with each vendor that it is allowed. This is an open item.
+
+**Spike before building.** For each of the 3 tools, inside the Kod sandbox, verify:
+
+- [ ] Headless login works with no browser
+- [ ] The token's lifetime and refresh behaviour
+- [ ] Whether traffic can go through kod-llm-proxy (Claude Code: the proxy injects the subscription token; Codex: whether subscription traffic can be routed; Cursor: expected no)
+- [ ] What the tool reports for usage and cost
+- [ ] That expiry is detected
+
 ## RAG: not in v1
 
 **Decision:** no vector RAG in v1. The agent finds context with agentic search: Drive search and issue tracker search through MCP, and grep over the approved snapshots in the repo.
@@ -668,6 +702,10 @@ roadmap · 4 phases, gated, not to scale
 
 - [ ] Name the backup owner
 
+- [ ] Vendor terms: confirm with each vendor that automated use of a business seat is allowed
+
+- [ ] Which plans the team has (Claude, ChatGPT, Cursor)
+
 **Decided:**
 
 - Regimes and retention: configurable, through the compliance profile
@@ -683,3 +721,5 @@ roadmap · 4 phases, gated, not to scale
 - Owner and Rust reviewer: the author of this doc
 
 - Sandbox isolation: plain Docker for phase 0 and offline evals; gVisor (`runsc`) before the connected pilot; a microVM per run (Firecracker or Kata) if stronger isolation is needed later
+
+- Subscription auth: vendor runners can use a subscription login on a dedicated business seat (auth mode `subscription`); kod-loop always uses `api_key` or a cloud provider
