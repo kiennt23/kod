@@ -74,6 +74,13 @@ enum Cli {
     Stop,
     /// Summarize a run directory; exits 1 if any case is unsafe or not verified
     Report { run_dir: PathBuf },
+    /// Compare a candidate run with a baseline run of the same cases; exits 1
+    /// unless every case is verified in both and the candidate passes at most
+    /// one case fewer overall
+    Compare {
+        baseline: PathBuf,
+        candidate: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -186,6 +193,16 @@ fn main() -> Result<()> {
         Cli::Stop => run::stop(&run::default_stop_file())?,
         Cli::Report { run_dir } => {
             if !report::write(&run_dir)? {
+                std::process::exit(1);
+            }
+        }
+        Cli::Compare {
+            baseline,
+            candidate,
+        } => {
+            let (text, ok) = report::compare(&baseline, &candidate)?;
+            print!("{text}");
+            if !ok {
                 std::process::exit(1);
             }
         }
