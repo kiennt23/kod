@@ -21,17 +21,17 @@ These choices were left open by the spec and the overview. Each one is made here
 | D1 | A separate crate, `crates/kod-policy`, and a top-level `policy/` directory with the Rego and data files. Callers pass the directory to `Policy::load` at startup. Nothing is embedded in the binary. | The spec says policies are configuration in the harness repo, versioned and reviewed like code. Loading at runtime matches how kod-loop loads its prompt. The content hash (D4) says exactly which rules were used, whatever the build. |
 | D2 | regorus pinned to `=0.13.0` with `default-features = false, features = ["std", "arc"]`. License: `MIT AND Apache-2.0 AND BSD-3-Clause`, all three on the `deny.toml` allow list. The only non-optional transitive crates it adds beyond what we already use are `vstd`, `verus_builtin`, `verus_builtin_macros` and `verus_state_machines_macros` (all MIT), `spin` (MIT), `num-bigint`, `num-traits`, `lazy_static` and `thiserror` (MIT OR Apache-2.0). CI's existing cargo-deny step checks this on every push. | An exact pin, because a minor release of regorus can change Rego semantics (0.13.0 changed rule path handling). `arc` makes the engine `Send`, so the gateways can share a `Policy` across threads. Without default features we drop regex, glob, time, http, net, jsonschema and yaml builtins: the rules need only core builtins, and a smaller dependency tree is less to audit. Upgrades go through the owner, after the tests pass. |
 | D3 | The API is `Policy::load(&Path) -> anyhow::Result<Policy>`, `Policy::version(&self) -> &str` and `Policy::decide(&self, &serde_json::Value) -> Decision`, where `Decision { allow: bool, reasons: Vec<String>, policy_version: String }` (Serialize, for the audit record). The input is an untyped JSON object with an `"action"` field. `decide` never fails. | Four sub-plans will call this. Typed Rust input structs per action would repeat the Rego contract in a second place, and drift. The Rego checks every field it reads, and a missing or mistyped field is a deny. Returning a `Decision` instead of a `Result` means no caller can get the error path wrong: an error is a refusal with the error as its reason. |
-| D4 | `policy_version` is `sha256:<64 hex>` over the loaded files in file-name order, each as `name`, a NUL byte, its length as a u64 little-endian, then its bytes. Files that aren't loaded (anything other than `*.rego` and `*.json`, and subdirectories) aren't hashed. | The audit log (sub-plan 4) records this with each decision, so an auditor can find the exact rules. Hashing names and lengths means a rename or moving bytes between files changes the version. |
+| D4 | `policy_version` is `sha256:<64 hex>;regorus=<version>`. The hash covers the loaded files in file-name order, each as `name`, a NUL byte, its length as a u64 little-endian, then its bytes. Files that aren't loaded (anything other than `*.rego` and `*.json`, and subdirectories) aren't hashed. `REGORUS_VERSION` is a const kept equal to the pin by a test that reads `Cargo.lock`. `.gitattributes` has `policy/** text eol=lf`, so a CRLF checkout can't change the hash. Data files load as `data.config.<name>`, rules as `data.kod`, so a data file can never shadow a rule. | The audit log (sub-plan 4) records this with each decision, so an auditor can find the exact rules and engine. Hashing names and lengths means a rename or moving bytes between files changes the version. An engine bump with unchanged files is still a new version. |
 | D5 | Default deny by construction. `allow` is true only when some `grant` body for the action holds and the `deny` set is empty. Grants state every condition positively. Every comparison of two input values first checks that one side is a string (`is_string`), so `null == null` and missing-equals-missing never match. Deny rules explain refusals and can veto. With no matching deny reason, the reason is `<action>: the request does not meet the rule for this action`. | The usual "allow unless denied" style lets a missing field silently pass a `!=` check (undefined in Rego). A grant that lists what must be true can't be satisfied by leaving fields out. |
 | D6 | Each matrix row has one action name (table below). Two rows are enforced outside the policy engine: local commands (the sandbox) and sign and release (trusted CI runners). They are known actions that are always denied with the enforcer named. | Then every row has a policy answer and a test, and no caller can treat a policy allow as authority for something the policy doesn't enforce. |
 | D7 | Two actions are not matrix rows: `delegate` (the delegation policy, called by the dispatcher) and `retention_delete` (the compliance profile, called by the audit store). Both are in scope because the overview gives this sub-plan the delegation policy and the compliance profile. `retention_delete` is always denied while the profile is a placeholder. | The matrix lists what agents and humans do. Admission and record deletion are harness operations the spec puts under "Configurable policies". Whether to add them as matrix rows is an open item for the owner. |
 | D8 | Model routing: a run may use an endpoint only if it is allowed for **every** class the run read. An unknown class, an empty list or a missing list is refused. The placeholder table has one class, `placeholder`, with one endpoint, `placeholder`. | The spec says a run uses the strictest class of anything it read. Requiring the endpoint for every class is the same when the table is ordered strict-to-lenient, and never weaker when it isn't, and it needs no ranking of classes. The names say "not decided yet" so nobody mistakes them for real values (overview: one class and one endpoint until the routing values are set). |
 | D9 | Publish clearance is one team-wide list, `publish.cleared_classes` (placeholder: `["placeholder"]`). The publish rule checks repo, branch `agent/<ticket>-<run>`, draft, a live run and the run's classes. Refusing publish when the audit write fails, and idempotency, stay with the gateway (sub-plan 5). | One team, one set of repos: a per-repo list is a config shape for a problem we don't have yet (add it when a second repo with different clearance appears). The gateway writes the audit record of a decision before acting on it, so the policy can't see whether that write worked. |
-| D10 | Delegation: `risk_classes` ranks `low` 0, `medium` 1, `high` 2. The effective class is the highest of the ticket's class and every path rule it matches. A path rule matches when the path, lower-cased and with one leading `./` removed, starts with the rule's prefix. A path that isn't a string, or has an empty, `.` or `..` segment (so also a leading `/`), denies the ticket. Phase 1 delegates `low` and `medium`. Placeholder path rules: `auth/` (the spec's example) and `.github/` (CI) are `high`. `wip_limit` is 1 (overview placeholder) and `bounce_limit` is 2 (spec default). The dispatcher passes its current WIP count and bounce count; making admission atomic is its job. | Path rules only raise the class, so a path written to dodge a rule must be refused, not ignored. Rejecting unclean paths is simpler and safer than resolving them. The policy states the rule; the dispatcher (sub-plan 6) holds the lock. |
-| D11 | `requester_approval` is read per team from `teams.json` (`{"<team>": {"requester_approval": "..."}}`); a team with no setting gets `not_sole`. Only approvals with `"agent": false` and a string `login` count. Any other approval (an agent, or no flag) denies the merge outright. An unknown setting denies. `allowed`: at least one human approval. `not_sole`: at least one human approval from someone other than the requester. `forbidden`: at least one human approval, and the requester isn't among them. | The spec's three settings and default. An agent approval should never be on a PR at all, so its presence is a refusal, not just "doesn't count". |
+| D10 | Delegation: `risk_classes` ranks `low` 0, `medium` 1, `high` 2. The effective class is the highest of the ticket's class and every path rule it matches. Paths are normalised for matching: trimmed, lower-cased, `\` read as `/`, empty and `.` segments dropped. A rule matches at the repo root or below any directory (`src/auth/x` like `auth/x`). A path that isn't a string, is empty after normalising, or has a `..` segment is refused. Phase 1 delegates `low` and `medium`. `wip_in_progress` and `bounces` must be numbers `>= 0`. Placeholder path rules, all `high`, are the design's examples: `auth/`, `payments/`, `crypto/`, `migrations/`, `infra/`, `.github/`, `policy/`, `codeowners`. The harness itself is deferred to the real list. `wip_limit` is 1 (overview placeholder) and `bounce_limit` is 2 (spec default). **The ticket's paths are an early filter only.** `publish` carries the diff's `changed_paths`, and a changed path whose rule class isn't delegated refuses the publish, whatever the ticket said. The dispatcher passes its current WIP count and bounce count; making admission atomic is its job. | Path rules only raise the class, so a path written to dodge a rule must be raised or refused, not ignored. The ticket author picks the ticket's paths, so only the diff can enforce "a change that touches auth/ is high". The policy states the rule; the dispatcher (sub-plan 6) holds the lock. |
+| D11 | Logins are GitHub logins, compared lower-cased on both sides (GitHub logins are case-insensitive). Callers map tracker ids to GitHub logins before asking (sub-plan 7, through 6a's `is_team_member` mapping). `requester_approval` is read per team from `teams.json` (`{"<team>": {"requester_approval": "..."}}`); a team with no setting gets `not_sole`. Only approvals with `"agent": false` and a string `login` count. Any other approval (an agent, or no flag) denies the merge outright. An unknown setting denies. `allowed`: at least one human approval. `not_sole`: at least one human approval from someone other than the requester. `forbidden`: at least one human approval, and the requester isn't among them. | The spec's three settings and default. An agent approval should never be on a PR at all, so its presence is a refusal, not just "doesn't count". |
 | D12 | The compliance profile is `compliance.json`, `{"profiles": {"<name>": {...}}}`. The placeholder has one profile, `placeholder`, with no values. `retention_delete` is allowed only when every active profile has a numeric `retention_days.<record_type>` and the record is at least as old as the longest of them. Any missing value denies, and the reason names the profile and the key. | The spec: more than one profile can be active and the strictest wins; for retention that is the longest period. A missing value must refuse, so the placeholder refuses all deletion, as the overview asks for sub-plan 4. |
 | D13 | Vendor-login requests (`subscription_model_request`): allowed only in `offline_spike` or `offline_eval`, for runners `claude-code` (plans `team`, `enterprise`), `codex` (`business`, `enterprise`) and `cursor` (`business`), with a seat whose `workspace` equals the approved workspace recorded for that runner and a string `account`, and only for the classes in `subscription.classes` (placeholder `["placeholder"]`). No workspace is recorded yet, so every such request is denied with "no approved workspace is recorded for runner X". `kod-loop` has no seat and is always refused. | The spec's credential exception (offline only until security accepts more), the business plans it names, and its eligibility check (valid credentials for the wrong workspace are refused). An unrecorded workspace is a missing value, so it denies. |
-| D14 | `people.json` holds `owner` (`kiennt23`, the GitHub login), `backup` (`null` until named) and `tech_leads` (`[]`). `harness_change` needs a human approval from every named owner and backup (today the owner only). The kill switch (`cancel` with scope `all`) is the owner or backup. Cancelling one run is the owner, backup, a tech lead, or a label removal. | The spec's Ownership section: the owner holds the kill switch, the backup covers, and harness changes need both once the backup is named (overview). The matrix lists tech leads and label removal under cancel; a label removal cancels its own run only. |
+| D14 | `people.json` holds `owner` (`kiennt23`, the GitHub login), `backup` (`null` until named) and `tech_leads` (`[]`). `harness_change` needs a human approval from every named owner and backup (today the owner only). The kill switch (`cancel` with scope `all`) is the owner or backup. Cancelling one run is the owner, backup, a tech lead, or a label removal of that run's ticket (`target.run` equals `run.id`). **The kill switch must not depend on the policy:** the dispatcher (sub-plan 6) honours the owner's kill switch without asking the policy when the policy fails to load or evaluate, since a fail-closed policy would otherwise block an emergency stop. | The spec's Ownership section: the owner holds the kill switch, the backup covers, and harness changes need both once the backup is named (overview). The matrix lists tech leads and label removal under cancel; a label removal cancels its own run only. |
 | D15 | Tests are Rust integration tests in the crate (`cargo test`), not `opa test`. Tests that need a non-placeholder value load a temp copy of `policy/` with one data file replaced (`common::policy_with`). | One toolchain in CI, and the tests exercise the same `Policy` API the callers use. The allow paths that placeholders block are still tested. |
 
 **Action names** (D6, D7). The `input` fields are the contract each caller builds; Tasks 2 to 4 define them in full.
@@ -59,9 +59,9 @@ The modes follow [ADR 0001](../../adr/0001-per-task-execution-mode.md): a task t
 | Task | Mode | Why |
 |---|---|---|
 | 1. Crate, loader, version and the default-deny core | Subagent + review | Owns default deny, fail-closed evaluation and the policy version (Review Focus 1 and 4). |
-| 2. Agent operations: routing, vendor login, reads, writes, publish | Subagent + review | Owns the routing refusals, the subscription exception and the publish scope (Review Focus 1 and 3). |
-| 3. Human operations: merge, harness change, cancel | Subagent + review | Owns separation of duties: agents never approve, the requester rule (Review Focus 5). |
-| 4. Delegation, compliance profile and matrix coverage | Subagent + review | Owns the risk-class rules, path raising and missing-value denial (Review Focus 2 and 3). |
+| 2. Agent operations: routing, vendor login, reads, writes, publish | Subagent + review | Owns the routing refusals, the subscription exception and the publish scope (Review Focus 1, 3 and 6). |
+| 3. Human operations: merge, harness change, cancel | Subagent + review | Owns separation of duties: agents never approve, the requester rule, the kill switch and harness changes (Review Focus 5 and 7). |
+| 4. Delegation, compliance profile and matrix coverage | Subagent + review | Owns the risk-class rules, path raising on tickets and diffs, and missing-value denial (Review Focus 2 and 3). |
 
 ## Global Constraints
 
@@ -69,7 +69,7 @@ The modes follow [ADR 0001](../../adr/0001-per-task-execution-mode.md): a task t
 - CI must pass: `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all`, and cargo-deny with the existing `deny.toml` (licenses MIT, Apache-2.0, BSD-2/3, ISC, Zlib, Unicode-3.0, CDLA-Permissive-2.0). `deny.toml` is not changed.
 - New dependencies are limited to: `regorus = { version = "=0.13.0", default-features = false, features = ["std", "arc"] }` and `sha2 = "0.10"` in kod-policy. `anyhow`, `serde`, `serde_json` and the dev-dependency `tempfile` are already in the workspace.
 - Rego is v1 syntax (regorus's default: `if`, `contains`, `in`, `every`). Every Rego file is `package kod`. The Rust API reads only `data.kod.decision`.
-- A data file `policy/<name>.json` is loaded as `data.kod.<name>`. No rule may be named like a data file (`routing`, `subscription`, `publish`, `people`, `teams`, `delegation`, `compliance`).
+- Data lives under `data.config`: a data file `policy/<name>.json` is loaded as `data.config.<name>`. Rules live under `data.kod`, so no data file can shadow a rule.
 - Default deny: a request is allowed only through a `grant` body for its action, with an empty `deny` set. Every comparison between two input values guards one side with `is_string` (or `is_number`).
 - Rule names that define a single value are defined once. Where a value has fallbacks, use `else := ... if { ... }` chains: regorus doesn't support an `else` without a body.
 - No real values are invented. Unknown values are named `placeholder`, or left out so that the rule reading them denies.
@@ -78,10 +78,12 @@ The modes follow [ADR 0001](../../adr/0001-per-task-execution-mode.md): a task t
 ## Review Focus
 
 1. **A missing, null or wrongly typed field** (an input that isn't an object, `null` ticket ids on both sides, `canceled` left out or `"false"` as a string, `data_classes` as a string) must deny, never allow. Pinned by Task 1 `input_that_is_not_an_object_is_denied` and `a_missing_or_unknown_action_is_denied`, and Task 2 `null_ids_never_match`, `publish_needs_an_explicit_live_run` and `an_unknown_or_missing_data_class_is_refused`.
-2. **A ticket path written to dodge a path rule** (`./auth/x`, `Auth/x`, `src/../auth/x`, `/auth/x`, `auth//x`, a path that isn't a string, or `paths` given as a string) must not lower the risk class: it is raised or refused. Pinned by Task 4 `path_tricks_cannot_dodge_a_path_rule`.
+2. **A path written to dodge a path rule, or a diff that touches a high-risk path the ticket never named** (`./auth/x`, `Auth/x`, `auth\x`, ` auth/x`, `src/auth/x`, `src/../auth/x`, a path that isn't a string, `paths` or `changed_paths` given as a string or left out) must not lower the risk class: the ticket is raised or refused, and the publish is refused. Pinned by Task 4 `path_tricks_cannot_dodge_a_path_rule` and `publish_refuses_a_diff_that_touches_a_high_risk_path`.
 3. **A placeholder or missing configuration value** (no recorded seat workspace, a `null` workspace sent by the caller, a compliance profile without the key, no active profile) must deny with a reason that names what is missing, and must never match a `null` in the input. Pinned by Task 2 `subscription_is_refused_until_a_workspace_is_recorded` and `a_null_or_wrong_workspace_never_matches`, and Task 4 `retention_delete_is_refused_while_the_profile_is_a_placeholder` and `a_missing_value_in_any_active_profile_denies`.
 4. **A broken policy directory or an evaluation error** (empty or missing directory, Rego that doesn't parse, invalid JSON, no `decision` rule, a decision of the wrong shape, a builtin error at request time) must fail at load or deny with a `policy error` reason, never allow. Pinned by Task 1 `a_broken_policy_fails_to_load` and `evaluation_errors_deny`, and Task 4 `a_malformed_ticket_is_a_policy_error_deny`.
-5. **An agent approval, or the requester as the only approver**, must block a merge under the matching setting, and an unknown setting must deny. Pinned by Task 3 `agent_approvals_block_the_merge`, `not_sole_is_the_default_and_needs_another_human`, `forbidden_refuses_any_requester_approval` and `an_unknown_requester_setting_is_refused`.
+5. **An agent approval, or the requester as the only approver**, must block a merge under the matching setting, and an unknown setting must deny. Requester and approver logins that differ only in case are the same person. Pinned by Task 3 `agent_approvals_block_the_merge`, `not_sole_is_the_default_and_needs_another_human`, `forbidden_refuses_any_requester_approval`, `an_unknown_requester_setting_is_refused` and `logins_compare_case_insensitively`.
+6. **Publish outside its own scope** (another repo, a branch other than `agent/<ticket>-<run>`, a non-draft PR, a canceled run, `null` repos on both sides) must be refused. Pinned by Task 2 `publish_anywhere_else_is_refused`, `publish_needs_an_explicit_live_run` and `null_ids_never_match`.
+7. **The kill switch and harness changes**: only the owner or backup pulls the kill switch, a label removal cancels only its own run, and a harness change needs every named owner and backup. The dispatcher honours the owner's kill switch even when the policy fails (D14). Pinned by Task 3 `who_may_cancel_a_run_or_pull_the_kill_switch` and `a_harness_change_needs_the_owner_and_the_backup_once_named`.
 
 ---
 
@@ -89,6 +91,7 @@ The modes follow [ADR 0001](../../adr/0001-per-task-execution-mode.md): a task t
 
 ```
 Cargo.toml                                modify: add crates/kod-policy to members
+.gitattributes                            create: policy/** text eol=lf
 crates/kod-policy/
   Cargo.toml                              create
   src/lib.rs                              create: Policy, Decision
@@ -114,7 +117,7 @@ docs/superpowers/plans/2026-10-14-phase1-overview.md        modify (Task 4): lin
 
 **Files:**
 - Modify: `Cargo.toml`
-- Create: `crates/kod-policy/Cargo.toml`, `crates/kod-policy/src/lib.rs`, `policy/kod.rego`
+- Create: `crates/kod-policy/Cargo.toml`, `crates/kod-policy/src/lib.rs`, `policy/kod.rego`, `.gitattributes`
 - Test: `crates/kod-policy/tests/common/mod.rs`, `crates/kod-policy/tests/api.rs`
 
 **Interfaces:**
@@ -216,6 +219,9 @@ pub fn copy_policy() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     for entry in std::fs::read_dir(policy_dir()).unwrap() {
         let path = entry.unwrap().path();
+        if !path.is_file() {
+            continue;
+        }
         std::fs::copy(&path, dir.path().join(path.file_name().unwrap())).unwrap();
     }
     dir
@@ -288,14 +294,16 @@ mod common;
 
 use std::fs;
 
-use common::{copy_policy, decide, denied, policy};
-use kod_policy::Policy;
+use common::{copy_policy, decide, denied, denied_by, policy};
+use kod_policy::{Policy, REGORUS_VERSION};
 use serde_json::json;
 
 #[test]
 fn the_repo_policy_loads_with_a_content_hash_version() {
     let v = policy().version();
-    assert!(v.starts_with("sha256:") && v.len() == 7 + 64, "{v}");
+    let (hash, engine) = v.split_once(';').unwrap();
+    assert!(hash.starts_with("sha256:") && hash.len() == 7 + 64, "{v}");
+    assert_eq!(engine, format!("regorus={REGORUS_VERSION}"));
     assert_eq!(decide(json!({})).policy_version, v);
 }
 
@@ -306,11 +314,29 @@ fn the_version_follows_the_content() {
     assert_eq!(Policy::load(dir.path()).unwrap().version(), first);
 
     fs::write(dir.path().join("README.md"), "not loaded").unwrap();
+    fs::create_dir(dir.path().join("sub")).unwrap();
+    fs::write(dir.path().join("sub/extra.rego"), "package kod\n").unwrap();
     assert_eq!(
         Policy::load(dir.path()).unwrap().version(),
         first,
-        "a file that isn't loaded doesn't change the version"
+        "files that aren't loaded don't change the version"
     );
+
+    fs::rename(
+        dir.path().join("teams.json"),
+        dir.path().join("teams2.json"),
+    )
+    .unwrap();
+    assert_ne!(
+        Policy::load(dir.path()).unwrap().version(),
+        first,
+        "a rename changes it"
+    );
+    fs::rename(
+        dir.path().join("teams2.json"),
+        dir.path().join("teams.json"),
+    )
+    .unwrap();
 
     let rego = dir.path().join("kod.rego");
     let text = fs::read_to_string(&rego).unwrap();
@@ -322,7 +348,10 @@ fn the_version_follows_the_content() {
 fn a_broken_policy_fails_to_load() {
     let empty = tempfile::tempdir().unwrap();
     assert!(Policy::load(empty.path()).is_err(), "no rego files");
-    assert!(Policy::load(&empty.path().join("missing")).is_err(), "no directory");
+    assert!(
+        Policy::load(&empty.path().join("missing")).is_err(),
+        "no directory"
+    );
 
     for text in [
         "package kod\nthis is not rego\n",
@@ -341,11 +370,18 @@ fn a_broken_policy_fails_to_load() {
 
 #[test]
 fn input_that_is_not_an_object_is_denied() {
-    for input in [json!(null), json!("publish"), json!([{"action": "publish"}]), json!(1)] {
+    for input in [
+        json!(null),
+        json!("publish"),
+        json!([{"action": "publish"}]),
+        json!(1),
+    ] {
         let d = policy().decide(&input);
         assert!(!d.allow, "{d:?}");
         assert!(
-            d.reasons.iter().any(|r| r.contains("input must be a JSON object")),
+            d.reasons
+                .iter()
+                .any(|r| r.contains("input must be a JSON object")),
             "{d:?}"
         );
     }
@@ -385,7 +421,10 @@ decision := {"allow": count(input.x) > 0, "reasons": []} if input.x
     )
     .unwrap();
     let probe = Policy::load(dir.path()).unwrap();
-    assert!(probe.decide(&json!({})).allow, "the probe allows when it evaluates");
+    assert!(
+        probe.decide(&json!({})).allow,
+        "the probe allows when it evaluates"
+    );
 
     // count(5) is a builtin error at request time.
     let d = probe.decide(&json!({"x": 5}));
@@ -398,6 +437,32 @@ decision := {"allow": count(input.x) > 0, "reasons": []} if input.x
 fn policy_is_send_and_sync() {
     fn shareable<T: Send + Sync>() {}
     shareable::<Policy>();
+}
+
+#[test]
+fn data_files_cannot_override_rules() {
+    let dir = copy_policy();
+    fs::write(dir.path().join("allow.json"), "true").unwrap();
+    fs::write(
+        dir.path().join("decision.json"),
+        r#"{"allow": true, "reasons": []}"#,
+    )
+    .unwrap();
+    fs::write(dir.path().join("grant.json"), "true").unwrap();
+    let p = Policy::load(dir.path()).unwrap();
+    denied_by(&p, json!({"action": "delete_repo"}), "unknown action");
+}
+
+#[test]
+fn the_regorus_version_matches_cargo_lock() {
+    let lock =
+        fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.lock")).unwrap();
+    let pinned = lock
+        .split("[[package]]")
+        .find(|p| p.contains("\nname = \"regorus\"\n"))
+        .and_then(|p| p.lines().find_map(|l| l.strip_prefix("version = ")))
+        .unwrap();
+    assert_eq!(pinned, format!("\"{REGORUS_VERSION}\""));
 }
 ```
 
@@ -417,7 +482,8 @@ Expected: FAIL. Every test that loads a policy panics with "not implemented" (`p
 # is allowed when a grant rule for its action holds and no deny rule fires.
 # Grant rules state every condition positively, so a missing or null field
 # never allows anything. Deny rules explain refusals and can veto a grant.
-# A data file <name>.json in this directory is data.kod.<name>.
+# A data file <name>.json in this directory is data.config.<name>, so a
+# data file can never shadow a rule.
 package kod
 
 decision := {"allow": allow, "reasons": reasons}
@@ -476,6 +542,12 @@ deny contains sprintf("%v is enforced by %v, not by policy", [input.action, by])
 
 - [ ] **Step 6: Implement the loader and `decide`**
 
+`.gitattributes` (repo root), so the policy hash doesn't depend on the checkout's line endings:
+
+```
+policy/** text eol=lf
+```
+
 `crates/kod-policy/src/lib.rs`:
 
 ```rust
@@ -494,6 +566,11 @@ use sha2::{Digest, Sha256};
 
 /// The one rule every decision reads.
 const DECISION_RULE: &str = "data.kod.decision";
+
+/// The pinned regorus version, part of `policy_version` so an engine bump
+/// with unchanged files is still a new version. A test keeps it equal to
+/// the version in Cargo.lock.
+pub const REGORUS_VERSION: &str = "0.13.0";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Decision {
@@ -517,7 +594,7 @@ pub struct Policy {
 
 impl Policy {
     /// Loads every `*.rego` and `*.json` file directly in `dir`. A data file
-    /// `<name>.json` becomes `data.kod.<name>`. Fails if there is no Rego, a
+    /// `<name>.json` becomes `data.config.<name>`. Fails if there is no Rego, a
     /// file doesn't parse, or the rules don't yield a decision.
     pub fn load(dir: &Path) -> Result<Policy> {
         let mut files = Vec::new();
@@ -529,7 +606,10 @@ impl Policy {
             }
         }
         files.sort();
-        if !files.iter().any(|p| p.extension().is_some_and(|e| e == "rego")) {
+        if !files
+            .iter()
+            .any(|p| p.extension().is_some_and(|e| e == "rego"))
+        {
             bail!("no .rego files in {}", dir.display());
         }
 
@@ -557,14 +637,17 @@ impl Policy {
                     .map_err(|e| anyhow!("{name}: {e}"))?;
             }
         }
-        let data = Value::Object(Map::from_iter([("kod".to_string(), Value::Object(data))]));
+        let data = Value::Object(Map::from_iter([(
+            "config".to_string(),
+            Value::Object(data),
+        )]));
         engine
             .add_data_json(&data.to_string())
             .map_err(|e| anyhow!("data: {e}"))?;
 
         let policy = Policy {
             engine: Mutex::new(engine),
-            version: format!("sha256:{:x}", hash.finalize()),
+            version: format!("sha256:{:x};regorus={REGORUS_VERSION}", hash.finalize()),
         };
         // A broken rule set fails here, at startup, not as a deny on every request.
         policy
@@ -573,7 +656,8 @@ impl Policy {
         Ok(policy)
     }
 
-    /// `sha256:<hex>` over the loaded files' names and contents.
+    /// `sha256:<hex>;regorus=<version>`: the hash covers the loaded files'
+    /// names and contents.
     pub fn version(&self) -> &str {
         &self.version
     }
@@ -614,7 +698,7 @@ If `policy_is_send_and_sync` fails to compile, `regorus::Engine` isn't `Send` ev
 - [ ] **Step 7: Run the tests to verify they pass**
 
 Run: `cargo test -p kod-policy --test api`
-Expected: PASS (8 tests).
+Expected: PASS (10 tests).
 
 - [ ] **Step 8: Check licenses and lints**
 
@@ -624,7 +708,7 @@ Expected: all three exit 0. `cargo deny` lists no rejected license. If `cargo-de
 - [ ] **Step 9: Commit**
 
 ```bash
-git add Cargo.toml Cargo.lock crates/kod-policy policy/kod.rego
+git add Cargo.toml Cargo.lock .gitattributes crates/kod-policy policy/kod.rego
 git commit -m "kod-policy: loader, content-hash version and default-deny core"
 ```
 
@@ -639,13 +723,13 @@ git commit -m "kod-policy: loader, content-hash version and default-deny core"
 **Interfaces:**
 - Consumes: Task 1's `Policy`, `kod.rego` (`grant`, `deny`), and the helpers in `tests/common/mod.rs`.
 - Produces, as input contracts for sub-plans 2 and 5 (every request also has `"actor": {"kind": "agent"}`):
-  - `model_request`: `{"run": {"data_classes": [..], "auth_mode": "api_key"}, "endpoint": "<name>"}`.
+  - `model_request`: `{"run": {"data_classes": [..], "auth_mode": "api_key"|"cloud"}, "endpoint": "<name>"}`. kod-loop uses an API key or a cloud provider; `subscription` is the separate vendor-login action.
   - `subscription_model_request`: `{"runner": "claude-code"|"codex"|"cursor", "context": "offline_spike"|"offline_eval", "seat": {"account", "workspace", "plan"}, "run": {"data_classes": [..]}}`.
   - `read`: `{"run": {"ticket", "linked_docs": [..]}, "target": {"kind": "ticket"|"doc", "id"}}`.
-  - `tracker_write`: `{"kind": "comment"|"transition"|"create_linked", "run": {"ticket", "linked_tickets": [..], "canceled": false}, "target": {"ticket"} or {"parent"}}`.
+  - `tracker_write`: `{"kind": "comment"|"transition"|"create_linked", "run": {"ticket", "linked_tickets": [..], "canceled": false}, "target": {"ticket"} or {"parent"}}`. `linked_tickets` holds only rework requests Kod itself created and linked to the run's ticket (the gateway records them); that is why a write may reach them while `read` stays on the ticket and its docs.
   - `draft_doc_write`: `{"run": {"id", "canceled": false}, "target": {"folder": "draft", "owner_run"}}`. The gateway sets `owner_run` to the run that created the draft.
-  - `publish`: `{"run": {"id", "ticket", "repo", "canceled": false, "data_classes": [..]}, "target": {"repo", "branch", "draft": true}}`.
-  - Data: `data.kod.routing.classes.<class>.endpoints`, `data.kod.subscription.{contexts, classes, runners.<runner>.{plans, workspace}}`, `data.kod.publish.cleared_classes`.
+  - `publish`: `{"run": {"id", "ticket", "repo", "canceled": false, "data_classes": [..]}, "target": {"repo", "branch", "draft": true}, "changed_paths": [..]}`. `changed_paths` are the repo-relative paths the diff touches; Task 4 refuses a publish whose diff touches a high-risk path.
+  - Data: `data.config.routing.classes.<class>.endpoints`, `data.config.subscription.{contexts, classes, runners.<runner>.{plans, workspace}}`, `data.config.publish.cleared_classes`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -684,14 +768,30 @@ fn model_request_to_an_allowed_endpoint_is_allowed() {
 #[test]
 fn an_unknown_or_missing_data_class_is_refused() {
     let base = req("model_request", json!({"endpoint": "placeholder"}));
-    denied(set(base.clone(), "/run/data_classes", json!(["secret"])), "unknown data class: secret");
     denied(
-        set(base.clone(), "/run/data_classes", json!(["placeholder", "secret"])),
+        set(base.clone(), "/run/data_classes", json!(["secret"])),
         "unknown data class: secret",
     );
-    denied(set(base.clone(), "/run/data_classes", json!([])), "the run has no data class");
-    denied(set(base.clone(), "/run/data_classes", json!("placeholder")), "the run has no data class");
-    denied(unset(base, "/run/data_classes"), "the run has no data class");
+    denied(
+        set(
+            base.clone(),
+            "/run/data_classes",
+            json!(["placeholder", "secret"]),
+        ),
+        "unknown data class: secret",
+    );
+    denied(
+        set(base.clone(), "/run/data_classes", json!([])),
+        "the run has no data class",
+    );
+    denied(
+        set(base.clone(), "/run/data_classes", json!("placeholder")),
+        "the run has no data class",
+    );
+    denied(
+        unset(base, "/run/data_classes"),
+        "the run has no data class",
+    );
 }
 
 #[test]
@@ -704,11 +804,22 @@ fn a_disallowed_endpoint_is_refused() {
 }
 
 #[test]
-fn model_requests_need_an_agent_and_api_key_auth() {
+fn model_requests_need_an_agent_and_api_key_or_cloud_auth() {
     let base = req("model_request", json!({"endpoint": "placeholder"}));
-    denied(set(base.clone(), "/actor/kind", json!("human")), "only an agent can request this");
-    denied(unset(base.clone(), "/actor"), "only an agent can request this");
-    denied(set(base, "/run/auth_mode", json!("subscription")), "model_request needs auth_mode api_key");
+    denied(
+        set(base.clone(), "/actor/kind", json!("human")),
+        "only an agent can request this",
+    );
+    denied(
+        unset(base.clone(), "/actor"),
+        "only an agent can request this",
+    );
+    allowed(set(base.clone(), "/run/auth_mode", json!("cloud")));
+    denied(
+        set(base.clone(), "/run/auth_mode", json!("subscription")),
+        "model_request needs auth_mode api_key or cloud",
+    );
+    denied(unset(base, "/run/auth_mode"), "does not meet the rule");
 }
 
 // subscription_model_request
@@ -748,31 +859,73 @@ fn subscription_with_the_recorded_workspace_is_allowed_offline_only() {
     let p = sub_policy();
     allowed_by(&p, sub());
     allowed_by(&p, set(sub(), "/context", json!("offline_spike")));
-    denied_by(&p, set(sub(), "/context", json!("connected")), "subscription mode is allowed only in");
-    denied_by(&p, set(sub(), "/seat/plan", json!("plus")), "plan plus is not a business plan for runner codex");
-    denied_by(&p, set(sub(), "/runner", json!("kod-loop")), "runner kod-loop has no subscription seat");
-    denied_by(&p, set(sub(), "/run/data_classes", json!(["secret"])), "unknown data class: secret");
+    denied_by(
+        &p,
+        set(sub(), "/context", json!("connected")),
+        "subscription mode is allowed only in",
+    );
+    denied_by(
+        &p,
+        set(sub(), "/seat/plan", json!("plus")),
+        "plan plus is not a business plan for runner codex",
+    );
+    denied_by(
+        &p,
+        set(sub(), "/runner", json!("kod-loop")),
+        "runner kod-loop has no subscription seat",
+    );
+    denied_by(
+        &p,
+        set(sub(), "/run/data_classes", json!(["secret"])),
+        "unknown data class: secret",
+    );
     denied_by(&p, unset(sub(), "/seat/account"), "does not meet the rule");
 }
 
 #[test]
 fn a_null_or_wrong_workspace_never_matches() {
     let p = sub_policy();
-    denied_by(&p, set(sub(), "/seat/workspace", json!("ws-2")), "the seat belongs to a different workspace");
-    denied_by(&p, set(sub(), "/seat/workspace", Value::Null), "the seat belongs to a different workspace");
+    denied_by(
+        &p,
+        set(sub(), "/seat/workspace", json!("ws-2")),
+        "the seat belongs to a different workspace",
+    );
+    denied_by(
+        &p,
+        set(sub(), "/seat/workspace", Value::Null),
+        "the seat belongs to a different workspace",
+    );
     // The repo policy records no workspace; a null from the caller must not match the gap.
-    denied(set(sub(), "/seat/workspace", Value::Null), "no approved workspace is recorded");
+    denied(
+        set(sub(), "/seat/workspace", Value::Null),
+        "no approved workspace is recorded",
+    );
 }
 
 // read
 
 #[test]
 fn reads_are_limited_to_the_ticket_and_its_linked_docs() {
-    allowed(req("read", json!({"target": {"kind": "ticket", "id": "KOD-1"}})));
-    allowed(req("read", json!({"target": {"kind": "doc", "id": "doc-1"}})));
-    denied(req("read", json!({"target": {"kind": "ticket", "id": "KOD-9"}})), "does not meet the rule");
-    denied(req("read", json!({"target": {"kind": "doc", "id": "doc-9"}})), "does not meet the rule");
-    denied(req("read", json!({"target": {"kind": "repo", "id": "KOD-1"}})), "does not meet the rule");
+    allowed(req(
+        "read",
+        json!({"target": {"kind": "ticket", "id": "KOD-1"}}),
+    ));
+    allowed(req(
+        "read",
+        json!({"target": {"kind": "doc", "id": "doc-1"}}),
+    ));
+    denied(
+        req("read", json!({"target": {"kind": "ticket", "id": "KOD-9"}})),
+        "does not meet the rule",
+    );
+    denied(
+        req("read", json!({"target": {"kind": "doc", "id": "doc-9"}})),
+        "does not meet the rule",
+    );
+    denied(
+        req("read", json!({"target": {"kind": "repo", "id": "KOD-1"}})),
+        "does not meet the rule",
+    );
 }
 
 #[test]
@@ -784,11 +937,12 @@ fn null_ids_never_match() {
     );
     denied(read, "does not meet the rule");
 
-    let publish = req(
-        "publish",
-        json!({"target": {"repo": null, "branch": "agent/null-r1", "draft": true}}),
+    // Everything else about this publish is valid: only the repo guard can refuse it.
+    let publish = set(
+        set(publish(), "/run/repo", Value::Null),
+        "/target/repo",
+        Value::Null,
     );
-    let publish = set(set(publish, "/run/repo", Value::Null), "/run/ticket", Value::Null);
     let d = decide(publish);
     assert!(!d.allow, "{d:?}");
 }
@@ -797,19 +951,37 @@ fn null_ids_never_match() {
 
 #[test]
 fn tracker_writes_are_limited_to_the_ticket_and_its_linked_requests() {
-    allowed(req("tracker_write", json!({"kind": "comment", "target": {"ticket": "KOD-1"}})));
-    allowed(req("tracker_write", json!({"kind": "transition", "target": {"ticket": "KOD-2"}})));
-    allowed(req("tracker_write", json!({"kind": "create_linked", "target": {"parent": "KOD-1"}})));
+    allowed(req(
+        "tracker_write",
+        json!({"kind": "comment", "target": {"ticket": "KOD-1"}}),
+    ));
+    allowed(req(
+        "tracker_write",
+        json!({"kind": "transition", "target": {"ticket": "KOD-2"}}),
+    ));
+    allowed(req(
+        "tracker_write",
+        json!({"kind": "create_linked", "target": {"parent": "KOD-1"}}),
+    ));
     denied(
-        req("tracker_write", json!({"kind": "comment", "target": {"ticket": "KOD-9"}})),
+        req(
+            "tracker_write",
+            json!({"kind": "comment", "target": {"ticket": "KOD-9"}}),
+        ),
         "does not meet the rule",
     );
     denied(
-        req("tracker_write", json!({"kind": "create_linked", "target": {"parent": "KOD-9"}})),
+        req(
+            "tracker_write",
+            json!({"kind": "create_linked", "target": {"parent": "KOD-9"}}),
+        ),
         "does not meet the rule",
     );
     denied(
-        req("tracker_write", json!({"kind": "delete", "target": {"ticket": "KOD-1"}})),
+        req(
+            "tracker_write",
+            json!({"kind": "delete", "target": {"ticket": "KOD-1"}}),
+        ),
         "unknown tracker write: delete",
     );
 }
@@ -818,13 +990,22 @@ fn tracker_writes_are_limited_to_the_ticket_and_its_linked_requests() {
 
 #[test]
 fn draft_doc_writes_are_limited_to_the_runs_own_draft() {
-    allowed(req("draft_doc_write", json!({"target": {"folder": "draft", "owner_run": "r1"}})));
+    allowed(req(
+        "draft_doc_write",
+        json!({"target": {"folder": "draft", "owner_run": "r1"}}),
+    ));
     denied(
-        req("draft_doc_write", json!({"target": {"folder": "approved", "owner_run": "r1"}})),
+        req(
+            "draft_doc_write",
+            json!({"target": {"folder": "approved", "owner_run": "r1"}}),
+        ),
         "does not meet the rule",
     );
     denied(
-        req("draft_doc_write", json!({"target": {"folder": "draft", "owner_run": "r2"}})),
+        req(
+            "draft_doc_write",
+            json!({"target": {"folder": "draft", "owner_run": "r2"}}),
+        ),
         "does not meet the rule",
     );
 }
@@ -834,7 +1015,10 @@ fn draft_doc_writes_are_limited_to_the_runs_own_draft() {
 fn publish() -> Value {
     req(
         "publish",
-        json!({"target": {"repo": "acme/app", "branch": "agent/KOD-1-r1", "draft": true}}),
+        json!({
+            "target": {"repo": "acme/app", "branch": "agent/KOD-1-r1", "draft": true},
+            "changed_paths": ["src/lib.rs", "docs/readme.md"]
+        }),
     )
 }
 
@@ -845,30 +1029,60 @@ fn publish_to_the_runs_own_branch_as_a_draft_is_allowed() {
 
 #[test]
 fn publish_anywhere_else_is_refused() {
-    denied(set(publish(), "/target/repo", json!("acme/other")), "publish target must be the run's repo");
-    denied(set(publish(), "/target/branch", json!("main")), "publish branch must be agent/KOD-1-r1");
-    denied(set(publish(), "/target/branch", json!("agent/KOD-1-r2")), "publish branch must be agent/KOD-1-r1");
-    denied(set(publish(), "/target/draft", json!(false)), "publish must open a draft PR");
+    denied(
+        set(publish(), "/target/repo", json!("acme/other")),
+        "publish target must be the run's repo",
+    );
+    denied(
+        set(publish(), "/target/branch", json!("main")),
+        "publish branch must be agent/KOD-1-r1",
+    );
+    denied(
+        set(publish(), "/target/branch", json!("agent/KOD-1-r2")),
+        "publish branch must be agent/KOD-1-r1",
+    );
+    denied(
+        set(publish(), "/target/draft", json!(false)),
+        "publish must open a draft PR",
+    );
     denied(unset(publish(), "/target/draft"), "does not meet the rule");
-    denied(set(publish(), "/run/data_classes", json!(["secret"])), "unknown data class: secret");
+    denied(
+        set(publish(), "/run/data_classes", json!(["secret"])),
+        "unknown data class: secret",
+    );
 }
 
 #[test]
 fn publish_needs_an_explicit_live_run() {
-    denied(set(publish(), "/run/canceled", json!(true)), "the run is canceled");
+    denied(
+        set(publish(), "/run/canceled", json!(true)),
+        "the run is canceled",
+    );
     denied(unset(publish(), "/run/canceled"), "does not meet the rule");
-    denied(set(publish(), "/run/canceled", json!("false")), "does not meet the rule");
+    denied(
+        set(publish(), "/run/canceled", json!("false")),
+        "does not meet the rule",
+    );
 }
 
 #[test]
 fn every_agent_write_is_refused_for_a_canceled_run() {
     for write in [
         publish(),
-        req("tracker_write", json!({"kind": "comment", "target": {"ticket": "KOD-1"}})),
-        req("draft_doc_write", json!({"target": {"folder": "draft", "owner_run": "r1"}})),
+        req(
+            "tracker_write",
+            json!({"kind": "comment", "target": {"ticket": "KOD-1"}}),
+        ),
+        req(
+            "draft_doc_write",
+            json!({"target": {"folder": "draft", "owner_run": "r1"}}),
+        ),
     ] {
         allowed(write.clone());
-        denied(set(write, "/run/canceled", json!(true)), "the run is canceled");
+        denied(
+            set(write, "/run/canceled", json!(true)),
+            "the run is canceled",
+        );
     }
 }
 ```
@@ -942,7 +1156,7 @@ has_classes if {
 run_classes_known if {
 	has_classes
 	every c in input.run.data_classes {
-		data.kod.routing.classes[c]
+		data.config.routing.classes[c]
 	}
 }
 
@@ -965,46 +1179,49 @@ deny contains sprintf("unknown data class: %v", [c]) if {
 	input.action in class_actions
 	has_classes
 	some c in input.run.data_classes
-	not data.kod.routing.classes[c]
+	not data.config.routing.classes[c]
 }
 
 # model_request: the endpoint must be allowed for every class the run read.
 
-endpoint_allowed(c) if input.endpoint in data.kod.routing.classes[c].endpoints
+endpoint_allowed(c) if input.endpoint in data.config.routing.classes[c].endpoints
 
 grant if {
 	input.action == "model_request"
 	is_agent
-	input.run.auth_mode == "api_key"
+	input.run.auth_mode in {"api_key", "cloud"}
 	run_classes_known
 	every c in input.run.data_classes {
 		endpoint_allowed(c)
 	}
 }
 
-deny contains "model_request needs auth_mode api_key" if {
+model_auth_ok if input.run.auth_mode in {"api_key", "cloud"}
+
+deny contains "model_request needs auth_mode api_key or cloud" if {
 	input.action == "model_request"
-	input.run.auth_mode != "api_key"
+	input.run.auth_mode
+	not model_auth_ok
 }
 
 deny contains sprintf("endpoint %v is not allowed for data class %v", [input.endpoint, c]) if {
 	input.action == "model_request"
 	has_classes
 	some c in input.run.data_classes
-	data.kod.routing.classes[c]
+	data.config.routing.classes[c]
 	not endpoint_allowed(c)
 }
 
 # subscription_model_request: the credential exception. Offline only, a
 # business plan, and the seat's workspace must be the one recorded.
 
-sub_runner := data.kod.subscription.runners[input.runner]
+sub_runner := data.config.subscription.runners[input.runner]
 
-sub_context_ok if input.context in data.kod.subscription.contexts
+sub_context_ok if input.context in data.config.subscription.contexts
 
 sub_plan_ok if input.seat.plan in sub_runner.plans
 
-sub_class_ok(c) if c in data.kod.subscription.classes
+sub_class_ok(c) if c in data.config.subscription.classes
 
 seat_ok if {
 	sub_plan_ok
@@ -1024,7 +1241,7 @@ grant if {
 	}
 }
 
-deny contains sprintf("subscription mode is allowed only in: %v", [concat(", ", data.kod.subscription.contexts)]) if {
+deny contains sprintf("subscription mode is allowed only in: %v", [concat(", ", data.config.subscription.contexts)]) if {
 	input.action == "subscription_model_request"
 	not sub_context_ok
 }
@@ -1056,7 +1273,7 @@ deny contains sprintf("data class %v is not allowed in subscription mode", [c]) 
 	input.action == "subscription_model_request"
 	has_classes
 	some c in input.run.data_classes
-	data.kod.routing.classes[c]
+	data.config.routing.classes[c]
 	not sub_class_ok(c)
 }
 
@@ -1134,7 +1351,7 @@ run_branch := sprintf("agent/%s-%s", [input.run.ticket, input.run.id]) if {
 	is_string(input.run.id)
 }
 
-publish_class_ok(c) if c in data.kod.publish.cleared_classes
+publish_class_ok(c) if c in data.config.publish.cleared_classes
 
 grant if {
 	input.action == "publish"
@@ -1169,7 +1386,7 @@ deny contains sprintf("data class %v is not cleared for publish", [c]) if {
 	input.action == "publish"
 	has_classes
 	some c in input.run.data_classes
-	data.kod.routing.classes[c]
+	data.config.routing.classes[c]
 	not publish_class_ok(c)
 }
 ```
@@ -1199,9 +1416,9 @@ git commit -m "kod-policy: agent operations, model routing and the subscription 
 - Produces, as input contracts for sub-plans 6 and 7:
   - `merge`: `{"team": "<team>", "requester": "<login>", "approvals": [{"login": "<login>", "agent": false}, ..]}`. The requester comes from the tracker (6a's adapter).
   - `harness_change`: `{"approvals": [{"login", "agent": false}, ..]}`.
-  - `cancel`: `{"scope": "run"|"all", "actor": {"kind": "human", "login"} | {"kind": "label_removal"}}`.
-  - Data: `data.kod.people.{owner, backup, tech_leads}`, `data.kod.teams.<team>.requester_approval`.
-  - Rego rules later tasks may use: `owners` (set of logins), `human_approvers` (set of logins).
+  - `cancel`: `{"scope": "run"|"all", "actor": {"kind": "human", "login"} | {"kind": "label_removal"}, "run": {"id"}, "target": {"run"}}`. A label removal cancels only `target.run == run.id`, the run of the ticket that lost its label. Every login is a GitHub login (callers map tracker ids), compared lower-cased.
+  - Data: `data.config.people.{owner, backup, tech_leads}`, `data.config.teams.<team>.requester_approval`.
+  - Rego rules later tasks may use: `owners` (set of lower-cased logins), `human_approvers` (set of lower-cased logins).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1210,7 +1427,7 @@ git commit -m "kod-policy: agent operations, model routing and the subscription 
 ```rust
 mod common;
 
-use common::{allowed, allowed_by, denied, denied_by, policy_with};
+use common::{allowed, allowed_by, denied, denied_by, policy_with, set, unset};
 use kod_policy::Policy;
 use serde_json::{Value, json};
 
@@ -1223,7 +1440,10 @@ fn merge(approvals: Vec<Value>) -> Value {
 }
 
 fn team_setting(setting: &str) -> Policy {
-    policy_with("teams.json", json!({"core": {"requester_approval": setting}}))
+    policy_with(
+        "teams.json",
+        json!({"core": {"requester_approval": setting}}),
+    )
 }
 
 // merge
@@ -1232,7 +1452,10 @@ fn team_setting(setting: &str) -> Policy {
 fn not_sole_is_the_default_and_needs_another_human() {
     allowed(merge(vec![human("bob")]));
     allowed(merge(vec![human("alice"), human("bob")]));
-    denied(merge(vec![human("alice")]), "the requester can't be the only approver");
+    denied(
+        merge(vec![human("alice")]),
+        "the requester can't be the only approver",
+    );
     denied(merge(vec![]), "no human approval");
     denied(
         json!({"action": "merge", "team": "core", "requester": "alice"}),
@@ -1251,24 +1474,41 @@ fn allowed_lets_the_requester_approve_alone() {
 fn forbidden_refuses_any_requester_approval() {
     let p = team_setting("forbidden");
     allowed_by(&p, merge(vec![human("bob")]));
-    denied_by(&p, merge(vec![human("alice"), human("bob")]), "the requester approved");
+    denied_by(
+        &p,
+        merge(vec![human("alice"), human("bob")]),
+        "the requester approved",
+    );
     denied_by(&p, merge(vec![human("alice")]), "the requester approved");
 }
 
 #[test]
 fn an_unknown_requester_setting_is_refused() {
     let p = team_setting("allow");
-    denied_by(&p, merge(vec![human("bob")]), "unknown requester_approval setting: allow");
+    denied_by(
+        &p,
+        merge(vec![human("bob")]),
+        "unknown requester_approval setting: allow",
+    );
 }
 
 #[test]
 fn agent_approvals_block_the_merge() {
     denied(
-        merge(vec![human("bob"), json!({"login": "kod-agent", "agent": true})]),
+        merge(vec![
+            human("bob"),
+            json!({"login": "kod-agent", "agent": true}),
+        ]),
         "agents never approve",
     );
-    denied(merge(vec![human("bob"), json!({"login": "carol"})]), "agents never approve");
-    denied(merge(vec![json!({"login": "kod-agent", "agent": true})]), "no human approval");
+    denied(
+        merge(vec![human("bob"), json!({"login": "carol"})]),
+        "agents never approve",
+    );
+    denied(
+        merge(vec![json!({"login": "kod-agent", "agent": true})]),
+        "no human approval",
+    );
 }
 
 #[test]
@@ -1276,7 +1516,8 @@ fn a_merge_needs_a_named_requester() {
     let mut no_requester = merge(vec![human("bob")]);
     no_requester.as_object_mut().unwrap().remove("requester");
     denied(no_requester, "does not meet the rule");
-    let null_requester = json!({"action": "merge", "team": "core", "requester": null, "approvals": [human("bob")]});
+    let null_requester =
+        json!({"action": "merge", "team": "core", "requester": null, "approvals": [human("bob")]});
     denied(null_requester, "does not meet the rule");
 }
 
@@ -1289,7 +1530,10 @@ fn harness(approvals: Vec<Value>) -> Value {
 #[test]
 fn a_harness_change_needs_the_owner_and_the_backup_once_named() {
     allowed(harness(vec![human("kiennt23")]));
-    denied(harness(vec![human("bob")]), "harness change needs approval from kiennt23");
+    denied(
+        harness(vec![human("bob")]),
+        "harness change needs approval from kiennt23",
+    );
     denied(
         harness(vec![json!({"login": "kiennt23", "agent": true})]),
         "agents never approve",
@@ -1299,14 +1543,18 @@ fn a_harness_change_needs_the_owner_and_the_backup_once_named() {
         "people.json",
         json!({"owner": "kiennt23", "backup": "bk", "tech_leads": []}),
     );
-    denied_by(&p, harness(vec![human("kiennt23")]), "harness change needs approval from bk");
+    denied_by(
+        &p,
+        harness(vec![human("kiennt23")]),
+        "harness change needs approval from bk",
+    );
     allowed_by(&p, harness(vec![human("kiennt23"), human("bk")]));
 }
 
 // cancel
 
 fn cancel(scope: &str, actor: Value) -> Value {
-    json!({"action": "cancel", "scope": scope, "actor": actor})
+    json!({"action": "cancel", "scope": scope, "actor": actor, "run": {"id": "r1"}, "target": {"run": "r1"}})
 }
 
 #[test]
@@ -1319,11 +1567,33 @@ fn who_may_cancel_a_run_or_pull_the_kill_switch() {
     allowed(cancel("run", owner.clone()));
     allowed(cancel("all", owner));
     allowed(cancel("run", label.clone()));
-    denied(cancel("all", label), "does not meet the rule");
+    denied(cancel("all", label.clone()), "does not meet the rule");
+    denied(
+        set(cancel("run", label.clone()), "/target/run", json!("r2")),
+        "does not meet the rule",
+    );
+    denied(
+        unset(cancel("run", label.clone()), "/target"),
+        "does not meet the rule",
+    );
+    denied(
+        set(
+            set(cancel("run", label), "/run/id", Value::Null),
+            "/target/run",
+            Value::Null,
+        ),
+        "does not meet the rule",
+    );
     denied(cancel("run", stranger.clone()), "does not meet the rule");
     denied(cancel("all", stranger), "does not meet the rule");
-    denied(cancel("run", json!({"kind": "agent"})), "does not meet the rule");
-    denied(cancel("everything", json!({"kind": "human", "login": "kiennt23"})), "does not meet the rule");
+    denied(
+        cancel("run", json!({"kind": "agent"})),
+        "does not meet the rule",
+    );
+    denied(
+        cancel("everything", json!({"kind": "human", "login": "kiennt23"})),
+        "does not meet the rule",
+    );
 
     let p = policy_with(
         "people.json",
@@ -1332,6 +1602,25 @@ fn who_may_cancel_a_run_or_pull_the_kill_switch() {
     allowed_by(&p, cancel("run", tech_lead.clone()));
     denied_by(&p, cancel("all", tech_lead), "does not meet the rule");
     allowed_by(&p, cancel("all", json!({"kind": "human", "login": "bk"})));
+}
+
+#[test]
+fn logins_compare_case_insensitively() {
+    let alice_alone = json!({"action": "merge", "team": "core", "requester": "Alice", "approvals": [human("alice")]});
+    denied(
+        alice_alone.clone(),
+        "the requester can't be the only approver",
+    );
+    let alice_and_bob = json!({"action": "merge", "team": "core", "requester": "ALICE", "approvals": [human("alice"), human("Bob")]});
+    allowed(alice_and_bob.clone());
+    denied_by(
+        &team_setting("forbidden"),
+        alice_and_bob,
+        "the requester approved",
+    );
+    allowed_by(&team_setting("allowed"), alice_alone);
+    allowed(harness(vec![human("KienNT23")]));
+    allowed(cancel("all", json!({"kind": "human", "login": "KIENNT23"})));
 }
 ```
 
@@ -1371,7 +1660,7 @@ package kod
 # The spec's default for a team with no setting.
 default_requester_approval := "not_sole"
 
-requester_rule := object.get(object.get(data.kod.teams, input.team, {}), "requester_approval", default_requester_approval)
+requester_rule := object.get(object.get(data.config.teams, input.team, {}), "requester_approval", default_requester_approval)
 
 known_requester_rule if requester_rule in {"allowed", "not_sole", "forbidden"}
 
@@ -1380,15 +1669,21 @@ human_approval(a) if {
 	is_string(a.login)
 }
 
-human_approvers := {a.login | some a in input.approvals; human_approval(a)}
+# GitHub logins are case-insensitive, so every login is compared lower-cased.
+human_approvers := {lower(a.login) | some a in input.approvals; human_approval(a)}
 
-requester_approved if input.requester in human_approvers
+requester_login := lower(input.requester) if is_string(input.requester)
+
+actor_login := lower(input.actor.login) if is_string(input.actor.login)
+
+requester_approved if requester_login in human_approvers
 
 # The owner and, once named, the backup.
-owners contains p if {
+owners contains login if {
 	some key in ["owner", "backup"]
-	p := data.kod.people[key]
+	p := data.config.people[key]
 	is_string(p)
+	login := lower(p)
 }
 
 deny contains "every approval must be from a named human; agents never approve" if {
@@ -1401,21 +1696,21 @@ deny contains "every approval must be from a named human; agents never approve" 
 
 grant if {
 	input.action == "merge"
-	is_string(input.requester)
+	requester_login
 	requester_rule == "allowed"
 	count(human_approvers) > 0
 }
 
 grant if {
 	input.action == "merge"
-	is_string(input.requester)
+	requester_login
 	requester_rule == "not_sole"
-	count(human_approvers - {input.requester}) > 0
+	count(human_approvers - {requester_login}) > 0
 }
 
 grant if {
 	input.action == "merge"
-	is_string(input.requester)
+	requester_login
 	requester_rule == "forbidden"
 	count(human_approvers) > 0
 	not requester_approved
@@ -1435,7 +1730,7 @@ deny contains "requester_approval is not_sole: the requester can't be the only a
 	input.action == "merge"
 	requester_rule == "not_sole"
 	count(human_approvers) > 0
-	count(human_approvers - {input.requester}) == 0
+	count(human_approvers - {requester_login}) == 0
 }
 
 deny contains "requester_approval is forbidden: the requester approved" if {
@@ -1462,36 +1757,42 @@ deny contains sprintf("harness change needs approval from %v", [p]) if {
 	not approved_by(p)
 }
 
-# cancel: one run by the owner, backup, a tech lead or a label removal;
-# every run (the kill switch) by the owner or backup.
+# cancel: one run by the owner, backup, a tech lead, or a label removal
+# (only the run of the ticket that lost its label); every run (the kill
+# switch) by the owner or backup. The dispatcher must still honour the
+# owner's kill switch when the policy fails to load or evaluate: a
+# fail-closed policy must never block an emergency stop.
 
 cancelers contains p if {
 	some p in owners
 }
 
-cancelers contains p if {
-	some p in data.kod.people.tech_leads
+cancelers contains login if {
+	some p in data.config.people.tech_leads
 	is_string(p)
+	login := lower(p)
 }
 
 grant if {
 	input.action == "cancel"
 	input.scope == "run"
 	input.actor.kind == "label_removal"
+	is_string(input.run.id)
+	input.target.run == input.run.id
 }
 
 grant if {
 	input.action == "cancel"
 	input.scope == "run"
 	input.actor.kind == "human"
-	input.actor.login in cancelers
+	actor_login in cancelers
 }
 
 grant if {
 	input.action == "cancel"
 	input.scope == "all"
 	input.actor.kind == "human"
-	input.actor.login in owners
+	actor_login in owners
 }
 ```
 
@@ -1519,9 +1820,9 @@ git commit -m "kod-policy: merge with requester_approval, harness changes and ca
 **Interfaces:**
 - Consumes: Task 1's `Policy` and helpers; `grant` and `deny` from `kod.rego`.
 - Produces, as input contracts for sub-plans 6 and 4:
-  - `delegate`: `{"ticket": {"risk_class": "low"|"medium"|"high", "paths": [..], "acceptance_criteria": true, "bounces": <number>}, "wip_in_progress": <number>}`. `paths` is optional (repo-relative paths the ticket names); `bounces` is the story's count of rework requests.
+  - `delegate`: `{"ticket": {"risk_class": "low"|"medium"|"high", "paths": [..], "acceptance_criteria": true, "bounces": <number>}, "wip_in_progress": <number>}`. `paths` is optional (repo-relative paths the ticket names, an early filter only); `bounces` is the story's count of rework requests. Task 4 also adds the `publish` veto on `changed_paths` (Task 2's contract).
   - `retention_delete`: `{"record_type": "<type>", "age_days": <number>}`.
-  - Data: `data.kod.delegation.{risk_classes, allowed_classes, path_rules[{prefix, class}], wip_limit, bounce_limit}`, `data.kod.compliance.profiles.<name>.retention_days.<record_type>`.
+  - Data: `data.config.delegation.{risk_classes, allowed_classes, path_rules[{prefix, class}], wip_limit, bounce_limit}`, `data.config.compliance.profiles.<name>.retention_days.<record_type>`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1531,7 +1832,25 @@ git commit -m "kod-policy: merge with requester_approval, harness changes and ca
 mod common;
 
 use common::{allowed, allowed_by, decide, denied, denied_by, policy_with, set, unset};
+use std::collections::BTreeSet;
+
 use serde_json::{Value, json};
+
+/// `known_actions` as policy/kod.rego defines it, read straight from the Rego.
+fn known_actions() -> BTreeSet<String> {
+    let mut engine = regorus::Engine::new();
+    for entry in std::fs::read_dir(common::policy_dir()).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|e| e == "rego") {
+            let text = std::fs::read_to_string(&path).unwrap();
+            engine.add_policy(path.display().to_string(), text).unwrap();
+        }
+    }
+    let value = engine
+        .eval_rule("data.kod.known_actions".to_string())
+        .unwrap();
+    serde_json::from_str(&value.to_json_str().unwrap()).unwrap()
+}
 
 fn delegate() -> Value {
     json!({
@@ -1552,51 +1871,127 @@ fn low_and_medium_tickets_are_delegated_in_phase_1() {
 
 #[test]
 fn a_high_unknown_or_missing_risk_class_is_refused() {
-    denied(set(delegate(), "/ticket/risk_class", json!("high")), "risk class high is not delegated in this phase");
-    denied(set(delegate(), "/ticket/risk_class", json!("urgent")), "unknown risk class: urgent");
-    denied(set(delegate(), "/ticket/risk_class", json!("")), "unknown risk class");
-    denied(unset(delegate(), "/ticket/risk_class"), "ticket has no risk class");
+    denied(
+        set(delegate(), "/ticket/risk_class", json!("high")),
+        "risk class high is not delegated in this phase",
+    );
+    denied(
+        set(delegate(), "/ticket/risk_class", json!("urgent")),
+        "unknown risk class: urgent",
+    );
+    denied(
+        set(delegate(), "/ticket/risk_class", json!("")),
+        "unknown risk class",
+    );
+    denied(
+        unset(delegate(), "/ticket/risk_class"),
+        "ticket has no risk class",
+    );
 }
 
 #[test]
 fn a_path_rule_raises_the_class() {
-    let auth = set(delegate(), "/ticket/paths", json!(["docs/readme.md", "auth/login.rs"]));
-    denied(auth.clone(), "risk class high is not delegated in this phase");
-    denied(auth, "path auth/login.rs raises the risk class to high");
+    let auth = set(
+        delegate(),
+        "/ticket/paths",
+        json!(["docs/readme.md", "auth/login.rs"]),
+    );
     denied(
-        set(delegate(), "/ticket/paths", json!([".github/workflows/ci.yml"])),
+        auth.clone(),
         "risk class high is not delegated in this phase",
     );
-    allowed(set(delegate(), "/ticket/paths", json!(["src/authors.rs", "docs/auth/readme.md"])));
+    denied(auth, "path auth/login.rs raises the risk class to high");
+    denied(
+        set(
+            delegate(),
+            "/ticket/paths",
+            json!([".github/workflows/ci.yml"]),
+        ),
+        "risk class high is not delegated in this phase",
+    );
+    denied(
+        set(delegate(), "/ticket/paths", json!(["src/auth/login.rs"])),
+        "risk class high is not delegated in this phase",
+    );
+    allowed(set(
+        delegate(),
+        "/ticket/paths",
+        json!(["src/authors.rs", "docs/oauth.md"]),
+    ));
 }
 
 #[test]
 fn path_tricks_cannot_dodge_a_path_rule() {
-    for path in ["./auth/login.rs", "Auth/login.rs", "AUTH/login.rs"] {
+    for path in [
+        "./auth/login.rs",
+        "Auth/login.rs",
+        "AUTH/login.rs",
+        "/auth/login.rs",
+        "auth//login.rs",
+        "./././auth/x",
+        "auth\\login.rs",
+        " auth/x",
+        "src/./auth/x",
+    ] {
         denied(
             set(delegate(), "/ticket/paths", json!([path])),
             "risk class high is not delegated in this phase",
         );
     }
-    for path in ["src/../auth/login.rs", "/auth/login.rs", "auth//login.rs", "./././auth/x", ""] {
+    for path in ["src/../auth/login.rs", "src/auth/..", "..", "", " ", "./"] {
         denied(
             set(delegate(), "/ticket/paths", json!([path])),
             "is not a clean repo-relative path",
         );
     }
-    denied(set(delegate(), "/ticket/paths", json!([5])), "is not a clean repo-relative path");
-    denied(set(delegate(), "/ticket/paths", json!("auth/login.rs")), "ticket.paths must be a list");
+    denied(
+        set(delegate(), "/ticket/paths", json!([5])),
+        "is not a clean repo-relative path",
+    );
+    denied(
+        set(delegate(), "/ticket/paths", json!("auth/login.rs")),
+        "ticket.paths must be a list",
+    );
 }
 
 #[test]
 fn admission_needs_criteria_capacity_and_bounces_left() {
-    denied(set(delegate(), "/ticket/acceptance_criteria", json!(false)), "ticket has no acceptance criteria");
-    denied(unset(delegate(), "/ticket/acceptance_criteria"), "ticket has no acceptance criteria");
-    denied(set(delegate(), "/wip_in_progress", json!(1)), "WIP limit reached");
-    denied(unset(delegate(), "/wip_in_progress"), "does not meet the rule");
-    denied(set(delegate(), "/wip_in_progress", json!("0")), "does not meet the rule");
-    denied(set(delegate(), "/ticket/bounces", json!(2)), "bounce limit reached: assign the story to the tech lead");
-    denied(unset(delegate(), "/ticket/bounces"), "does not meet the rule");
+    denied(
+        set(delegate(), "/ticket/acceptance_criteria", json!(false)),
+        "ticket has no acceptance criteria",
+    );
+    denied(
+        unset(delegate(), "/ticket/acceptance_criteria"),
+        "ticket has no acceptance criteria",
+    );
+    denied(
+        set(delegate(), "/wip_in_progress", json!(1)),
+        "WIP limit reached",
+    );
+    denied(
+        unset(delegate(), "/wip_in_progress"),
+        "does not meet the rule",
+    );
+    denied(
+        set(delegate(), "/wip_in_progress", json!("0")),
+        "does not meet the rule",
+    );
+    denied(
+        set(delegate(), "/ticket/bounces", json!(2)),
+        "bounce limit reached: assign the story to the tech lead",
+    );
+    denied(
+        unset(delegate(), "/ticket/bounces"),
+        "does not meet the rule",
+    );
+    denied(
+        set(delegate(), "/wip_in_progress", json!(-1)),
+        "does not meet the rule",
+    );
+    denied(
+        set(delegate(), "/ticket/bounces", json!(-3)),
+        "does not meet the rule",
+    );
 }
 
 #[test]
@@ -1604,7 +1999,9 @@ fn a_malformed_ticket_is_a_policy_error_deny() {
     let d = decide(json!({"action": "delegate", "ticket": "KOD-1", "wip_in_progress": 0}));
     assert!(!d.allow, "{d:?}");
     assert!(
-        d.reasons.iter().any(|r| r.starts_with("policy error") || r.contains("ticket has no risk class")),
+        d.reasons
+            .iter()
+            .any(|r| r.starts_with("policy error") || r.contains("ticket has no risk class")),
         "{d:?}"
     );
 }
@@ -1628,7 +2025,10 @@ fn the_longest_retention_across_active_profiles_wins() {
             "b": {"retention_days": {"run_audit": 2555}}
         }}),
     );
-    allowed_by(&p, json!({"action": "retention_delete", "record_type": "run_audit", "age_days": 2555}));
+    allowed_by(
+        &p,
+        json!({"action": "retention_delete", "record_type": "run_audit", "age_days": 2555}),
+    );
     denied_by(
         &p,
         json!({"action": "retention_delete", "record_type": "run_audit", "age_days": 400}),
@@ -1670,28 +2070,101 @@ fn a_missing_value_in_any_active_profile_denies() {
 /// `known_actions` in policy/kod.rego means adding it here, with its test.
 const ACTIONS: &[(&str, &str)] = &[
     ("local_command", "api::external_rows_are_never_granted"),
-    ("model_request", "agent_ops::model_request_*, a_disallowed_endpoint_is_refused"),
-    ("subscription_model_request", "agent_ops::subscription_*, a_null_or_wrong_workspace_never_matches"),
-    ("read", "agent_ops::reads_are_limited_to_the_ticket_and_its_linked_docs"),
-    ("tracker_write", "agent_ops::tracker_writes_are_limited_to_the_ticket_and_its_linked_requests"),
-    ("draft_doc_write", "agent_ops::draft_doc_writes_are_limited_to_the_runs_own_draft"),
+    (
+        "model_request",
+        "agent_ops::model_request_*, a_disallowed_endpoint_is_refused",
+    ),
+    (
+        "subscription_model_request",
+        "agent_ops::subscription_*, a_null_or_wrong_workspace_never_matches",
+    ),
+    (
+        "read",
+        "agent_ops::reads_are_limited_to_the_ticket_and_its_linked_docs",
+    ),
+    (
+        "tracker_write",
+        "agent_ops::tracker_writes_are_limited_to_the_ticket_and_its_linked_requests",
+    ),
+    (
+        "draft_doc_write",
+        "agent_ops::draft_doc_writes_are_limited_to_the_runs_own_draft",
+    ),
     ("publish", "agent_ops::publish_*"),
-    ("merge", "human_ops::not_sole_*, allowed_*, forbidden_*, agent_approvals_block_the_merge"),
-    ("harness_change", "human_ops::a_harness_change_needs_the_owner_and_the_backup_once_named"),
-    ("cancel", "human_ops::who_may_cancel_a_run_or_pull_the_kill_switch"),
+    (
+        "merge",
+        "human_ops::not_sole_*, allowed_*, forbidden_*, agent_approvals_block_the_merge",
+    ),
+    (
+        "harness_change",
+        "human_ops::a_harness_change_needs_the_owner_and_the_backup_once_named",
+    ),
+    (
+        "cancel",
+        "human_ops::who_may_cancel_a_run_or_pull_the_kill_switch",
+    ),
     ("sign_release", "api::external_rows_are_never_granted"),
     ("delegate", "delegation::*"),
-    ("retention_delete", "delegation::retention_*, a_missing_value_in_any_active_profile_denies"),
+    (
+        "retention_delete",
+        "delegation::retention_*, a_missing_value_in_any_active_profile_denies",
+    ),
 ];
 
 #[test]
 fn every_action_is_known_and_denies_an_empty_request() {
-    assert_eq!(ACTIONS.len(), 13, "11 matrix rows plus delegate and retention_delete");
+    let listed: BTreeSet<String> = ACTIONS.iter().map(|(a, _)| a.to_string()).collect();
+    assert_eq!(
+        listed,
+        known_actions(),
+        "ACTIONS must match known_actions in policy/kod.rego"
+    );
     for (action, _) in ACTIONS {
         let d = decide(json!({"action": action}));
         assert!(!d.allow, "{action}: {d:?}");
-        assert!(!d.reasons.iter().any(|r| r == "unknown action"), "{action}: {d:?}");
+        assert!(
+            !d.reasons.iter().any(|r| r == "unknown action"),
+            "{action}: {d:?}"
+        );
     }
+}
+
+// publish: the diff's own paths, whatever the ticket said
+
+fn publish(changed: Value) -> Value {
+    json!({
+        "action": "publish", "actor": {"kind": "agent"},
+        "run": {"id": "r1", "ticket": "KOD-1", "repo": "acme/app", "canceled": false, "data_classes": ["placeholder"]},
+        "target": {"repo": "acme/app", "branch": "agent/KOD-1-r1", "draft": true},
+        "changed_paths": changed
+    })
+}
+
+#[test]
+fn publish_refuses_a_diff_that_touches_a_high_risk_path() {
+    allowed(publish(json!(["src/lib.rs"])));
+    for path in [
+        "auth/login.rs",
+        "./AUTH/login.rs",
+        "src/auth/login.rs",
+        ".github/workflows/ci.yml",
+    ] {
+        denied(
+            publish(json!(["src/lib.rs", path])),
+            "raises the risk class to high",
+        );
+    }
+    denied(
+        publish(json!(["src/../auth/x.rs"])),
+        "is not a clean repo-relative path",
+    );
+    denied(
+        publish(json!("auth/x.rs")),
+        "publish needs changed_paths as a list",
+    );
+    let mut missing = publish(json!([]));
+    missing.as_object_mut().unwrap().remove("changed_paths");
+    denied(missing, "publish needs changed_paths as a list");
 }
 ```
 
@@ -1706,11 +2179,48 @@ Expected: FAIL. No `delegate` or `retention_delete` grant exists yet, and the sp
 
 ```json
 {
-  "risk_classes": { "low": 0, "medium": 1, "high": 2 },
-  "allowed_classes": ["low", "medium"],
+  "risk_classes": {
+    "low": 0,
+    "medium": 1,
+    "high": 2
+  },
+  "allowed_classes": [
+    "low",
+    "medium"
+  ],
   "path_rules": [
-    { "prefix": "auth/", "class": "high" },
-    { "prefix": ".github/", "class": "high" }
+    {
+      "prefix": "auth/",
+      "class": "high"
+    },
+    {
+      "prefix": "payments/",
+      "class": "high"
+    },
+    {
+      "prefix": "crypto/",
+      "class": "high"
+    },
+    {
+      "prefix": "migrations/",
+      "class": "high"
+    },
+    {
+      "prefix": "infra/",
+      "class": "high"
+    },
+    {
+      "prefix": ".github/",
+      "class": "high"
+    },
+    {
+      "prefix": "policy/",
+      "class": "high"
+    },
+    {
+      "prefix": "codeowners",
+      "class": "high"
+    }
   ],
   "wip_limit": 1,
   "bounce_limit": 2
@@ -1737,29 +2247,49 @@ Expected: FAIL. No `delegate` or `retention_delete` grant exists yet, and the sp
 # Caller: sub-plan 6 (dispatcher), which also makes admission atomic.
 package kod
 
-risk := data.kod.delegation.risk_classes
+risk := data.config.delegation.risk_classes
 
 ticket_paths := object.get(object.get(input, "ticket", {}), "paths", [])
 
-# Lower-cased, with one leading ./ removed. Only for strings.
-clean_path(p) := trim_prefix(lower(p), "./") if is_string(p)
+path_rules := data.config.delegation.path_rules
 
+skip_segment(seg) if seg in {"", "."}
+
+# Normalised for matching: trimmed, lower-cased, backslashes read as
+# slashes, empty and "." segments dropped. Only for strings.
+path_segments(p) := [seg |
+	some seg in split(replace(lower(trim_space(p)), "\\", "/"), "/")
+	not skip_segment(seg)
+] if is_string(p)
+
+clean_path(p) := concat("/", path_segments(p))
+
+# Refused outright: not a string, empty, or with a ".." segment.
 bad_path(p) if not is_string(p)
 
-bad_path(p) if {
-	is_string(p)
-	some seg in split(trim_prefix(p, "./"), "/")
-	seg in {"", ".", ".."}
+bad_path(p) if clean_path(p) == ""
+
+bad_path(p) if ".." in path_segments(p)
+
+# A rule matches at the top of the repo or below any directory, so
+# src/auth/x is raised like auth/x.
+path_matches(cp, prefix) if startswith(cp, lower(prefix))
+
+path_matches(cp, prefix) if contains(cp, concat("", ["/", lower(prefix)]))
+
+bad_paths_in(paths) := {p | some p in paths; bad_path(p)}
+
+ranks_in(paths) := {risk[r.class] |
+	some p in paths
+	some r in path_rules
+	path_matches(clean_path(p), r.prefix)
 }
 
-bad_paths := {p | is_array(ticket_paths); some p in ticket_paths; bad_path(p)}
+class_allowed(c) if c in data.config.delegation.allowed_classes
 
-raised_ranks := {risk[r.class] |
-	is_array(ticket_paths)
-	some p in ticket_paths
-	some r in data.kod.delegation.path_rules
-	startswith(clean_path(p), r.prefix)
-}
+bad_paths := bad_paths_in(ticket_paths) if is_array(ticket_paths)
+
+raised_ranks := ranks_in(ticket_paths) if is_array(ticket_paths)
 
 effective_rank := max(raised_ranks | {risk[input.ticket.risk_class]})
 
@@ -1768,7 +2298,7 @@ effective_class := c if {
 	rank == effective_rank
 }
 
-class_delegated if effective_class in data.kod.delegation.allowed_classes
+class_delegated if class_allowed(effective_class)
 
 has_criteria if input.ticket.acceptance_criteria == true
 
@@ -1779,9 +2309,11 @@ grant if {
 	class_delegated
 	has_criteria
 	is_number(input.wip_in_progress)
-	input.wip_in_progress < data.kod.delegation.wip_limit
+	input.wip_in_progress >= 0
+	input.wip_in_progress < data.config.delegation.wip_limit
 	is_number(input.ticket.bounces)
-	input.ticket.bounces < data.kod.delegation.bounce_limit
+	input.ticket.bounces >= 0
+	input.ticket.bounces < data.config.delegation.bounce_limit
 }
 
 deny contains "ticket has no risk class" if {
@@ -1806,8 +2338,8 @@ deny contains sprintf("path %v raises the risk class to %v", [p, r.class]) if {
 	not class_delegated
 	is_array(ticket_paths)
 	some p in ticket_paths
-	some r in data.kod.delegation.path_rules
-	startswith(clean_path(p), r.prefix)
+	some r in path_rules
+	path_matches(clean_path(p), r.prefix)
 	risk[r.class] > risk[input.ticket.risk_class]
 }
 
@@ -1826,16 +2358,40 @@ deny contains "ticket has no acceptance criteria" if {
 	not has_criteria
 }
 
-deny contains sprintf("WIP limit reached (%v)", [data.kod.delegation.wip_limit]) if {
+deny contains sprintf("WIP limit reached (%v)", [data.config.delegation.wip_limit]) if {
 	input.action == "delegate"
 	is_number(input.wip_in_progress)
-	input.wip_in_progress >= data.kod.delegation.wip_limit
+	input.wip_in_progress >= data.config.delegation.wip_limit
 }
 
 deny contains "bounce limit reached: assign the story to the tech lead" if {
 	input.action == "delegate"
 	is_number(input.ticket.bounces)
-	input.ticket.bounces >= data.kod.delegation.bounce_limit
+	input.ticket.bounces >= data.config.delegation.bounce_limit
+}
+
+# publish: the diff's own paths decide, whatever the ticket said. A change
+# that touches a path whose class isn't delegated is refused. Sub-plan 5
+# passes the paths of the diff it is about to push.
+
+deny contains "publish needs changed_paths as a list" if {
+	input.action == "publish"
+	not is_array(input.changed_paths)
+}
+
+deny contains sprintf("path %v is not a clean repo-relative path", [p]) if {
+	input.action == "publish"
+	is_array(input.changed_paths)
+	some p in bad_paths_in(input.changed_paths)
+}
+
+deny contains sprintf("publish: path %v raises the risk class to %v", [p, r.class]) if {
+	input.action == "publish"
+	is_array(input.changed_paths)
+	some p in input.changed_paths
+	some r in path_rules
+	path_matches(clean_path(p), r.prefix)
+	not class_allowed(r.class)
 }
 ```
 
@@ -1851,7 +2407,7 @@ Note on `"ticket": "KOD-1"` (`a_malformed_ticket_is_a_policy_error_deny`): `obje
 # that reads a missing value denies. Caller: sub-plan 4 (audit store).
 package kod
 
-profiles := data.kod.compliance.profiles
+profiles := data.config.compliance.profiles
 
 retention_known if {
 	count(profiles) > 0
@@ -1898,7 +2454,7 @@ to:
 - [ ] **Step 7: Run the whole suite and the CI checks**
 
 Run: `cargo fmt --all --check && cargo clippy --all-targets -- -D warnings && cargo test --all`
-Expected: all pass. `kod-policy` runs `api` (8), `agent_ops` (15), `human_ops` (8) and `delegation` (10) tests.
+Expected: all pass. `kod-policy` runs `api` (10), `agent_ops` (15), `human_ops` (9) and `delegation` (11) tests.
 
 - [ ] **Step 8: Commit**
 
@@ -1922,10 +2478,10 @@ After Task 4, one fresh reviewer reads the whole branch against the spec section
 ## Self-review
 
 - **Spec coverage.**
-  - Action and permission matrix: all 11 rows have an action and tests (Tasks 1 to 3), including the vendor-login row (Task 2). The two rows enforced elsewhere are always denied with the enforcer named (D6). `every_action_is_known_and_denies_an_empty_request` lists them (Task 4).
+  - Action and permission matrix: all 11 rows have an action and tests (Tasks 1 to 3), including the vendor-login row (Task 2). The two rows enforced elsewhere are always denied with the enforcer named (D6). The Task 4 coverage test compares its list with `data.kod.known_actions`.
   - "An operation not listed here is refused": `unknown action` and default deny (Task 1).
   - Model routing: unknown or missing class refused, one placeholder class and endpoint (Task 2, D8).
-  - Delegation policy: risk classes, phase 1 eligibility, a ticket with no class refused, path rules raise the class, bounce limit, WIP placeholder (Task 4, D10).
+  - Delegation policy: risk classes, phase 1 eligibility, a ticket with no class refused, bounce limit, WIP placeholder (Task 4, D10). "A change that touches auth/ is high, whatever the ticket says" is enforced on the diff at publish (`changed_paths`); the ticket's own paths are only an early filter at delegate time.
   - Requester approval: `allowed`, `not_sole` (default), `forbidden`, and agents never approve (Task 3, D11).
   - Compliance profile: a placeholder, missing values deny, strictest wins (Task 4, D12).
   - Credential exception and eligibility check: offline contexts only, business plans, recorded workspace (Task 2, D13).
@@ -1935,14 +2491,15 @@ After Task 4, one fresh reviewer reads the whole branch against the spec section
 - **Type consistency.**
   - `Policy::load(&Path) -> anyhow::Result<Policy>`, `version(&self) -> &str` and `decide(&self, &Value) -> Decision` match between Task 1's code, its Interfaces block and `tests/common/mod.rs`.
   - The helpers `allowed`, `denied`, `allowed_by`, `denied_by`, `policy_with`, `set` and `unset` are defined in Task 1 and used with the same signatures in Tasks 2 to 4.
-  - Data file stems (`routing`, `subscription`, `publish`, `people`, `teams`, `delegation`, `compliance`) match the `data.kod.<stem>` paths in the Rego, and no rule uses those names.
+  - Data file stems (`routing`, `subscription`, `publish`, `people`, `teams`, `delegation`, `compliance`) match the `data.config.<stem>` paths in the Rego. Data can't shadow a rule: `data_files_cannot_override_rules` (Task 1).
   - Reason strings asserted in the tests appear verbatim in the Rego: for example "the run has no data class", "no approved workspace is recorded for runner", "requester_approval is not_sole: the requester can't be the only approver", "compliance profile %v has no retention_days.%v".
   - Rules defined more than once (`grant`, `own_or_linked`, `bad_path`, `owners`, `cancelers`) are boolean, function or partial-set rules. Single-value rules are defined once; `reasons` uses an `else` chain with bodies.
-- **Review Focus.** Each of the five lines names tests in its owning task.
+- **Review Focus.** Each of the seven lines names tests in its owning task. The action-coverage test (Task 4) evaluates `data.kod.known_actions` with regorus and compares it with its `ACTIONS` list, so an action added to the Rego without a test fails it.
 
 ## Open items
 
-- **Compliance profile values**, **routing values** (data classes and endpoints), **team settings** for `requester_approval`, **tech leads**, the **backup owner** and the **real path rules** per product repo: each is a data-file change, reviewed like code. Until then the rules that read them deny or use the spec's defaults.
+- **Compliance profile values**, **routing values** (data classes and endpoints), **team settings** for `requester_approval`, **tech leads**, the **backup owner** and the **real path rules** per product repo (the placeholder list is the design's examples; the harness path is not in it yet): each is a data-file change, reviewed like code. Until then the rules that read them deny or use the spec's defaults.
 - **Matrix rows for `delegate` and `retention_delete`** (D7): the spec's matrix doesn't list the dispatcher admitting a ticket or the audit store deleting expired records. The owner decides whether to add rows.
 - **Harness changes before the backup is named** (D14): the rule needs the owner's approval, and GitHub doesn't let an author approve their own PR, so an owner-authored harness change can't pass `harness_change` until a second named approver exists.
 - **Approved seat workspaces** for subscription mode (D13): record them once the spike's eligibility check is done.
+- **Kill-switch actors** (D14): the matrix lists owner, tech lead and label removal under cancel; this plan gives the kill switch (all runs) to the owner and backup only. The owner confirms.
