@@ -43,7 +43,7 @@ This doc designs a harness that lets an AI agent take a ticket and hand back a p
 
 v1 harness · 6 flow components, 3 support services
 
-The sandbox holds no long-lived credentials, and the agent never calls an external system directly. Every external operation (tracker, docs, model, git publish) passes through a gateway, which asks the policy engine, injects a short-lived credential and records the decision. Local work inside the sandbox (shell, builds, tests, file edits) isn't a gateway call; the sandbox contains it (see Trust boundaries). The only write the agent can make to the repo is the gateway's publish operation: a push to its own agent/\<ticket\> branch plus a draft PR, so everything it produces still goes through CI and human review.
+The sandbox holds no long-lived credentials, and the agent never calls an external system directly. The one named exception is a vendor runner in subscription mode (see Subscription auth for vendor runners). Every external operation (tracker, docs, model, git publish) passes through a gateway, which asks the policy engine, injects a short-lived credential and records the decision. Local work inside the sandbox (shell, builds, tests, file edits) isn't a gateway call; the sandbox contains it (see Trust boundaries). The only write the agent can make to the repo is the gateway's publish operation: a push to its own agent/\<ticket\> branch plus a draft PR, so everything it produces still goes through CI and human review.
 
 This implements the control architecture in [*DevSecOps SDLC with AI Agents*](devsecops-sdlc.md): the sandbox → gateway → policy → audit spine is the same. This diagram adds what Kod is concrete about: the tracker and dispatcher on the way in, the pluggable model, and the draft-PR path on the way out.
 
@@ -396,11 +396,30 @@ The tracker connects to the harness in two places, so pluggability needs two pie
 
 **Controls:**
 
-- Log in once, not per run. Credentials are stored once on the host and handled like the model key: never on a command line, never in results, and stopped by the kill switch.
+- Log in once, not per run. Credentials are stored once on the host and handled like the model key: never on a command line, never in results, and in the sandbox only under the exception below.
 - kod-eval checks every credential before a run. If one has expired or been revoked, it stops with a clear "log in again" message.
-- When the credential is inside the sandbox (Codex, Cursor), egress is allowed only to that vendor's domains, and each run is bounded by its timeout.
-- The run manifest records the auth mode. `kod-eval compare` already refuses runs whose model endpoint or limits differ. It also refuses runs whose auth mode differs.
+- When the credential is inside the sandbox (Codex, Cursor), the exception below applies. Egress is allowed only to that vendor's domains, and each run is bounded by its timeout.
+- Requirement for enabling subscription mode, not a current control: the run manifest records the auth mode. `kod-eval compare` refuses runs whose model endpoint or limits differ today. It must also refuse runs whose auth mode differs.
 - The routing policy decides where subscription mode is allowed. Example: offline evals and low-risk tickets. Restricted data never, unless the plan's data terms cover it.
+
+**Exception: credential inside the sandbox.** Codex, Cursor and the Claude fallback put a reusable credential in the sandbox that runs repo code. This is a named exception to the rule that the sandbox holds no long-lived credentials.
+
+- Allowed scope: sanitized offline spike and evals only. Not the connected pilot, until security accepts the risk and the controls are evidenced.
+- Still holds: egress limited to the vendor's domains, the container bounds, and the audit record.
+- Lost: repo code can read or copy the token. Passing it by name or as a read-only file does not stop reading.
+- Compromise response: revoke the token at the vendor and rotate it. The kill switch stops local use only. It does not revoke.
+
+**Eligibility check.** A valid login is not proof of the right account.
+
+- Record non-secret identity evidence for each seat: account, and workspace or org id.
+- Valid credentials for the wrong workspace must be refused.
+- Where this can't be checked programmatically, an admin attests it in writing. For Codex, pin the login with `forced_login_method` and `forced_chatgpt_workspace_id` ([Codex auth](https://developers.openai.com/codex/auth/)).
+
+**Before enabling subscription mode.** These are requirements, not current controls. A passing spike shows feasibility only. It does not make a runner ready.
+
+- Persist the effective auth mode in the run manifest.
+- `kod-eval compare` rejects runs with different auth modes.
+- A legacy manifest with no recorded mode is refused. It is read as `api_key` only when that mode was recorded.
 
 **What is lost when the proxy can't be in the path:** the per-run model allowlist, token caps, request budget and token counts. What remains is the vendor plan limits plus Kod's turn limit, timeout and kill switch.
 
@@ -417,6 +436,10 @@ The tracker connects to the harness in two places, so pluggability needs two pie
 - [ ] Whether traffic can go through kod-llm-proxy (Claude Code: the proxy injects the subscription token; Codex: whether subscription traffic can be routed; Cursor: expected no)
 - [ ] What the tool reports for usage and cost
 - [ ] That expiry is detected
+- [ ] Adversarial: untrusted code tries to read or exfiltrate the credential into workspace output or the diff
+- [ ] Egress to non-vendor hosts is blocked
+- [ ] Cancel a run and confirm local use stops. Document that revoking the token is a separate manual step
+- [ ] Credentials for the wrong workspace are refused, and non-secret identity evidence is recorded
 
 ## RAG: not in v1
 
@@ -573,7 +596,7 @@ Data written into a PR or sent in a model request remains a residual risk, recor
 
 **Trusted authorship isn't authority.** A team member's comment can carry pasted external text. Instructions may change how the agent does the ticket, never its scope: changing scope or authorizing an action goes through the tracker and the approvers.
 
-**Secrets.** The sandbox holds none. The gateway injects a short-lived, narrowly scoped token for each external call. The git token exists only inside the gateway's publish operation, which can push to agent/\* branches and open draft PRs, nothing else.
+**Secrets.** The sandbox holds none, except the named subscription-auth exception. The gateway injects a short-lived, narrowly scoped token for each external call. The git token exists only inside the gateway's publish operation, which can push to agent/\* branches and open draft PRs, nothing else.
 
 **Protected paths.** Changes to CI config, CODEOWNERS, policy rules, the harness itself and existing test assertions fail the protected-paths required check unless an extra CODEOWNERS reviewer approves. Runner hooks may warn earlier, but the check is the control. This stops an agent from making a build pass by weakening it.
 
@@ -601,6 +624,8 @@ Agent code runs only in the top zone. Everything it does outside goes through th
 
 **Caches.** Sandboxes read a per-repo cache that trusted CI builds from the main branch, and write only to a per-run cache that is thrown away. Nothing an untrusted run builds reaches a release.
 
+**Credential exception.** A vendor runner in subscription mode can hold its vendor credential in the local execution zone. Repo code can read it. It is allowed only for the sanitized offline spike and evals, with egress limited to the vendor, until security accepts the risk and the controls are evidenced. See Subscription auth for vendor runners.
+
 **Not recorded:** system calls and file reads inside the sandbox. If evidence must cover those, add sandbox-level tracing later.
 
 ### Sandbox isolation
@@ -619,6 +644,7 @@ Every operation Kod can perform, where it is enforced and what happens when it i
 |----|----|----|----|----|----|
 | Local commands: shell, build, test, file edits (agent) | Its own workspace; egress allowlist only | None | Sandbox: container, egress rules, limits | Commands, exit codes, final diff, resource use | Command fails; run ends at its limits; nothing leaves the sandbox |
 | Model request (agent) | Endpoints the routing policy allows for the run's data class | None | LLM gateway and routing policy | Endpoint, model, tokens; redacted prompt and output | Refused; with no allowed endpoint the run ends as needs a human |
+| Vendor-login model request (vendor runner, subscription mode) | Sanitized offline spike and evals only; egress to that vendor's domains only | Security acceptance for anything beyond the spike | Sandbox egress rules and run timeout. The token is readable by repo code | Auth mode and seat identity. No token counts | Refused; on suspected exposure revoke the token at the vendor and rotate it |
 | Read tracker or docs (agent) | The ticket and the docs it links | None | Gateway policy | Call, IDs, result size | Refused and logged |
 | Write to the tracker: comment, transition, create a linked rework request (agent) | Its own ticket and requests linked to it | None | Gateway policy | Call and content | Refused and logged |
 | Write a draft doc (agent, phase 1) | Its own draft in the Draft folder | A human moves it to Approved | Gateway policy; Drive permissions | Named version before each edit | Refused and logged |
