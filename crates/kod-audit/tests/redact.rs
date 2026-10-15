@@ -48,6 +48,8 @@ fn ordinary_text_is_left_alone() {
         "https://example.com:8443/a@b and user@example.com",
         "PWD=/home/kod OLDPWD=/tmp author: Jane timeout = 30 port: 5432",
         "at 12:30 see https://example.com",
+        r#"{"max_tokens": 4096}"#,
+        r#"[{"max_tokens":4096}]"#,
     ] {
         assert_eq!(redact(text), text);
     }
@@ -216,4 +218,16 @@ fn stripe_keys_are_redacted() {
 fn long_non_matching_tokens_are_left_alone() {
     let text = "_".repeat(128 * 1024);
     assert_eq!(redact(&text), text);
+    let text = "a:".repeat(64 * 1024);
+    assert_eq!(redact(&text), text);
+    let text = format!("http://{}", ":".repeat(64 * 1024));
+    assert_eq!(redact(&text), text);
+}
+
+#[test]
+fn values_stop_at_closing_brackets() {
+    assert_eq!(
+        redact("(token=abcdef123456)"),
+        format!("(token={REDACTED})")
+    );
 }

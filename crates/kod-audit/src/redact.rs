@@ -177,7 +177,7 @@ fn token_at(text: &str, i: usize) -> Option<usize> {
 }
 
 /// End of a value starting at `i`: a quoted value with its quotes, otherwise
-/// up to whitespace or `"'&;,`.
+/// up to whitespace or `"'&;,}])`.
 fn value_end(text: &str, i: usize) -> usize {
     let bytes = text.as_bytes();
     match bytes[i] {
@@ -187,7 +187,7 @@ fn value_end(text: &str, i: usize) -> usize {
         _ => {
             i + bytes[i..]
                 .iter()
-                .take_while(|b| !b.is_ascii_whitespace() && !b"\"'&;,".contains(b))
+                .take_while(|b| !b.is_ascii_whitespace() && !b"\"'&;,}])".contains(b))
                 .count()
         }
     }
@@ -263,12 +263,12 @@ fn url_password_at(text: &str, i: usize) -> Option<usize> {
     if i == 0 || bytes[i - 1] != b':' {
         return None;
     }
-    let user_start = text[..i - 1].rfind("://")? + 3;
-    let user = &bytes[user_start..i - 1];
-    if user
+    let user_len = bytes[..i - 1]
         .iter()
-        .any(|b| b"/@:".contains(b) || b.is_ascii_whitespace())
-    {
+        .rev()
+        .take_while(|b| !b"/@:".contains(b) && !b.is_ascii_whitespace())
+        .count();
+    if !text[..i - 1 - user_len].ends_with("://") {
         return None;
     }
     let len = bytes[i..]
