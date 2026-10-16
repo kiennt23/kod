@@ -76,10 +76,15 @@ WHEN NEW.payload IS NOT NULL OR NEW.seq IS NOT OLD.seq OR NEW.at IS NOT OLD.at
 BEGIN SELECT RAISE(ABORT, 'audit log is append-only'); END;
 ";
 
+fn file_id(path: &Path) -> std::io::Result<(u64, u64)> {
+    let m = std::fs::metadata(path)?;
+    Ok((m.dev(), m.ino()))
+}
+
 pub struct AuditLog {
-    path: PathBuf,
-    /// (dev, ino) of the db file at open; every transaction re-checks it.
-    id: (u64, u64),
+    /// The db file and its -wal, with their (dev, ino) at open; every
+    /// transaction re-checks both.
+    files: [(PathBuf, (u64, u64)); 2],
     conn: Mutex<Connection>,
 }
 
@@ -212,7 +217,7 @@ impl AuditLog {
         let context = || format!("audit store {}", path.display());
         // Identity is taken before SQLite opens the path: a swap in between
         // makes the first write fail closed.
-        let meta = std::fs::metadata(path).with_context(context)?;
+        let db_id = file_id(path).with_context(context)?;
         let conn = Connection::open_with_flags(path, flags | OpenFlags::SQLITE_OPEN_NO_MUTEX)
             .with_context(context)?;
         conn.busy_timeout(BUSY_TIMEOUT)?;
@@ -226,9 +231,14 @@ impl AuditLog {
         }
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.execute_batch(SCHEMA)?;
+        // The -wal exists while this connection is open in WAL mode. Deleting
+        // it leaves writes in an unlinked file that a crash loses.
+        let mut wal = path.as_os_str().to_owned();
+        wal.push("-wal");
+        let wal = PathBuf::from(wal);
+        let wal_id = file_id(&wal).with_context(context)?;
         Ok(AuditLog {
-            path: path.to_path_buf(),
-            id: (meta.dev(), meta.ino()),
+            files: [(path.to_path_buf(), db_id), (wal, wal_id)],
             conn: Mutex::new(conn),
         })
     }
@@ -250,14 +260,18 @@ impl AuditLog {
         let mut conn = self.lock()?;
         // Fail closed: a write to an unlinked or swapped file would return Ok
         // and land where no one will ever read it.
-        let now = std::fs::metadata(&self.path)
-            .map(|m| (m.dev(), m.ino()))
-            .with_context(|| format!("audit store {} is gone", self.path.display()))?;
-        if now != self.id {
-            bail!(
-                "audit store {} was replaced while open",
-                self.path.display()
-            );
+        // ponytail: identity is checked before the transaction begins, so a
+        // swap between this stat and commit is not caught; upgrade path is to
+        // hold an fd to the db and compare fstat after commit.
+        for (path, id) in &self.files {
+            let now = file_id(path)
+                .with_context(|| format!("audit store file {} is gone", path.display()))?;
+            if now != *id {
+                bail!(
+                    "audit store file {} was replaced while open",
+                    path.display()
+                );
+            }
         }
         let tx = conn.transaction_with_behavior(behavior)?;
         let out = f(&tx)?;

@@ -211,5 +211,8 @@ fn purge_rejects_an_unknown_record_type() {
         ],
     );
     assert!(!ok, "{v}");
-    assert!(v["error"].as_str().unwrap().contains("prompt"), "{v}");
+    assert!(
+        v["error"].as_str().unwrap().contains("unknown record type"),
+        "{v}"
+    );
 }

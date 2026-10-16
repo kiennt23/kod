@@ -278,3 +278,19 @@ fn before_does_not_run_the_call_after_the_store_is_deleted() {
     assert!(r.is_err());
     assert!(!ran.get());
 }
+
+#[test]
+fn append_errors_after_only_the_wal_is_deleted() {
+    let f = fixture();
+    f.log.append(RUN_AUDIT, &json!({"n": 1})).unwrap();
+    for ext in ["-wal", "-shm"] {
+        let mut p = f.db().into_os_string();
+        p.push(ext);
+        std::fs::remove_file(p).unwrap();
+    }
+    assert!(f.log.append(RUN_AUDIT, &json!({"n": 2})).is_err());
+    let ran = Cell::new(false);
+    let r = f.log.before(RUN_AUDIT, &json!({"n": 3}), || ran.set(true));
+    assert!(r.is_err());
+    assert!(!ran.get());
+}
