@@ -8,7 +8,11 @@
 //! checkpoints the host cannot forge (run it under the checkpoint account,
 //! against a copy of the log). Entries after the last checkpoint can be
 //! truncated without trace.
+pub mod checkpoint;
 pub mod redact;
+mod verify;
+
+pub use verify::Verified;
 
 use anyhow::{Context, Result, anyhow, bail};
 use kod_policy::Decision;
