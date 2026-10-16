@@ -1,4 +1,4 @@
-use crate::{AuditLog, RETENTION, RUN_AUDIT, append_in};
+use crate::{AuditLog, PURGEABLE, RETENTION, RUN_AUDIT, append_in};
 use anyhow::{Result, bail};
 use kod_policy::Policy;
 use rusqlite::{Transaction, TransactionBehavior, params};
@@ -21,6 +21,11 @@ impl AuditLog {
     pub fn purge(&self, policy: &Policy, record_type: &str, now: i64) -> Result<usize> {
         if record_type == RETENTION {
             bail!("retention records are kept for the life of the log");
+        }
+        if !PURGEABLE.contains(&record_type) {
+            bail!(
+                "cannot purge unknown record type {record_type:?}; expected one of {PURGEABLE:?}"
+            );
         }
         let mut deleted = 0;
         loop {

@@ -241,3 +241,40 @@ fn entry_hash_rejects_malformed_hex_without_panicking() {
         assert!(entry_hash(&good, 1, 0, "x", &bad).is_err(), "{bad:?}");
     }
 }
+
+fn remove_store(f: &Fixture) {
+    for ext in ["", "-wal", "-shm"] {
+        let mut p = f.db().into_os_string();
+        p.push(ext);
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+#[test]
+fn append_errors_after_the_store_is_deleted() {
+    let f = fixture();
+    f.log.append(RUN_AUDIT, &json!({"n": 1})).unwrap();
+    remove_store(&f);
+    assert!(f.log.append(RUN_AUDIT, &json!({"n": 2})).is_err());
+    assert!(!f.db().exists());
+}
+
+#[test]
+fn append_errors_after_the_store_is_replaced() {
+    let f = fixture();
+    f.log.append(RUN_AUDIT, &json!({"n": 1})).unwrap();
+    let other = f.dir.path().join("other.db");
+    drop(AuditLog::open(&other).unwrap());
+    std::fs::rename(&other, f.db()).unwrap();
+    assert!(f.log.append(RUN_AUDIT, &json!({"n": 2})).is_err());
+}
+
+#[test]
+fn before_does_not_run_the_call_after_the_store_is_deleted() {
+    let f = fixture();
+    remove_store(&f);
+    let ran = Cell::new(false);
+    let r = f.log.before(RUN_AUDIT, &json!({"n": 1}), || ran.set(true));
+    assert!(r.is_err());
+    assert!(!ran.get());
+}

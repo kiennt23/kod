@@ -177,3 +177,39 @@ fn verify_checks_retention_records_against_the_released_policies() {
         "{v}"
     );
 }
+
+#[test]
+fn read_and_maintenance_commands_never_create_the_db() {
+    let f = fixture();
+    let missing = f.dir.path().join("typo.db");
+    let policy = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../policy");
+    let policy = policy.to_str().unwrap();
+    for args in [
+        vec!["verify"],
+        vec!["checkpoint"],
+        vec!["purge", "--policy", policy, "--record-type", RUN_AUDIT],
+    ] {
+        let (ok, v) = run_at(&missing, &f.target.dir, &args);
+        assert!(!ok, "{args:?}: {v}");
+        assert_eq!(v["ok"], false);
+        assert!(!missing.exists(), "{args:?} created the db");
+    }
+}
+
+#[test]
+fn purge_rejects_an_unknown_record_type() {
+    let f = fixture();
+    let policy = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../policy");
+    let (ok, v) = run(
+        &f,
+        &[
+            "purge",
+            "--policy",
+            policy.to_str().unwrap(),
+            "--record-type",
+            "prompt",
+        ],
+    );
+    assert!(!ok, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("prompt"), "{v}");
+}

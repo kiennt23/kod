@@ -8,6 +8,9 @@
 //! checkpoints the host cannot forge (run it under the checkpoint account,
 //! against a copy of the log). Entries after the last checkpoint can be
 //! truncated without trace.
+#[cfg(not(unix))]
+compile_error!("kod-audit identifies its store by (dev, ino) and is unix-only");
+
 pub mod checkpoint;
 pub mod redact;
 mod retention;
@@ -18,11 +21,14 @@ pub use verify::Verified;
 
 use anyhow::{Context, Result, anyhow, bail};
 use kod_policy::Decision;
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    path::Path,
+    os::unix::fs::MetadataExt,
+    path::{Path, PathBuf},
     sync::{Mutex, MutexGuard},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -34,6 +40,9 @@ pub const RUN_AUDIT: &str = "run_audit";
 /// Deletion records, written only by `purge`. Never deleted themselves:
 /// `verify` needs them to account for every removed payload.
 pub const RETENTION: &str = "retention";
+/// The record types `purge` accepts: what the runbook purge timer iterates.
+/// RETENTION must never be among them.
+pub const PURGEABLE: &[&str] = &[RUN_AUDIT, "prompts", "model_outputs"];
 /// How long a write waits for another writer before it fails.
 pub const BUSY_TIMEOUT: Duration = Duration::from_secs(2);
 /// Maximum serialized payload size, checked before redaction and locking.
@@ -68,6 +77,9 @@ BEGIN SELECT RAISE(ABORT, 'audit log is append-only'); END;
 ";
 
 pub struct AuditLog {
+    path: PathBuf,
+    /// (dev, ino) of the db file at open; every transaction re-checks it.
+    id: (u64, u64),
     conn: Mutex<Connection>,
 }
 
@@ -176,19 +188,33 @@ impl AuditLog {
     /// The file is made 0600 before SQLite opens it, and SQLite gives the
     /// -wal and -shm files the same mode.
     pub fn open(path: &Path) -> Result<AuditLog> {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("audit store {}", path.display()))?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        Self::open_with(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+        )
+    }
+
+    /// Opens a log that must already exist; never creates the file. For the
+    /// CLI's read and maintenance paths, where a missing file is a mistake.
+    pub fn open_existing(path: &Path) -> Result<AuditLog> {
+        Self::open_with(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+    }
+
+    fn open_with(path: &Path, flags: OpenFlags) -> Result<AuditLog> {
         let context = || format!("audit store {}", path.display());
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .mode(0o600)
-                .open(path)
-                .with_context(context)?;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        }
-        let conn = Connection::open(path).with_context(context)?;
+        // Identity is taken before SQLite opens the path: a swap in between
+        // makes the first write fail closed.
+        let meta = std::fs::metadata(path).with_context(context)?;
+        let conn = Connection::open_with_flags(path, flags | OpenFlags::SQLITE_OPEN_NO_MUTEX)
+            .with_context(context)?;
         conn.busy_timeout(BUSY_TIMEOUT)?;
         let mode: String =
             conn.pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get(0))?;
@@ -201,6 +227,8 @@ impl AuditLog {
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.execute_batch(SCHEMA)?;
         Ok(AuditLog {
+            path: path.to_path_buf(),
+            id: (meta.dev(), meta.ino()),
             conn: Mutex::new(conn),
         })
     }
@@ -220,6 +248,17 @@ impl AuditLog {
         f: impl FnOnce(&Transaction) -> Result<T>,
     ) -> Result<T> {
         let mut conn = self.lock()?;
+        // Fail closed: a write to an unlinked or swapped file would return Ok
+        // and land where no one will ever read it.
+        let now = std::fs::metadata(&self.path)
+            .map(|m| (m.dev(), m.ino()))
+            .with_context(|| format!("audit store {} is gone", self.path.display()))?;
+        if now != self.id {
+            bail!(
+                "audit store {} was replaced while open",
+                self.path.display()
+            );
+        }
         let tx = conn.transaction_with_behavior(behavior)?;
         let out = f(&tx)?;
         tx.commit()?;

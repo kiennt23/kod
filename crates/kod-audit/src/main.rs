@@ -7,6 +7,8 @@ use kod_audit::{
 };
 use kod_policy::Policy;
 use serde_json::json;
+#[cfg(unix)]
+use std::os::unix::fs::DirBuilderExt;
 use std::{path::PathBuf, process::ExitCode};
 
 /// Kod's audit log. Prints one JSON line; exits non-zero on any failure.
@@ -54,7 +56,6 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
     };
     Ok(match cli.command {
         Command::CaptureCheckpoints { output } => {
-            use std::os::unix::fs::DirBuilderExt;
             let checkpoints = target.list()?;
             std::fs::DirBuilder::new().mode(0o700).create(&output)?;
             let frozen = DirTarget { dir: output };
@@ -64,7 +65,7 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             json!({"ok": true, "checkpoints": checkpoints.len()})
         }
         Command::Verify { released_policies } => {
-            let log = AuditLog::open(&cli.db)?;
+            let log = AuditLog::open_existing(&cli.db)?;
             let v = log.verify(&target)?;
             let mut out =
                 json!({"ok": true, "entries": v.entries, "last_checkpoint": v.last_checkpoint});
@@ -78,14 +79,14 @@ fn run(cli: Cli) -> Result<serde_json::Value> {
             out
         }
         Command::Checkpoint => {
-            let log = AuditLog::open(&cli.db)?;
+            let log = AuditLog::open_existing(&cli.db)?;
             json!({"ok": true, "checkpoint": log.checkpoint(&target)?})
         }
         Command::Purge {
             policy,
             record_type,
         } => {
-            let log = AuditLog::open(&cli.db)?;
+            let log = AuditLog::open_existing(&cli.db)?;
             // Separate transactions: an entry appended in between is checked
             // by the next verify, and purge clears only payloads its own
             // retention records cover.
