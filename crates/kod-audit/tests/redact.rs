@@ -238,6 +238,12 @@ fn brackets_inside_a_secret_do_not_end_it() {
         ("password=abc)def", format!("password={REDACTED}")),
         ("password=abc]def", format!("password={REDACTED}")),
         ("password=abc}def", format!("password={REDACTED}")),
+        ("password=abc))def", format!("password={REDACTED}")),
+        ("password=abc)]def", format!("password={REDACTED}")),
+        (
+            r#"{"a":{"api_key":abcdef123456}}"#,
+            format!(r#"{{"a":{{"api_key":{REDACTED}}}}}"#),
+        ),
         ("--password=ab)cd", format!("--password={REDACTED}")),
         (
             "Authorization: Basic abc)def",

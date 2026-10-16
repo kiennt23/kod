@@ -177,7 +177,7 @@ fn token_at(text: &str, i: usize) -> Option<usize> {
 }
 
 /// End of a value starting at `i`: a quoted value with its quotes, otherwise
-/// up to whitespace or `"'&;,`, or a closing `}])` that ends the token.
+/// up to whitespace or `"'&;,`, or a run of closing `}])` that ends the token.
 fn value_end(text: &str, i: usize) -> usize {
     let bytes = text.as_bytes();
     match bytes[i] {
@@ -188,15 +188,16 @@ fn value_end(text: &str, i: usize) -> usize {
             let stop = |b: u8| b.is_ascii_whitespace() || b"\"'&;,".contains(&b);
             let mut j = i;
             while j < bytes.len() && !stop(bytes[j]) {
-                // A closing bracket ends the value only when it ends the token.
-                if b"}])".contains(&bytes[j])
-                    && bytes
-                        .get(j + 1)
-                        .is_none_or(|n| stop(*n) || b"}])".contains(n))
-                {
-                    break;
+                if b"}])".contains(&bytes[j]) {
+                    // A run of closers ends the value only at a token boundary.
+                    let run = bytes[j..].iter().take_while(|b| b"}])".contains(b)).count();
+                    if bytes.get(j + run).is_none_or(|n| stop(*n)) {
+                        break;
+                    }
+                    j += run;
+                } else {
+                    j += 1;
                 }
-                j += 1;
             }
             j
         }
