@@ -228,3 +228,16 @@ fn oversized_payloads_are_refused_before_waiting_for_the_write_lock() {
     blocker.execute_batch("ROLLBACK").unwrap();
     assert_eq!(f.chain_len(), 0);
 }
+
+#[test]
+fn entry_hash_rejects_malformed_hex_without_panicking() {
+    let good = "0".repeat(64);
+    let multibyte = format!("0\u{e9}{}", "0".repeat(61)); // 64 bytes, not 64 chars
+    assert_eq!(multibyte.len(), 64);
+    let upper = format!("A{}", "0".repeat(63));
+    let plus = format!("+a{}", "0".repeat(62));
+    for bad in [multibyte, upper, plus, "0".repeat(63)] {
+        assert!(entry_hash(&bad, 1, 0, "x", &good).is_err(), "{bad:?}");
+        assert!(entry_hash(&good, 1, 0, "x", &bad).is_err(), "{bad:?}");
+    }
+}

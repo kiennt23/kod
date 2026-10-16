@@ -71,12 +71,20 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn unhex(s: &str) -> Result<Vec<u8>> {
-    if s.len() != 64 {
+    let nibble = |b: u8| match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        _ => None,
+    };
+    let b = s.as_bytes();
+    if b.len() != 64 {
         bail!("not a sha256 hex string: {s:?}");
     }
-    (0..64)
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| anyhow!("{e}: {s:?}")))
+    b.chunks(2)
+        .map(|p| match (nibble(p[0]), nibble(p[1])) {
+            (Some(h), Some(l)) => Ok(h << 4 | l),
+            _ => Err(anyhow!("not a lower-case sha256 hex string: {s:?}")),
+        })
         .collect()
 }
 
@@ -165,7 +173,14 @@ impl AuditLog {
         }
         let conn = Connection::open(path).with_context(context)?;
         conn.busy_timeout(BUSY_TIMEOUT)?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
+        let mode: String =
+            conn.pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get(0))?;
+        if !mode.eq_ignore_ascii_case("wal") {
+            bail!(
+                "audit store {} could not enter WAL mode: {mode}",
+                path.display()
+            );
+        }
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.execute_batch(SCHEMA)?;
         Ok(AuditLog {
