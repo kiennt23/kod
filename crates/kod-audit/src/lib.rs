@@ -10,8 +10,10 @@
 //! truncated without trace.
 pub mod checkpoint;
 pub mod redact;
+mod retention;
 mod verify;
 
+pub use retention::PURGE_BATCH;
 pub use verify::Verified;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -155,6 +157,15 @@ fn append_text_in(tx: &Transaction, record_type: &str, text: &str, at: i64) -> R
         params![seq, at, record_type, text, payload_sha256, hash],
     )?;
     Ok(seq as u64)
+}
+
+pub(crate) fn append_in(
+    tx: &Transaction,
+    record_type: &str,
+    payload: &Value,
+    at: i64,
+) -> Result<u64> {
+    append_text_in(tx, record_type, &prepare_payload(payload)?, at)
 }
 
 impl AuditLog {
