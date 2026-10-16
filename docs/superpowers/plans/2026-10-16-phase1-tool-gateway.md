@@ -2,9 +2,13 @@
 
 > **For agentic workers:** the execution mode is set per task in **Execution** below. *Subagent + review* tasks use superpowers:subagent-driven-development; *Native* tasks use superpowers:executing-plans. Every mode ends with one whole-branch review. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** A `kod-tool-gateway` crate that serves a run's tracker, docs and publish tools over MCP (rmcp), checks every call with kod-policy and writes it to the audit log before it acts, gets the git credential from a token broker so the sandbox never holds one, and publishes idempotently (push `agent/<ticket>-<run>`, open a draft PR); plus an MCP client in `kod-loop`.
+**Goal:** A `kod-tool-gateway` crate that serves a run's tracker and docs tools over MCP (rmcp), checks every call with kod-policy and writes it to the audit log before it acts, and publishes a finished run for the host: it takes the run's change from the trusted collector output outside the sandbox, gets a git credential from a token broker and revokes it after, and pushes `agent/<ticket>-<run>` and opens a draft PR idempotently. Plus an MCP client in `kod-loop`.
 
-**Architecture:** The gateway is a library: `Gateway` holds the policy, the audit log, the adapters (tracker, docs, broker, forge) and the live runs, keyed by the SHA-256 of a per-run token as in the LLM gateway. `Gateway::call(token, tool, args)` is the one entry point: it builds the policy input from the run and the target, records the decision, writes a `tool_call` record with the exact target through `AuditLog::before`, and only then calls the adapter. `router(gateway, hosts)` mounts rmcp's Streamable HTTP service at `/r/{token}/mcp` in stateless JSON mode. A test harness starts runs (`start_run`) and cancels them (`cancel`); the dispatcher (6) and the merge into the LLM gateway's process (6b) wire it later. `kod-loop` gets a small blocking MCP client and adds the gateway's tools to its own when `KOD_MCP_URL` is set.
+**Architecture:** The gateway is a library. `Gateway` holds the policy, the audit log, the adapters (tracker, docs, the dispatcher's `stopped` check, broker, forge, workspace) and the live runs, keyed by the SHA-256 of a per-run token as in the LLM gateway. There are two entry points, one per side of the trust boundary:
+- **`Gateway::call(token, tool, args)`** is the sandbox's. It offers only the tracker and docs tools. It checks the dispatcher's durable run state first, builds the policy input from the run's start-time snapshot, records the decision, writes a `tool_call` record with the exact target through `AuditLog::before`, and only then calls the adapter. Every error is scrubbed of tokens and credentials.
+- **`Gateway::publish(run_id)`** is the host's. It takes no content from the sandbox: the change and the test evidence come from the `Workspace` adapter, which reads the collector output the host wrote outside the sandbox, and `changed_paths` is computed from that change.
+
+`router(gateway, hosts)` mounts rmcp's Streamable HTTP service at `/r/{token}/mcp` in stateless JSON mode, with `call` behind it and never `publish`. The dispatcher (6) owns run state, the cancel flag and when publish happens; 6b wires the processes. `kod-loop` gets a small blocking MCP client and adds the gateway's tools to its own when `KOD_MCP_URL` is set.
 
 **Tech Stack:** Rust 1.99.0 (edition 2024). New: rmcp 3.5 (server, Streamable HTTP server). Already in `Cargo.lock`: axum 0.8, tokio, tower 0.5, serde_json, sha2 0.10, anyhow, rusqlite 0.40 (tests), reqwest 0.12 (tests and kod-loop). Crates from this phase: kod-policy, kod-audit (PR #14 / `feat/phase1-audit`), kod-tracker (the 6a plan), kod-llm-proxy (sub-plan 2, for the execution order only).
 
@@ -14,20 +18,23 @@
 
 | | Decision | Why |
 |---|---|---|
-| D1 | A library crate with a router, no binary yet. 6b mounts `router` in the LLM gateway's process (the overview's "same process at first") when real adapters and a run source exist. | Today there are only fakes and no dispatcher; a binary would serve fakes. The router takes the allowed hosts so the process that mounts it sets them. |
-| D2 | One token per run in the path, `/r/{token}/mcp`, at least 32 lower-case hex characters, kept as its SHA-256. An unknown token gets 404 before rmcp sees the request. | Same scheme as the LLM gateway (sub-plan 2), so 6b can give a sandbox one token for both routes. |
+| D1 | A library crate with a router, no binary yet. 6b mounts `router` in the LLM gateway's process (the overview's "same process at first") when real adapters and a run source exist. | Today there are only fakes; a binary would serve fakes. The router takes the allowed hosts so the process that mounts it sets them. |
+| D2 | One token per run in the path, `/r/{token}/mcp`, at least 32 lower-case hex characters, kept as its SHA-256. An unknown token gets 404 before rmcp sees the request. `end_run` and `end_all` drop the token, so it stops working the moment a run ends. | Same scheme as the LLM gateway (sub-plan 2), so 6b can give a sandbox one token for both routes. |
 | D3 | rmcp 3.5, stateless Streamable HTTP (protocol 2026-07-28), JSON responses, no SSE keep-alive. | No session state to lose or forge; every call carries its run token. |
-| D4 | The `kod-loop` client is a hand-written blocking JSON-RPC client over the reqwest it already has, tested against the rmcp server. | `kod-loop` is synchronous and runs in the sandbox; the rmcp client would pull tokio into it for three request shapes. |
-| D5 | Tracker tools: `get_issue`, `read_doc`, `comment`, `transition`, `create_linked`. Policy inputs are the policy plan's `read` and `tracker_write`; `linked_docs` is the run ticket's `approved_versions` and `linked_tickets` its `links`, both read live from the tracker on each call. | The matrix limits reads to the ticket and its linked docs and writes to its own ticket and linked requests; reading them live means a link removed mid-run is honoured. |
-| D6 | Every call: `Policy::decide`, then `AuditLog::record_decision`, then `AuditLog::before(run_audit, {"kind": "tool_call", run, tool, target})` around the adapter call, then a best-effort `tool_result` record. A failed decision write or `before` write refuses the call. Malformed arguments and unknown tools or tokens are refused before any record. | The trust boundary: a record with the exact target exists before the external call, and an unrecordable call does not happen (policy plan D9). |
-| D7 | `publish{title, summary, test_evidence, files: [{path, content}]}` carries the change set as UTF-8 file contents (`null` deletes). The gateway commits it through the forge's git data API onto `run.base`; the sandbox never pushes. At most 1000 files and 8 MiB. | The sandbox has no git credential to push with. Binary files are a known ceiling (`ponytail:` note in the code). |
-| D8 | `publish` is not offered to the model: `kod-loop` hides it. The caller that ends the run calls it (the 6b runner; the test harness here). | The design's publish happens at the end of a run, not when the model decides. |
-| D9 | The token broker is `trait Broker { fn mint(&self, repo) -> Result<Secret> }`, called inside the publish operation only. `Secret` has a redacted `Debug`, no `Serialize`, and is dropped when the operation ends. Tracker and docs adapters hold their own credentials outside the sandbox. | The design's "git token exists only inside the publish op". The real broker (a GitHub App installation token scoped to one repo) is 6b's. |
-| D10 | Idempotent publish: the commit is a pure function of the change set, the base, the message and the committer, so a retry makes the same commit; `set_branch` moves `agent/<ticket>-<run>` to it; `find_pr` before `open_draft_pr`; `link_pr` on every publish. | A publish that died after the push and before the PR completes on retry with one branch and one PR. Real adapters must treat a repeated `link_pr` as a no-op. |
-| D11 | Cancel is checked twice: in the policy input (`run.canceled`), and again after the commit and before the branch moves. | A cancel that lands during publish stops it before anything is visible. |
-| D12 | The commit message ends with `Kod-Ticket: <tracker>:<key>`, `Kod-Run: <id>` and `Co-Authored-By: <agent>`; the committer is the agent identity, validated at `Gateway::new`. The PR title is `<key>: <title>` and its body carries the summary, ticket, requirement, run ID, pinned inputs and test evidence. | The design's PR package. |
+| D4 | The `kod-loop` client is a hand-written blocking JSON-RPC client over the reqwest it already has, tested against the rmcp server. Its errors drop the URL (`reqwest::Error::without_url`) and scrub `/r/<token>` from anything the server echoes. | `kod-loop` is synchronous and runs in the sandbox; the rmcp client would pull tokio into it for three request shapes. The run token is in the URL, and the trace is kept. |
+| D5 | Sandbox tools: `get_issue`, `read_doc`, `comment`, `transition`, `create_linked`. Policy inputs are the policy plan's `read` and `tracker_write`. `linked_docs` is the ticket's `approved_versions`. `linked_tickets` is a snapshot taken by the dispatcher at `start_run` (the rework requests Kod linked to the run), plus the keys the run creates with `create_linked`. Never the ticket's live links. | The policy grants writes to "own or linked" tickets. Live links would let anyone who links a ticket, or the agent through the tracker, widen the run's reach mid-run. A snapshot is fixed at admission. Reads of the snapshot need a new `read` grant in `policy/agent.rego` (Task 1). |
+| D6 | Every call, reads included, goes: the `stopped` check, then `Policy::decide`, then `AuditLog::record_decision`, then `AuditLog::before(run_audit, {"kind": "tool_call", run, tool, target})` around the adapter call, then a best-effort `tool_result` record. A failed decision write or `before` write refuses the call. Malformed arguments and unknown tools or tokens are refused before any record. | The trust boundary: a record with the exact target exists before the external call, and an unrecordable call does not happen (policy plan D9). |
+| D7 | The dispatcher's database holds the one durable cancel flag: a run is stopped unless its row is live. The gateway gets it as `Adapters::stopped: Fn(run_id) -> Result<bool>` and checks it on every call and inside publish before the push, before the branch moves, and before the PR opens. A read error counts as stopped. A cancel that lands after the branch moved deletes the branch. | One source of truth that survives a crash, set by the dispatcher before any external call. An in-memory flag in the gateway would be lost on restart and could disagree with the dispatcher. |
+| D8 | `publish(run_id)` is host-only. It is not in `call`, not in `tools()`, and not reachable through the MCP endpoint, and a sandbox call to it is refused. Its input is the run ID only. The change comes from `Workspace::collected(run)`: in 6b, kod-eval's collector writes `collect_out/diff.patch` and the check results next to the sandbox, never inside it, and the 6b runner then calls the dispatcher's `finished`, which calls `publish`. The commit message, PR title and PR body come from the ticket and the run. | The sandbox must not choose what is pushed or which paths the policy sees. Hiding a tool from the model is not a boundary. |
+| D9 | The change is UTF-8 file contents (`None` deletes), at most 1000 files and 8 MiB, no path twice. The gateway commits it through the forge's git data API onto `run.base`; the sandbox never pushes. | The sandbox has no git credential to push with. Binary files are a known ceiling. |
+| D10 | `trait Broker { mint(run, repo), revoke(run), revoke_all() }`. `mint` is called inside the publish operation only. `revoke(run)` is called when publish returns, whatever the outcome, and on `end_run`; `revoke_all` on `end_all` (the kill switch). `Secret` has a redacted `Debug` and no `Serialize`. Tracker and docs adapters hold their own credentials outside the sandbox. | The design's "git token exists only inside the publish op", made true even when a drop is skipped or a token leaks. The real broker (a GitHub App installation token scoped to one repo) is 6b's. |
+| D11 | Idempotent publish. The commit pins its author and committer date to `run.started_at`, so it is a pure function of the change, the base, the message, the committer and that date, and a retry makes the same commit. `set_branch` moves `agent/<ticket>-<run>` to it. `find_pr` runs before `open_draft_pr`. `link_pr` runs on every publish. `forge::check` is the contract every forge adapter must pass: a retry after a crash after the push gives the same SHA, and `find_pr` finds a PR whose response was lost. | A publish that died anywhere completes on retry with one branch and one PR. The real adapter must meet this, not just the fake. |
+| D12 | Errors that leave the gateway (replies, audit records) go through `scrub`: kod-audit's `redact`, plus any `/r/<hex>` run token, plus the exact minted secret. | A forge or broker error can carry a token or a URL with one. |
+| D13 | The data class is per call. A run starts with the ticket's classes, every `read_doc` adds the document's class, and publish is checked against all of them. | A run that read a restricted document can't publish what it learned through a channel cleared only for the ticket's class. |
+| D14 | The agent may move only its own ticket, and only `in_progress` to `blocked` or back (`AGENT_TRANSITIONS`). Review and done are the dispatcher's. | The policy allows writes on own or linked tickets. Moving a ticket to done or review is a human-visible claim the agent must not make. |
+| D15 | The commit message ends with `Kod-Ticket: <tracker>:<key>`, `Kod-Run: <id>` and `Co-Authored-By: <agent>`; the committer is the agent identity, validated at `Gateway::new`. The PR title is `<key>: <title>` and its body carries the ticket, requirement, run ID, pinned inputs, changed files and test evidence. | The design's PR package. |
 
-Out of scope here: the real GitHub, tracker and docs adapters and the real broker (6b, 6c); serving the router from a process (6b); the dispatcher (6); revoking identities on the kill switch beyond `cancel_all` (the dispatcher plan).
+Out of scope here: the real GitHub, tracker, docs and workspace adapters and the real broker (6b, 6c); serving the router from a process (6b); run state and the kill switch (the dispatcher, 6).
 
 ## Execution
 
@@ -35,10 +42,10 @@ Per ADR 0001.
 
 | Task | Mode | Why |
 |---|---|---|
-| 1. Tracker and docs tools | Subagent + review | Owns policy-then-audit gating and the planted-secret conformance test |
-| 2. Publish and the token broker | Subagent + review | Owns the publish refusals, credential handling and idempotency; four Review Focus tests |
-| 3. The MCP endpoint | Subagent + review | Owns the run-token check in front of rmcp |
-| 4. The MCP client in kod-loop | Subagent + review | Owns the conformance test that a tool call goes through the endpoint, and hiding `publish` from the model |
+| 1. Tracker and docs tools | Subagent + review | Owns policy-then-audit gating, the run snapshot, the transition allowlist and the planted-secret conformance test |
+| 2. Publish and the token broker | Subagent + review | Owns host-only publish, the cancel checks, credential revocation and scrubbing, and the forge contract |
+| 3. The MCP endpoint | Subagent + review | Owns the run-token check in front of rmcp and keeping publish off it |
+| 4. The MCP client in kod-loop | Subagent + review | Owns the conformance test that a tool call goes through the endpoint, and keeping the token out of errors |
 
 The plan ends with one whole-branch review.
 
@@ -46,30 +53,35 @@ The plan ends with one whole-branch review.
 
 - Toolchain 1.99.0 (`rust-toolchain.toml`), edition 2024, resolver 3.
 - CI runs `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all` and cargo-deny with the existing `deny.toml`, unchanged. The one new dependency is rmcp 3.5 (MIT/Apache-2.0); every crate it adds is under a licence `deny.toml` allows.
-- Fail closed: an unknown token, tool or argument is refused; a decision or audit write that fails refuses the call; the gateway never acts without a policy allow.
-- No credential in a tool result, an audit record, a log line or the sandbox.
-- No network: fakes only (the 6a fake tracker, `FakeDocs`, `FakeGitHub`).
-- Code against kod-audit's plan API (`open`, `record_decision`, `before`, `append`, `RUN_AUDIT`) and kod-tracker's plan API.
+- Fail closed: an unknown token, tool or argument is refused; a decision or audit write that fails refuses the call; a run state that can't be read refuses the call; the gateway never acts without a policy allow.
+- No credential or run token in a tool result, an audit record, an error, a log line or the sandbox.
+- No network: fakes only (the 6a fake tracker, `FakeDocs`, `FakeGitHub`, `FakeWorkspace`).
+- Code against kod-audit's plan API (`open`, `record_decision`, `before`, `append`, `RUN_AUDIT`, `redact::redact`) and kod-tracker's plan API.
 - Commit messages are plain, with no trailers.
 
 ## Review Focus
 
-- A publish that dies after the branch moved but before the PR opened must complete on retry with one branch and one PR, not fail or open a second: `a_publish_that_died_before_the_pr_completes_on_retry` (Task 2).
-- A cancel that lands while publish is running must stop it before the branch moves: `a_cancel_during_publish_stops_it_before_the_branch_moves` (Task 2).
-- An audit database that is locked must refuse publish with nothing pushed: `publish_is_refused_when_the_audit_write_fails` (Task 2).
-- A minted git credential must never appear in a tool reply or an audit record: `the_publish_credential_never_leaves_the_gateway` (Task 2).
-- An unknown token, an unknown tool or malformed arguments must be refused without reaching policy or an adapter: `unknown_tokens_tools_and_bad_arguments_are_refused` (Task 1).
+- The sandbox must not be able to publish, with a valid token or through the endpoint: `the_sandbox_cannot_publish` (Task 2), `a_publish_call_from_the_sandbox_is_refused` (Task 3).
+- A ticket a human linked must not be readable or writable; a rework request Kod created must be: `reads_the_runs_ticket_its_rework_requests_and_linked_docs_only`, `writes_reach_only_the_runs_ticket_and_its_rework_requests`, `create_linked_opens_a_request_the_run_may_then_read_and_comment_on` (Task 1).
+- A cancel at any point must stop publish, and a cancel after the push must leave no branch and no PR: `a_cancel_before_the_push_stops_publish`, `a_cancel_after_the_push_deletes_the_branch_and_opens_no_pr`, `a_canceled_run_is_not_published` (Task 2); `a_run_canceled_in_the_dispatchers_database_gets_nothing`, `a_run_whose_state_cannot_be_read_gets_nothing` (Task 1).
+- A failure between the decision and the intent record must refuse publish with nothing minted or pushed: `publish_is_refused_when_the_intent_cannot_be_recorded` (Task 2).
+- A real-looking token in a forge or broker error must not reach the reply or the audit log, and every minted credential must be revoked: `credentials_never_reach_the_reply_or_the_audit_log`, `every_publish_credential_is_revoked_when_it_returns`, `ending_runs_revokes_their_credentials` (Task 2); `an_unreachable_gateway_does_not_leak_the_run_token`, `an_error_page_that_echoes_the_path_does_not_leak_the_run_token` (Task 4).
+- Idempotency must be a property of the forge contract: `the_fake_forge_meets_the_contract`, `the_contract_catches_a_forge_that_dates_commits_by_the_clock`, `a_retry_after_a_lost_pr_response_finds_the_pr` (Task 2).
+- A run that read a restricted document must not publish: `a_run_that_read_a_restricted_doc_cannot_publish` (Task 2).
+- The agent must not move its ticket to review or done, or move another ticket: `the_agent_moves_only_its_own_ticket_between_in_progress_and_blocked` (Task 1).
 
 ## File Structure
 
 ```
 Cargo.toml                                   modify: add crates/kod-tool-gateway to members
+policy/agent.rego                            modify: read grant for the run's rework requests (Task 1)
+crates/kod-policy/tests/agent_ops.rs         modify: its test (Task 1)
 crates/kod-tool-gateway/
   Cargo.toml                                 create (Task 1), modify (Task 3)
-  src/lib.rs                                 create: Run, Adapters, Gateway, the tools (Task 1); publish (Task 2); mcp (Task 3)
-  src/docs.rs                                create: the Docs trait and FakeDocs
+  src/lib.rs                                 create: Run, Adapters, Gateway, scrub, the tools (Task 1); publish, published (Task 2); mcp (Task 3)
+  src/docs.rs                                create: Doc, the Docs trait and FakeDocs
   src/broker.rs                              create: Secret and the Broker trait (Task 2)
-  src/forge.rs                               create: Change, Identity, Commit, the Forge trait and FakeGitHub (Task 2)
+  src/forge.rs                               create: Change, Collected, Workspace, Identity, Commit, the Forge trait, the forge contract, FakeGitHub and FakeWorkspace (Task 2)
   src/mcp.rs                                 create: the rmcp handler and router (Task 3)
   tests/common/mod.rs                        create (Task 1), modify (Tasks 2, 3)
   tests/tools.rs                             create (Task 1)
@@ -90,13 +102,13 @@ Execution order: this plan runs after sub-plans 3 (policy), 4 (audit), 6a (track
 ### Task 1: Tracker and docs tools
 
 **Files:**
-- Modify: `Cargo.toml`
+- Modify: `Cargo.toml`, `policy/agent.rego`
 - Create: `crates/kod-tool-gateway/Cargo.toml`, `src/lib.rs`, `src/docs.rs`
-- Test: `crates/kod-tool-gateway/tests/common/mod.rs`, `tests/tools.rs`
+- Test: `crates/kod-tool-gateway/tests/common/mod.rs`, `tests/tools.rs`; `crates/kod-policy/tests/agent_ops.rs` (modify)
 
 **Interfaces:**
-- Consumes: `kod_policy::Policy::{load, decide}`; `kod_audit::{AuditLog::{open, record_decision, before, append}, RUN_AUDIT}`; `kod_tracker::{Tracker, Issue, State, Rework, ReworkKind, fake::{sandbox, FakeTracker, FakeIssue}}`.
-- Produces: `Run { id, ticket, repo, base, data_classes }`; `Adapters { tracker: Arc<dyn Tracker>, docs: Arc<dyn Docs> }`; `Gateway::new(Arc<Policy>, Arc<AuditLog>, Adapters) -> anyhow::Result<Gateway>`; `Gateway::{start_run(&str, Run) -> anyhow::Result<()>, cancel(&str) -> bool, cancel_all(), run(&str) -> Option<(Run, bool)>, call(&str, &str, &Value) -> Reply}` with `type Reply = Result<Value, String>`; `MIN_TOKEN_LEN`; `docs::{Docs, FakeDocs}`.
+- Consumes: `kod_policy::Policy::{load, decide}`; `kod_audit::{AuditLog::{open, record_decision, before, append}, RUN_AUDIT, redact::redact}`; `kod_tracker::{Tracker, Issue, State, Rework, ReworkKind, fake::{sandbox, FakeTracker, FakeIssue}}`.
+- Produces: `Run { id, ticket, repo, base, data_classes, linked_tickets, started_at }`; `type Stopped = Arc<dyn Fn(&str) -> anyhow::Result<bool> + Send + Sync>`; `Adapters { tracker, docs, stopped }`; `Gateway::new(Arc<Policy>, Arc<AuditLog>, Adapters) -> anyhow::Result<Gateway>`; `Gateway::{start_run(&str, Run) -> anyhow::Result<()>, end_run(&str) -> anyhow::Result<()>, end_all() -> anyhow::Result<()>, run(&str) -> Option<Run>, call(&str, &str, &Value) -> Reply}` with `type Reply = Result<Value, String>`; `scrub(&str) -> String`; `MIN_TOKEN_LEN`; `AGENT_TRANSITIONS`; `docs::{Doc { text, class }, Docs, FakeDocs::{add, add_classed}}`; a `read` grant in `policy/agent.rego` for `run.linked_tickets`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -104,13 +116,21 @@ Apply to `Cargo.toml` with `git apply`:
 
 ````diff
 diff --git a/Cargo.toml b/Cargo.toml
-index 086e6c7..56a355c 100644
+index 086e6c7..3d38611 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
-@@ -1,3 +1,3 @@
+@@ -1,3 +1,11 @@
  [workspace]
 -members = ["crates/kod-audit", "crates/kod-eval", "crates/kod-llm-proxy", "crates/kod-loop", "crates/kod-policy", "crates/kod-tracker"]
-+members = ["crates/kod-audit", "crates/kod-eval", "crates/kod-llm-proxy", "crates/kod-loop", "crates/kod-policy", "crates/kod-tool-gateway", "crates/kod-tracker"]
++members = [
++    "crates/kod-audit",
++    "crates/kod-eval",
++    "crates/kod-llm-proxy",
++    "crates/kod-loop",
++    "crates/kod-policy",
++    "crates/kod-tool-gateway",
++    "crates/kod-tracker",
++]
  resolver = "3"
 ````
 
@@ -136,6 +156,36 @@ rusqlite = "0.40"
 tempfile = "3"
 ````
 
+Apply to `crates/kod-policy/tests/agent_ops.rs` with `git apply`:
+
+````diff
+diff --git a/crates/kod-policy/tests/agent_ops.rs b/crates/kod-policy/tests/agent_ops.rs
+index 26276c0..4ae9b87 100644
+--- a/crates/kod-policy/tests/agent_ops.rs
++++ b/crates/kod-policy/tests/agent_ops.rs
+@@ -190,6 +190,20 @@ fn reads_are_limited_to_the_ticket_and_its_linked_docs() {
+     );
+ }
+ 
++#[test]
++fn reads_reach_the_rework_requests_kod_linked_to_the_run() {
++    allowed(req(
++        "read",
++        json!({"target": {"kind": "ticket", "id": "KOD-2"}}),
++    ));
++    let none = set(
++        req("read", json!({"target": {"kind": "ticket", "id": "KOD-2"}})),
++        "/run/linked_tickets",
++        json!([]),
++    );
++    denied(none, "does not meet the rule");
++}
++
+ #[test]
+ fn null_ids_never_match() {
+     let read = set(
+````
+
 Create `crates/kod-tool-gateway/tests/common/mod.rs`:
 
 ````rust
@@ -144,7 +194,14 @@ use kod_audit::AuditLog;
 use kod_policy::Policy;
 use kod_tool_gateway::{Adapters, Gateway, Run, docs::FakeDocs};
 use kod_tracker::fake::{self, FakeIssue, FakeTracker};
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    collections::HashSet,
+    path::PathBuf,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 pub const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 pub const BASE: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -152,11 +209,24 @@ pub const LINKED_DOC: &str = "https://docs.example/brief?rev=3";
 pub const SECRET_DOC: &str = "https://docs.example/payroll?rev=1";
 /// Text planted where the run may not read: an unlinked ticket and doc.
 pub const PLANTED: &str = "PLANTED-SECRET-7f3a";
+/// A rework request Kod linked to FAKE-1 before run-1 started.
+pub const REWORK: &str = "FAKE-3";
+/// A ticket a human linked to FAKE-1.
+pub const HUMAN_LINK: &str = "FAKE-2";
+
+/// The dispatcher's runs table, as the gateway sees it: the stopped runs,
+/// and whether reading it fails.
+#[derive(Default)]
+pub struct Runs {
+    pub stopped: Mutex<HashSet<String>>,
+    pub broken: AtomicBool,
+}
 
 pub struct Harness {
     pub gw: Arc<Gateway>,
     pub tracker: Arc<FakeTracker>,
     pub docs: Arc<FakeDocs>,
+    pub runs: Arc<Runs>,
     pub audit: PathBuf,
     _dir: tempfile::TempDir,
 }
@@ -168,11 +238,14 @@ pub fn run() -> Run {
         repo: "acme/app".into(),
         base: BASE.into(),
         data_classes: vec!["placeholder".into()],
+        linked_tickets: vec![REWORK.into()],
+        started_at: 1_700_000_000,
     }
 }
 
-/// A gateway over the fakes with run-1 started under TOKEN. FAKE-1 links
-/// FAKE-2; FAKE-9 and SECRET_DOC are not linked and hold PLANTED.
+/// A gateway over the fakes with run-1 started under TOKEN on FAKE-1, which
+/// is in progress. FAKE-1 links HUMAN_LINK and REWORK; FAKE-9 and
+/// SECRET_DOC are not linked and hold PLANTED.
 pub fn harness() -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -181,9 +254,14 @@ pub fn harness() -> Harness {
     let log = Arc::new(AuditLog::open(&audit).unwrap());
     let (tracker, _) = fake::sandbox();
     let mut story = tracker.issue("FAKE-1").unwrap();
-    story.links = vec!["FAKE-2".into()];
+    story.links = vec![HUMAN_LINK.into(), REWORK.into()];
+    story.workflow_state = "Doing".into();
     tracker.add_issue("FAKE-1", story);
-    for (key, body) in [("FAKE-2", "the linked story"), ("FAKE-9", PLANTED)] {
+    for (key, body) in [
+        (HUMAN_LINK, "an epic a human linked"),
+        (REWORK, "a question Kod asked"),
+        ("FAKE-9", PLANTED),
+    ] {
         let issue = FakeIssue {
             title: key.into(),
             body: body.into(),
@@ -197,9 +275,18 @@ pub fn harness() -> Harness {
     let docs = Arc::new(FakeDocs::default());
     docs.add(LINKED_DOC, "the approved brief");
     docs.add(SECRET_DOC, PLANTED);
+    let runs = Arc::new(Runs::default());
+    let r = runs.clone();
+    let stopped = Arc::new(move |run: &str| {
+        if r.broken.load(Ordering::SeqCst) {
+            anyhow::bail!("database is locked");
+        }
+        Ok(r.stopped.lock().unwrap().contains(run))
+    });
     let adapters = Adapters {
         tracker: tracker.clone(),
         docs: docs.clone(),
+        stopped,
     };
     let gw = Arc::new(Gateway::new(policy, log, adapters).unwrap());
     gw.start_run(TOKEN, run()).unwrap();
@@ -207,12 +294,18 @@ pub fn harness() -> Harness {
         gw,
         tracker,
         docs,
+        runs,
         audit,
         _dir: dir,
     }
 }
 
 impl Harness {
+    /// Cancels the run in the dispatcher's database.
+    pub fn stop(&self, run: &str) {
+        self.runs.stopped.lock().unwrap().insert(run.into());
+    }
+
     /// Every audit payload, oldest first.
     pub fn records(&self) -> Vec<serde_json::Value> {
         let db = rusqlite::Connection::open(&self.audit).unwrap();
@@ -233,6 +326,11 @@ impl Harness {
             .map(|r| (r["decision"]["allow"] == true, r["input"].clone()))
             .collect()
     }
+
+    /// The audit log's raw bytes, as text.
+    pub fn raw_log(&self) -> String {
+        String::from_utf8_lossy(&std::fs::read(&self.audit).unwrap()).into_owned()
+    }
 }
 ````
 
@@ -242,23 +340,27 @@ Create `crates/kod-tool-gateway/tests/tools.rs`:
 mod common;
 
 use common::*;
+use kod_tool_gateway::Run;
 use serde_json::json;
 
 #[test]
-fn reads_the_runs_ticket_and_its_linked_docs_only() {
+fn reads_the_runs_ticket_its_rework_requests_and_linked_docs_only() {
     let h = harness();
     let own =
         h.gw.call(TOKEN, "get_issue", &json!({"key": "FAKE-1"}))
             .unwrap();
     assert_eq!(own["requirement_id"], "REQ-7");
+    let rework =
+        h.gw.call(TOKEN, "get_issue", &json!({"key": REWORK}))
+            .unwrap();
+    assert_eq!(rework["body"], "a question Kod asked");
     let doc =
         h.gw.call(TOKEN, "read_doc", &json!({"id": LINKED_DOC}))
             .unwrap();
     assert_eq!(doc["text"], "the approved brief");
-    // The read rule is the ticket and its linked docs; a linked ticket is a
-    // write target, not a read one.
+    // A human's link is on the live ticket but not in the run's snapshot.
     let e =
-        h.gw.call(TOKEN, "get_issue", &json!({"key": "FAKE-2"}))
+        h.gw.call(TOKEN, "get_issue", &json!({"key": HUMAN_LINK}))
             .unwrap_err();
     assert!(e.starts_with("refused by policy"), "{e}");
 }
@@ -285,62 +387,86 @@ fn a_planted_secret_cannot_be_read_and_the_attempt_is_audited() {
         refused[1].1["target"],
         json!({"kind": "doc", "id": SECRET_DOC})
     );
-    let log = std::fs::read(&h.audit).unwrap();
-    assert!(!String::from_utf8_lossy(&log).contains(PLANTED));
+    assert!(!h.raw_log().contains(PLANTED));
 }
 
 #[test]
-fn writes_reach_the_tracker_only_for_the_runs_tickets() {
+fn writes_reach_only_the_runs_ticket_and_its_rework_requests() {
     let h = harness();
     h.gw.call(TOKEN, "comment", &json!({"key": "FAKE-1", "text": "on it"}))
         .unwrap();
     assert_eq!(h.tracker.comments("FAKE-1"), ["on it"]);
     h.gw.call(
         TOKEN,
-        "transition",
-        &json!({"key": "FAKE-2", "state": "blocked"}),
+        "comment",
+        &json!({"key": REWORK, "text": "still open"}),
     )
     .unwrap();
-    assert_eq!(h.tracker.issue("FAKE-2").unwrap().workflow_state, "Waiting");
-    let e =
-        h.gw.call(TOKEN, "comment", &json!({"key": "FAKE-9", "text": "hi"}))
-            .unwrap_err();
-    assert!(e.starts_with("refused by policy"), "{e}");
-    assert!(h.tracker.comments("FAKE-9").is_empty());
-    let e =
-        h.gw.call(
-            TOKEN,
-            "transition",
-            &json!({"key": "FAKE-1", "state": "shipped"}),
-        )
-        .unwrap_err();
-    assert_eq!(e, "unknown state \"shipped\"");
+    assert_eq!(h.tracker.comments(REWORK), ["still open"]);
+    for key in [HUMAN_LINK, "FAKE-9"] {
+        let e =
+            h.gw.call(TOKEN, "comment", &json!({"key": key, "text": "hi"}))
+                .unwrap_err();
+        assert!(e.starts_with("refused by policy"), "{e}");
+        assert!(h.tracker.comments(key).is_empty());
+    }
 }
 
 #[test]
-fn every_tracker_write_is_audited_with_its_target_before_it_happens() {
+fn the_agent_moves_only_its_own_ticket_between_in_progress_and_blocked() {
+    let h = harness();
+    let to = |key: &str, state: &str| {
+        h.gw.call(TOKEN, "transition", &json!({"key": key, "state": state}))
+    };
+    to("FAKE-1", "blocked").unwrap();
+    assert_eq!(h.tracker.issue("FAKE-1").unwrap().workflow_state, "Waiting");
+    for state in ["done", "in_review", "ready"] {
+        let e = to("FAKE-1", state).unwrap_err();
+        assert_eq!(
+            e,
+            format!("the agent may not move its ticket from blocked to {state}")
+        );
+    }
+    to("FAKE-1", "in_progress").unwrap();
+    assert_eq!(h.tracker.issue("FAKE-1").unwrap().workflow_state, "Doing");
+    let e = to(REWORK, "blocked").unwrap_err();
+    assert_eq!(e, "the agent may move only its own ticket");
+    assert_eq!(
+        to("FAKE-1", "shipped").unwrap_err(),
+        "unknown state \"shipped\""
+    );
+    assert_eq!(h.tracker.issue(REWORK).unwrap().workflow_state, "Backlog");
+}
+
+#[test]
+fn every_call_is_audited_with_its_target_before_it_happens() {
     let h = harness();
     h.gw.call(TOKEN, "comment", &json!({"key": "FAKE-1", "text": "on it"}))
         .unwrap();
+    h.gw.call(TOKEN, "get_issue", &json!({"key": "FAKE-1"}))
+        .unwrap();
     let kinds: Vec<_> = h.records().iter().map(|r| r["kind"].clone()).collect();
-    assert_eq!(kinds, ["policy_decision", "tool_call", "tool_result"]);
+    let call = ["policy_decision", "tool_call", "tool_result"];
+    assert_eq!(kinds, [call, call].concat());
     assert_eq!(h.records()[1]["target"], json!({"ticket": "FAKE-1"}));
+    assert_eq!(
+        h.records()[4]["target"],
+        json!({"kind": "ticket", "id": "FAKE-1"})
+    );
 }
 
 #[test]
-fn create_linked_opens_a_request_under_the_runs_ticket() {
+fn create_linked_opens_a_request_the_run_may_then_read_and_comment_on() {
     let h = harness();
     let args = json!({"kind": "question", "stage": "build", "artifact": "brief",
         "version": "3", "text": "Which approver?", "evidence": ["src/refund.rs:12"]});
     let r = h.gw.call(TOKEN, "create_linked", &args).unwrap();
     let key = r["key"].as_str().unwrap();
-    assert!(
-        h.tracker
-            .issue(key)
-            .unwrap()
-            .body
-            .contains("Which approver?")
-    );
+    let read = h.gw.call(TOKEN, "get_issue", &json!({"key": key})).unwrap();
+    assert!(read["body"].as_str().unwrap().contains("Which approver?"));
+    h.gw.call(TOKEN, "comment", &json!({"key": key, "text": "more"}))
+        .unwrap();
+    assert_eq!(h.tracker.comments(key), ["more"]);
     let bad = json!({"kind": "rumour", "stage": "", "artifact": "", "version": "",
         "text": "", "evidence": []});
     let e = h.gw.call(TOKEN, "create_linked", &bad).unwrap_err();
@@ -348,14 +474,60 @@ fn create_linked_opens_a_request_under_the_runs_ticket() {
 }
 
 #[test]
-fn a_canceled_run_cannot_write_to_the_tracker() {
+fn a_run_canceled_in_the_dispatchers_database_gets_nothing() {
     let h = harness();
-    assert!(h.gw.cancel("run-1"));
+    h.stop("run-1");
+    for (tool, args) in [
+        ("get_issue", json!({"key": "FAKE-1"})),
+        ("comment", json!({"key": "FAKE-1", "text": "x"})),
+    ] {
+        let e = h.gw.call(TOKEN, tool, &args).unwrap_err();
+        assert_eq!(e, "refused: the run is canceled");
+    }
+    assert!(h.tracker.comments("FAKE-1").is_empty());
+    assert!(h.records().is_empty());
+}
+
+#[test]
+fn a_run_whose_state_cannot_be_read_gets_nothing() {
+    let h = harness();
+    h.runs
+        .broken
+        .store(true, std::sync::atomic::Ordering::SeqCst);
     let e =
         h.gw.call(TOKEN, "comment", &json!({"key": "FAKE-1", "text": "x"}))
             .unwrap_err();
-    assert!(e.contains("the run is canceled"), "{e}");
+    assert!(
+        e.starts_with("refused: the run's state could not be read"),
+        "{e}"
+    );
     assert!(h.tracker.comments("FAKE-1").is_empty());
+}
+
+#[test]
+fn an_ended_runs_token_stops_working() {
+    let h = harness();
+    let other = "2".repeat(64);
+    h.gw.start_run(
+        &other,
+        Run {
+            id: "run-2".into(),
+            ..run()
+        },
+    )
+    .unwrap();
+    h.gw.end_run("run-1").unwrap();
+    let args = json!({"key": "FAKE-1"});
+    assert_eq!(
+        h.gw.call(TOKEN, "get_issue", &args).unwrap_err(),
+        "unknown run"
+    );
+    h.gw.call(&other, "get_issue", &args).unwrap();
+    h.gw.end_all().unwrap();
+    assert_eq!(
+        h.gw.call(&other, "get_issue", &args).unwrap_err(),
+        "unknown run"
+    );
 }
 
 #[test]
@@ -376,6 +548,18 @@ fn unknown_tokens_tools_and_bad_arguments_are_refused() {
 }
 
 #[test]
+fn errors_are_scrubbed_of_run_tokens_and_credentials() {
+    let leak = format!(
+        "error sending request for url (http://gw/r/{TOKEN}/mcp): token ghs_0123456789abcdef0123 refused"
+    );
+    let clean = kod_tool_gateway::scrub(&leak);
+    assert!(!clean.contains(TOKEN), "{clean}");
+    assert!(!clean.contains("ghs_0123456789abcdef0123"), "{clean}");
+    assert!(clean.contains("http://gw/r/[REDACTED]/mcp"), "{clean}");
+    assert_eq!(kod_tool_gateway::scrub("/r/abc/mcp"), "/r/abc/mcp");
+}
+
+#[test]
 fn start_run_validates_the_run() {
     let h = harness();
     let mut r = run();
@@ -388,6 +572,9 @@ fn start_run_validates_the_run() {
     let mut classless = r.clone();
     classless.data_classes = vec![];
     assert!(h.gw.start_run(&"1".repeat(64), classless).is_err());
+    let mut links = r.clone();
+    links.linked_tickets = vec!["".into()];
+    assert!(h.gw.start_run(&"1".repeat(64), links).is_err());
     let again = h.gw.start_run(&"1".repeat(64), run()).unwrap_err();
     assert_eq!(again.to_string(), "run run-1 is already started");
     h.gw.start_run(&"1".repeat(64), r).unwrap();
@@ -396,10 +583,45 @@ fn start_run_validates_the_run() {
 
 - [ ] **Step 2: Run the tests to see them fail**
 
-Run: `cargo test -p kod-tool-gateway`
-Expected: FAIL to compile: `cannot find module or crate kod_tool_gateway` (the crate has no library yet).
+Run: `cargo test -p kod-policy --test agent_ops; cargo test -p kod-tool-gateway`
+Expected: FAIL: `reads_reach_the_rework_requests_kod_linked_to_the_run` panics (the policy has no read grant for `run.linked_tickets`), and kod-tool-gateway fails to compile: unresolved import `kod_tool_gateway`.
 
-- [ ] **Step 3: Implement the gateway and the tools**
+- [ ] **Step 3: Implement the read grant, the gateway and the tools**
+
+Apply to `policy/agent.rego` with `git apply`:
+
+````diff
+diff --git a/policy/agent.rego b/policy/agent.rego
+index 583c1b5..3d72588 100644
+--- a/policy/agent.rego
++++ b/policy/agent.rego
+@@ -145,7 +145,8 @@ deny contains sprintf("data class %v is not allowed in subscription mode", [c])
+ 	not sub_class_ok(c)
+ }
+ 
+-# read: the run's own ticket and the docs it links.
++# read: the run's own ticket, the rework requests Kod linked to it (the
++# run's linked_tickets), and the docs the ticket links.
+ 
+ grant if {
+ 	input.action == "read"
+@@ -155,6 +156,15 @@ grant if {
+ 	input.target.id == input.run.ticket
+ }
+ 
++grant if {
++	input.action == "read"
++	is_agent
++	input.target.kind == "ticket"
++	named(input.target.id)
++	is_array(input.run.linked_tickets)
++	input.target.id in input.run.linked_tickets
++}
++
+ grant if {
+ 	input.action == "read"
+ 	is_agent
+````
 
 Create `crates/kod-tool-gateway/src/docs.rs`:
 
@@ -408,23 +630,39 @@ Create `crates/kod-tool-gateway/src/docs.rs`:
 use anyhow::{Context, Result};
 use std::{collections::HashMap, sync::Mutex};
 
+/// A document and its data class (design: "Data classes").
+#[derive(Clone, Debug, PartialEq)]
+pub struct Doc {
+    pub text: String,
+    pub class: String,
+}
+
 pub trait Docs: Send + Sync {
-    fn read(&self, id: &str) -> Result<String>;
+    fn read(&self, id: &str) -> Result<Doc>;
 }
 
 /// In-memory docs for tests.
 #[derive(Default)]
-pub struct FakeDocs(Mutex<HashMap<String, String>>);
+pub struct FakeDocs(Mutex<HashMap<String, Doc>>);
 
 impl FakeDocs {
+    /// A `placeholder` doc.
     pub fn add(&self, id: &str, text: &str) {
+        self.add_classed(id, text, "placeholder");
+    }
+
+    pub fn add_classed(&self, id: &str, text: &str, class: &str) {
         let mut docs = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        docs.insert(id.to_owned(), text.to_owned());
+        let doc = Doc {
+            text: text.to_owned(),
+            class: class.to_owned(),
+        };
+        docs.insert(id.to_owned(), doc);
     }
 }
 
 impl Docs for FakeDocs {
-    fn read(&self, id: &str) -> Result<String> {
+    fn read(&self, id: &str) -> Result<Doc> {
         let docs = self.0.lock().unwrap_or_else(|e| e.into_inner());
         docs.get(id)
             .cloned()
@@ -437,12 +675,12 @@ Create `crates/kod-tool-gateway/src/lib.rs`:
 
 ````rust
 //! Kod's tool gateway: the MCP endpoint a run's sandbox reaches for tracker
-//! and docs tools and for the publish operation. Every call is checked by
-//! kod-policy and recorded in the audit log before it acts; a call that
-//! can't be decided or recorded doesn't happen.
+//! and docs tools. Every call is checked by kod-policy and recorded in the
+//! audit log before it acts; a call that can't be decided or recorded
+//! doesn't happen. A canceled run gets nothing.
 use anyhow::bail;
 use docs::Docs;
-use kod_audit::{AuditLog, RUN_AUDIT};
+use kod_audit::{AuditLog, RUN_AUDIT, redact::REDACTED};
 use kod_policy::Policy;
 use kod_tracker::{Issue, Rework, ReworkKind, State, Tracker};
 use serde_json::{Value, json};
@@ -453,9 +691,17 @@ use std::{
 };
 
 pub mod docs;
+
 /// A run token is at least this many lower-case hex characters, as in the
 /// LLM gateway.
 pub const MIN_TOKEN_LEN: usize = 32;
+/// The moves the agent may make on its own ticket. Review and done are the
+/// dispatcher's, on publish.
+pub const AGENT_TRANSITIONS: [(State, State); 2] = [
+    (State::InProgress, State::Blocked),
+    (State::Blocked, State::InProgress),
+];
+
 /// A run the gateway serves. `base` is the commit its workspace started from.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Run {
@@ -463,19 +709,45 @@ pub struct Run {
     pub ticket: String,
     pub repo: String,
     pub base: String,
+    /// The classes the run starts with; each doc it reads adds its own.
     pub data_classes: Vec<String>,
+    /// The rework requests Kod itself linked to the ticket before this run,
+    /// from the dispatcher's records: a snapshot taken at start, never the
+    /// ticket's live links, which any human can change.
+    pub linked_tickets: Vec<String>,
+    /// Unix seconds. The commit date, so a retried publish makes the same
+    /// commit.
+    pub started_at: i64,
 }
 
+#[derive(Clone)]
 struct Live {
     run: Run,
-    canceled: bool,
+    /// Rework requests this run created; it may read and comment on them.
+    created: Vec<String>,
+    /// `run.data_classes` plus the class of every doc read since.
+    classes: Vec<String>,
 }
+
+impl Live {
+    fn linked(&self) -> Vec<String> {
+        let mut all = self.run.linked_tickets.clone();
+        all.extend(self.created.iter().cloned());
+        all
+    }
+}
+
+/// Whether a run is stopped (canceled, or ended) in the dispatcher's
+/// database. The gateway asks before every call; an error counts as
+/// stopped.
+pub type Stopped = Arc<dyn Fn(&str) -> anyhow::Result<bool> + Send + Sync>;
 
 /// The adapters behind the tools. Each holds its own credentials; none of
 /// them is ever handed to the sandbox.
 pub struct Adapters {
     pub tracker: Arc<dyn Tracker>,
     pub docs: Arc<dyn Docs>,
+    pub stopped: Stopped,
 }
 
 pub struct Gateway {
@@ -501,6 +773,24 @@ fn named(s: &str) -> bool {
 
 fn lower_hex(s: &str, min: usize) -> bool {
     s.len() >= min && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Error text made safe for an MCP reply, an audit record or a log: the
+/// audit log's redaction, then run tokens in `/r/{token}` paths.
+pub fn scrub(text: &str) -> String {
+    let text = kod_audit::redact::redact(text);
+    let (mut out, mut rest) = (String::new(), text.as_str());
+    while let Some(i) = rest.find("/r/") {
+        out.push_str(&rest[..i + 3]);
+        rest = &rest[i + 3..];
+        let n = rest.bytes().take_while(u8::is_ascii_hexdigit).count();
+        if n >= MIN_TOKEN_LEN {
+            out.push_str(REDACTED);
+            rest = &rest[n..];
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 type Reply = Result<Value, String>;
@@ -566,48 +856,78 @@ impl Gateway {
                 run.id
             );
         }
+        if !run.linked_tickets.iter().all(|t| named(t)) {
+            bail!("run {}: linked_tickets must be names", run.id);
+        }
         let mut runs = self.lock();
         if runs.values().any(|l| l.run.id == run.id) || runs.contains_key(&key(token)) {
             bail!("run {} is already started", run.id);
         }
+        let classes = run.data_classes.clone();
         runs.insert(
             key(token),
             Live {
                 run,
-                canceled: false,
+                created: vec![],
+                classes,
             },
         );
         Ok(())
     }
 
-    /// Cancels a run; false if there is no such run.
-    pub fn cancel(&self, run_id: &str) -> bool {
-        let mut runs = self.lock();
-        let live = runs.values_mut().find(|l| l.run.id == run_id);
-        live.map(|l| l.canceled = true).is_some()
+    /// Stops serving a run: its token stops working. Safe to repeat. The
+    /// dispatcher calls it when the run ends, however it ends.
+    pub fn end_run(&self, run_id: &str) -> anyhow::Result<()> {
+        self.lock().retain(|_, l| l.run.id != run_id);
+        Ok(())
     }
 
-    /// Cancels every run: the kill switch.
-    pub fn cancel_all(&self) {
-        self.lock().values_mut().for_each(|l| l.canceled = true);
+    /// The kill switch: stop serving every run.
+    pub fn end_all(&self) -> anyhow::Result<()> {
+        self.lock().clear();
+        Ok(())
     }
 
-    /// The run and whether it is canceled, or None for an unknown token.
-    pub fn run(&self, token: &str) -> Option<(Run, bool)> {
-        let runs = self.lock();
-        runs.get(&key(token)).map(|l| (l.run.clone(), l.canceled))
+    /// The run, or None for an unknown token.
+    pub fn run(&self, token: &str) -> Option<Run> {
+        self.lock().get(&key(token)).map(|l| l.run.clone())
     }
 
-    /// Runs one tool call for the run with this token. Blocking.
+    fn live(&self, token: &str) -> Option<Live> {
+        self.lock().get(&key(token)).cloned()
+    }
+
+    fn update(&self, run_id: &str, f: impl FnOnce(&mut Live)) {
+        if let Some(l) = self.lock().values_mut().find(|l| l.run.id == run_id) {
+            f(l);
+        }
+    }
+
+    /// Refuses unless the dispatcher's database says the run is live.
+    fn not_stopped(&self, run_id: &str) -> Result<(), String> {
+        match (self.adapters.stopped)(run_id) {
+            Ok(false) => Ok(()),
+            Ok(true) => Err("refused: the run is canceled".into()),
+            Err(e) => Err(scrub(&format!(
+                "refused: the run's state could not be read: {e:#}"
+            ))),
+        }
+    }
+
+    /// Runs one tool call for the run with this token. Blocking. Every
+    /// error is scrubbed.
     pub fn call(&self, token: &str, tool: &str, args: &Value) -> Reply {
-        let (run, canceled) = self.run(token).ok_or("unknown run")?;
+        let live = self.live(token).ok_or("unknown run")?;
+        self.not_stopped(&live.run.id)?;
         match tool {
-            "get_issue" => self.get_issue(&run, args),
-            "read_doc" => self.read_doc(&run, args),
-            "comment" | "transition" => self.write(&run, canceled, tool, args),
-            "create_linked" => self.create_linked(&run, canceled, args),
+            "get_issue" => self.get_issue(&live, args),
+            "read_doc" => self.read_doc(&live, args),
+            "comment" => self.comment(&live, args),
+            "transition" => self.transition(&live, args),
+            "create_linked" => self.create_linked(&live, args),
             other => Err(format!("unknown tool {other:?}")),
         }
+        .map_err(|e| scrub(&e))
     }
 
     /// Asks the policy and records the decision. Refuses if the record can't
@@ -637,21 +957,21 @@ impl Gateway {
         let r = self
             .audit
             .before(RUN_AUDIT, &intent, call)
-            .map_err(|e| format!("refused: the audit write failed: {e:#}"))?;
+            .map_err(|e| scrub(&format!("refused: the audit write failed: {e:#}")))?;
         let result = r
             .as_ref()
             .map(|_| "ok".to_owned())
-            .unwrap_or_else(|e| format!("{e:#}"));
+            .unwrap_or_else(|e| scrub(&format!("{e:#}")));
         // The call already happened; a failed result record can't undo it.
         let _ = self.audit.append(
             RUN_AUDIT,
             &json!({"kind": "tool_result", "run": run.id, "tool": tool, "result": result}),
         );
-        r.map_err(|e| format!("{tool} failed: {e:#}"))
+        r.map_err(|e| scrub(&format!("{tool} failed: {e:#}")))
     }
 
-    /// The run's own ticket, read for the policy inputs (its linked docs and
-    /// tickets) and the PR text.
+    /// The run's own ticket, read for its linked docs, its state and the PR
+    /// text.
     fn own_issue(&self, run: &Run) -> Result<Issue, String> {
         self.adapters
             .tracker
@@ -659,73 +979,87 @@ impl Gateway {
             .map_err(|e| format!("reading the run's ticket failed: {e:#}"))
     }
 
-    fn get_issue(&self, run: &Run, args: &Value) -> Reply {
-        let k = text(args, "key")?;
+    fn get_issue(&self, live: &Live, args: &Value) -> Reply {
+        let (run, k) = (&live.run, text(args, "key")?);
+        let target = json!({"kind": "ticket", "id": k});
         self.allow(json!({
             "action": "read",
             "actor": {"kind": "agent"},
-            "run": {"id": run.id, "ticket": run.ticket},
-            "target": {"kind": "ticket", "id": k},
+            "run": {"id": run.id, "ticket": run.ticket, "linked_tickets": live.linked()},
+            "target": target,
         }))?;
-        let i = self
-            .adapters
-            .tracker
-            .get_issue(k)
-            .map_err(|e| format!("{e:#}"))?;
+        let t = &self.adapters.tracker;
+        let i = self.act(run, "get_issue", target, || t.get_issue(k))?;
         Ok(issue_json(&i))
     }
 
-    fn read_doc(&self, run: &Run, args: &Value) -> Reply {
-        let id = text(args, "id")?;
+    fn read_doc(&self, live: &Live, args: &Value) -> Reply {
+        let (run, id) = (&live.run, text(args, "id")?);
         let issue = self.own_issue(run)?;
+        let target = json!({"kind": "doc", "id": id});
         self.allow(json!({
             "action": "read",
             "actor": {"kind": "agent"},
             "run": {"id": run.id, "ticket": run.ticket, "linked_docs": issue.approved_versions},
-            "target": {"kind": "doc", "id": id},
+            "target": target,
         }))?;
-        let t = self.adapters.docs.read(id).map_err(|e| format!("{e:#}"))?;
-        Ok(json!({"id": id, "text": t}))
+        let docs = &self.adapters.docs;
+        let doc = self.act(run, "read_doc", target, || docs.read(id))?;
+        // What the run has read, it may only publish under that doc's class.
+        self.update(&run.id, |l| {
+            if !l.classes.contains(&doc.class) {
+                l.classes.push(doc.class.clone());
+            }
+        });
+        Ok(json!({"id": id, "text": doc.text}))
     }
 
-    fn write_input(
-        &self,
-        run: &Run,
-        canceled: bool,
-        kind: &str,
-        target: Value,
-    ) -> Result<(), String> {
-        let issue = self.own_issue(run)?;
+    fn write_input(&self, live: &Live, kind: &str, target: Value) -> Result<(), String> {
+        let run = &live.run;
         self.allow(json!({
             "action": "tracker_write",
             "kind": kind,
             "actor": {"kind": "agent"},
-            "run": {"id": run.id, "ticket": run.ticket, "canceled": canceled, "linked_tickets": issue.links},
+            // `not_stopped` already checked the dispatcher's database.
+            "run": {"id": run.id, "ticket": run.ticket, "canceled": false, "linked_tickets": live.linked()},
             "target": target,
         }))
     }
 
-    fn write(&self, run: &Run, canceled: bool, tool: &str, args: &Value) -> Reply {
-        let k = text(args, "key")?;
+    fn comment(&self, live: &Live, args: &Value) -> Reply {
+        let (k, body) = (text(args, "key")?, text(args, "text")?);
+        let target = json!({"ticket": k});
+        self.write_input(live, "comment", target.clone())?;
         let t = &self.adapters.tracker;
-        if tool == "comment" {
-            let body = text(args, "text")?;
-            self.write_input(run, canceled, tool, json!({"ticket": k}))?;
-            self.act(run, tool, json!({"ticket": k}), || t.comment(k, body))?;
-        } else {
-            let name = text(args, "state")?;
-            let state = State::ALL
-                .into_iter()
-                .find(|s| s.name() == name)
-                .ok_or_else(|| format!("unknown state {name:?}"))?;
-            self.write_input(run, canceled, tool, json!({"ticket": k}))?;
-            let target = json!({"ticket": k, "state": name});
-            self.act(run, tool, target, || t.transition(k, state))?;
-        }
+        self.act(&live.run, "comment", target, || t.comment(k, body))?;
         Ok(json!({"ok": true}))
     }
 
-    fn create_linked(&self, run: &Run, canceled: bool, args: &Value) -> Reply {
+    fn transition(&self, live: &Live, args: &Value) -> Reply {
+        let (run, k, name) = (&live.run, text(args, "key")?, text(args, "state")?);
+        let to = State::ALL
+            .into_iter()
+            .find(|s| s.name() == name)
+            .ok_or_else(|| format!("unknown state {name:?}"))?;
+        if k != run.ticket {
+            return Err("the agent may move only its own ticket".into());
+        }
+        let from = self.own_issue(run)?.state;
+        if !AGENT_TRANSITIONS.contains(&(from, to)) {
+            return Err(format!(
+                "the agent may not move its ticket from {} to {name}",
+                from.name()
+            ));
+        }
+        let target = json!({"ticket": k, "state": name});
+        self.write_input(live, "transition", json!({"ticket": k}))?;
+        let t = &self.adapters.tracker;
+        self.act(run, "transition", target, || t.transition(k, to))?;
+        Ok(json!({"ok": true}))
+    }
+
+    fn create_linked(&self, live: &Live, args: &Value) -> Reply {
+        let run = &live.run;
         let kind = match text(args, "kind")? {
             "question" => ReworkKind::Question,
             "amendment" => ReworkKind::Amendment,
@@ -744,11 +1078,12 @@ impl Gateway {
             evidence,
         };
         let target = json!({"parent": run.ticket});
-        self.write_input(run, canceled, "create_linked", target.clone())?;
+        self.write_input(live, "create_linked", target.clone())?;
         let t = &self.adapters.tracker;
         let key = self.act(run, "create_linked", target, || {
             t.create_linked(&run.ticket, kind, &fields)
         })?;
+        self.update(&run.id, |l| l.created.push(key.clone()));
         Ok(json!({"key": key}))
     }
 }
@@ -756,13 +1091,13 @@ impl Gateway {
 
 - [ ] **Step 4: Run the tests to see them pass**
 
-Run: `cargo test -p kod-tool-gateway && cargo clippy -p kod-tool-gateway --all-targets -- -D warnings && cargo fmt --all --check`
-Expected: PASS (tools 8), clean.
+Run: `cargo test -p kod-policy -p kod-tool-gateway && cargo clippy -p kod-policy -p kod-tool-gateway --all-targets -- -D warnings && cargo fmt --all --check`
+Expected: PASS (kod-tool-gateway tools 12; kod-policy agent_ops 17), clean.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add Cargo.toml Cargo.lock crates/kod-tool-gateway
+git add Cargo.toml Cargo.lock policy/agent.rego crates/kod-policy crates/kod-tool-gateway
 git commit -m "kod-tool-gateway: tracker and docs tools behind policy and the audit log"
 ```
 
@@ -774,8 +1109,8 @@ git commit -m "kod-tool-gateway: tracker and docs tools behind policy and the au
 - Test: `crates/kod-tool-gateway/tests/common/mod.rs` (modify), `tests/publish.rs`
 
 **Interfaces:**
-- Consumes: Task 1's `Gateway`, `Run`, `Adapters`, `Reply`; the policy plan's `publish` input (`run.{id, ticket, repo, canceled, data_classes}`, `target.{repo, branch, draft}`, `changed_paths`).
-- Produces: `broker::{Secret::{new, expose}, Broker::mint(&str) -> anyhow::Result<Secret>}`; `forge::{Change { path, content: Option<String> }, Identity { name, email }, Commit { repo, base, changes, message, committer }, Forge::{commit, set_branch, find_pr, open_draft_pr}, FakeGitHub, FakePr}`; `Adapters` gains `broker: Arc<dyn Broker>` and `forge: Arc<dyn Forge>`; `Gateway::new` gains `agent: Identity`; the `publish` tool returning `{"branch", "commit", "pr"}`; `MAX_FILES`, `MAX_PUBLISH_BYTES`, `MAX_TITLE`.
+- Consumes: Task 1's `Gateway`, `Run`, `Adapters`, `Stopped`, `scrub`; the policy plan's `publish` input (`run.{id, ticket, repo, canceled, data_classes}`, `target.{repo, branch, draft}`, `changed_paths`).
+- Produces: `broker::{Secret::{new, expose}, Broker::{mint(&str, &str) -> anyhow::Result<Secret>, revoke(&str), revoke_all()}}`; `forge::{Change { path, content: Option<String> }, Collected { changes, test_evidence }, Workspace::collected(&str), Identity { name, email }, Commit { repo, base, changes, message, committer, date }, Forge::{commit, set_branch, delete_branch, find_pr, open_draft_pr}, check(&dyn Forge, &dyn Broker, &str, &str), FakeGitHub, FakePr, FakeWorkspace}`; `Adapters` gains `broker`, `forge` and `workspace`; `Gateway::new` gains `agent: Identity`; `Gateway::publish(&str) -> Result<Published, String>` with `Published { branch, commit, pr }`; `Gateway::published(&str, &str, &str) -> Result<Option<String>, String>` (the dispatcher's crash recovery); `MAX_FILES`, `MAX_PUBLISH_BYTES`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -783,47 +1118,72 @@ Apply to `crates/kod-tool-gateway/tests/common/mod.rs` with `git apply`:
 
 ````diff
 diff --git a/crates/kod-tool-gateway/tests/common/mod.rs b/crates/kod-tool-gateway/tests/common/mod.rs
-index 5ecc930..4c590d1 100644
+index 401b6f0..9d6433a 100644
 --- a/crates/kod-tool-gateway/tests/common/mod.rs
 +++ b/crates/kod-tool-gateway/tests/common/mod.rs
-@@ -1,7 +1,11 @@
+@@ -1,6 +1,7 @@
  #![allow(dead_code)]
  use kod_audit::AuditLog;
  use kod_policy::Policy;
--use kod_tool_gateway::{Adapters, Gateway, Run, docs::FakeDocs};
-+use kod_tool_gateway::{
-+    Adapters, Gateway, Run,
-+    docs::FakeDocs,
-+    forge::{FakeGitHub, Identity},
-+};
++use kod_tool_gateway::forge::{Change, Collected, FakeGitHub, FakeWorkspace, Identity};
+ use kod_tool_gateway::{Adapters, Gateway, Run, docs::FakeDocs};
  use kod_tracker::fake::{self, FakeIssue, FakeTracker};
- use std::{path::PathBuf, sync::Arc};
- 
-@@ -16,6 +20,7 @@ pub struct Harness {
+ use std::{
+@@ -35,6 +36,8 @@ pub struct Harness {
      pub gw: Arc<Gateway>,
      pub tracker: Arc<FakeTracker>,
      pub docs: Arc<FakeDocs>,
 +    pub github: Arc<FakeGitHub>,
++    pub workspace: Arc<FakeWorkspace>,
+     pub runs: Arc<Runs>,
      pub audit: PathBuf,
      _dir: tempfile::TempDir,
+@@ -52,6 +55,24 @@ pub fn run() -> Run {
+     }
  }
-@@ -56,16 +61,25 @@ pub fn harness() -> Harness {
-     let docs = Arc::new(FakeDocs::default());
-     docs.add(LINKED_DOC, "the approved brief");
-     docs.add(SECRET_DOC, PLANTED);
+ 
++/// What the collector found for a run that changed `path` and deleted
++/// old.rs.
++pub fn collected(path: &str) -> Collected {
++    Collected {
++        changes: vec![
++            Change {
++                path: path.into(),
++                content: Some("fn hold() {}\n".into()),
++            },
++            Change {
++                path: "old.rs".into(),
++                content: None,
++            },
++        ],
++        test_evidence: "cargo test: 12 passed".into(),
++    }
++}
++
+ /// A gateway over the fakes with run-1 started under TOKEN on FAKE-1, which
+ /// is in progress. FAKE-1 links HUMAN_LINK and REWORK; FAKE-9 and
+ /// SECRET_DOC are not linked and hold PLANTED.
+@@ -92,17 +113,30 @@ pub fn harness() -> Harness {
+         }
+         Ok(r.stopped.lock().unwrap().contains(run))
+     });
 +    let github = Arc::new(FakeGitHub::default());
 +    github.add_repo("acme/app", BASE);
++    let workspace = Arc::new(FakeWorkspace::default());
++    workspace.set("run-1", collected("src/refund.rs"));
      let adapters = Adapters {
          tracker: tracker.clone(),
          docs: docs.clone(),
+         stopped,
 +        broker: github.clone(),
 +        forge: github.clone(),
-     };
--    let gw = Arc::new(Gateway::new(policy, log, adapters).unwrap());
++        workspace: workspace.clone(),
++    };
 +    let agent = Identity {
 +        name: "kod-agent".into(),
 +        email: "kod-agent@users.noreply.example".into(),
-+    };
+     };
+-    let gw = Arc::new(Gateway::new(policy, log, adapters).unwrap());
 +    let gw = Arc::new(Gateway::new(policy, log, adapters, agent).unwrap());
      gw.start_run(TOKEN, run()).unwrap();
      Harness {
@@ -831,9 +1191,10 @@ index 5ecc930..4c590d1 100644
          tracker,
          docs,
 +        github,
++        workspace,
+         runs,
          audit,
          _dir: dir,
-     }
 ````
 
 Create `crates/kod-tool-gateway/tests/publish.rs`:
@@ -841,213 +1202,330 @@ Create `crates/kod-tool-gateway/tests/publish.rs`:
 ````rust
 mod common;
 
+use anyhow::Result;
 use common::*;
-use kod_tool_gateway::Run;
-use serde_json::{Value, json};
+use kod_tool_gateway::{
+    broker::{Broker, Secret},
+    forge::{self, Change, Collected, Commit, FakeGitHub, Forge},
+};
+use serde_json::json;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-fn change(path: &str) -> Value {
-    json!({
-        "title": "Hold refunds over 100",
-        "summary": "Refunds over 100 wait for a second approver.",
-        "test_evidence": "cargo test: 12 passed",
-        "files": [{"path": path, "content": "fn hold() {}\n"}, {"path": "old.rs", "content": null}],
-    })
-}
-
-/// The run's branch and the PRs: nothing a refused publish may change.
 fn nothing_published(h: &Harness) {
     assert_eq!(h.github.branch("acme/app", "agent/FAKE-1-run-1"), None);
     assert!(h.github.prs().is_empty());
-    assert!(
-        h.github.minted().is_empty(),
-        "no token is minted for a refusal"
-    );
 }
 
 #[test]
-fn publish_pushes_the_agent_branch_and_opens_a_draft_pr() {
+fn publish_pushes_the_collected_change_and_opens_a_draft_pr() {
     let h = harness();
-    let r =
-        h.gw.call(TOKEN, "publish", &change("src/refund.rs"))
-            .unwrap();
-    assert_eq!(r["branch"], "agent/FAKE-1-run-1");
-    let sha = r["commit"].as_str().unwrap();
+    let p = h.gw.publish("run-1").unwrap();
+    assert_eq!(p.branch, "agent/FAKE-1-run-1");
     assert_eq!(
-        h.github.branch("acme/app", "agent/FAKE-1-run-1").as_deref(),
-        Some(sha)
+        h.github.branch("acme/app", &p.branch),
+        Some(p.commit.clone())
     );
-    let commit = h.github.commit_of(sha).unwrap();
-    assert_eq!(commit.base, BASE);
-    assert_eq!(commit.committer.name, "kod-agent");
-    assert!(commit.message.ends_with(
-        "Kod-Ticket: fake:FAKE-1\nKod-Run: run-1\nCo-Authored-By: kod-agent <kod-agent@users.noreply.example>\n"
-    ));
+    let c = h.github.commit_of(&p.commit).unwrap();
+    assert_eq!(c.base, BASE);
+    assert_eq!(c.changes, collected("src/refund.rs").changes);
+    assert_eq!(c.committer.name, "kod-agent");
+    assert_eq!(c.date, 1_700_000_000);
+    let title = &h.tracker.issue("FAKE-1").unwrap().title;
+    assert_eq!(
+        c.message,
+        format!(
+            "{title}\n\nKod-Ticket: fake:FAKE-1\nKod-Run: run-1\nCo-Authored-By: kod-agent <kod-agent@users.noreply.example>\n"
+        )
+    );
     let prs = h.github.prs();
     assert_eq!(prs.len(), 1);
     assert!(prs[0].draft);
-    assert_eq!(prs[0].title, "FAKE-1: Hold refunds over 100");
-    for part in [
+    assert_eq!(prs[0].url, p.pr);
+    assert_eq!(prs[0].title, format!("FAKE-1: {title}"));
+    for line in [
         "Ticket: fake:FAKE-1",
         "Requirement: REQ-7",
         "Run: run-1",
-        LINKED_DOC,
-        "12 passed",
+        "- https://docs.example/brief?rev=3",
+        "- src/refund.rs\n- old.rs",
+        "Test evidence:\ncargo test: 12 passed",
     ] {
-        assert!(
-            prs[0].body.contains(part),
-            "{part} missing from {}",
-            prs[0].body
-        );
+        assert!(prs[0].body.contains(line), "{line} not in {}", prs[0].body);
     }
-    assert_eq!(r["pr"], prs[0].url);
-    assert!(h.tracker.prs("FAKE-1").contains(&prs[0].url));
+    assert_eq!(h.tracker.prs("FAKE-1"), std::slice::from_ref(&p.pr));
 }
 
 #[test]
-fn the_publish_credential_never_leaves_the_gateway() {
+fn the_sandbox_cannot_publish() {
     let h = harness();
-    let r =
-        h.gw.call(TOKEN, "publish", &change("src/refund.rs"))
-            .unwrap();
-    let minted = h.github.minted();
-    assert_eq!(minted.len(), 1);
-    let log = String::from_utf8_lossy(&std::fs::read(&h.audit).unwrap()).into_owned();
-    for t in &minted {
-        assert!(!r.to_string().contains(t.as_str()));
-        assert!(!log.contains(t.as_str()));
-    }
-    let call = h
-        .records()
-        .into_iter()
-        .find(|r| r["tool"] == "publish")
-        .unwrap();
-    assert_eq!(
-        call["target"]["changed_paths"],
-        json!(["src/refund.rs", "old.rs"])
+    let e =
+        h.gw.call(
+            TOKEN,
+            "publish",
+            &json!({"files": [{"path": "x", "content": "y"}]}),
+        )
+        .unwrap_err();
+    assert_eq!(e, "unknown tool \"publish\"");
+    nothing_published(&h);
+    assert_eq!(h.github.minted().len(), 0);
+}
+
+#[test]
+fn publish_needs_a_live_run_and_a_collected_change() {
+    let h = harness();
+    assert_eq!(h.gw.publish("run-9").unwrap_err(), "unknown run");
+    h.workspace.set(
+        "run-1",
+        Collected {
+            changes: vec![],
+            test_evidence: String::new(),
+        },
     );
-}
-
-#[test]
-fn publishing_again_reuses_the_branch_and_the_pr() {
-    let h = harness();
-    let first =
-        h.gw.call(TOKEN, "publish", &change("src/refund.rs"))
-            .unwrap();
-    let again =
-        h.gw.call(TOKEN, "publish", &change("src/refund.rs"))
-            .unwrap();
-    assert_eq!(first, again);
-    assert_eq!(h.github.prs().len(), 1);
-}
-
-#[test]
-fn a_publish_that_died_before_the_pr_completes_on_retry() {
-    let h = harness();
-    h.github.fail_next_pr();
-    let e =
-        h.gw.call(TOKEN, "publish", &change("src/refund.rs"))
-            .unwrap_err();
-    assert!(e.contains("connection reset"), "{e}");
-    let r =
-        h.gw.call(TOKEN, "publish", &change("src/refund.rs"))
-            .unwrap();
-    assert_eq!(h.github.prs().len(), 1);
-    assert_eq!(r["pr"], h.github.prs()[0].url);
-}
-
-#[test]
-fn publish_is_refused_for_a_canceled_run() {
-    let h = harness();
-    h.gw.cancel("run-1");
-    let e =
-        h.gw.call(TOKEN, "publish", &change("src/refund.rs"))
-            .unwrap_err();
-    assert!(e.contains("the run is canceled"), "{e}");
-    nothing_published(&h);
-}
-
-#[test]
-fn publish_is_refused_for_a_path_that_raises_the_risk_class() {
-    let h = harness();
-    let e =
-        h.gw.call(TOKEN, "publish", &change("auth/session.rs"))
-            .unwrap_err();
-    assert!(e.starts_with("refused by policy"), "{e}");
-    nothing_published(&h);
-}
-
-#[test]
-fn publish_is_refused_for_a_data_class_not_cleared() {
-    let h = harness();
-    let token = "2".repeat(64);
-    let run = Run {
-        id: "run-2".into(),
-        data_classes: vec!["customer-pii".into()],
-        ..run()
+    assert_eq!(
+        h.gw.publish("run-1").unwrap_err(),
+        "the change must have 1 to 1000 files, it has 0"
+    );
+    let twice = Collected {
+        changes: vec![collected("a.rs").changes[0].clone(); 2],
+        test_evidence: String::new(),
     };
-    h.gw.start_run(&token, run).unwrap();
-    let e =
-        h.gw.call(&token, "publish", &change("src/refund.rs"))
-            .unwrap_err();
+    h.workspace.set("run-1", twice);
+    assert_eq!(
+        h.gw.publish("run-1").unwrap_err(),
+        "a.rs is in the change twice"
+    );
+    let big = Collected {
+        changes: vec![Change {
+            path: "big.bin".into(),
+            content: Some("x".repeat(8 * 1024 * 1024 + 1)),
+        }],
+        test_evidence: String::new(),
+    };
+    h.workspace.set("run-1", big);
+    assert_eq!(
+        h.gw.publish("run-1").unwrap_err(),
+        "the change is over 8388608 bytes"
+    );
+    nothing_published(&h);
+}
+
+#[test]
+fn publish_is_refused_for_paths_the_policy_protects() {
+    let h = harness();
+    h.workspace.set("run-1", collected("policy/agent.rego"));
+    let e = h.gw.publish("run-1").unwrap_err();
     assert!(e.starts_with("refused by policy"), "{e}");
-    assert!(h.github.prs().is_empty());
-    assert!(h.github.minted().is_empty());
-}
-
-#[test]
-fn publish_is_refused_when_the_audit_write_fails() {
-    let h = harness();
-    // Another writer holds the log, so every append times out.
-    let db = rusqlite::Connection::open(&h.audit).unwrap();
-    db.execute_batch("BEGIN EXCLUSIVE").unwrap();
-    let e =
-        h.gw.call(TOKEN, "publish", &change("src/refund.rs"))
-            .unwrap_err();
-    assert!(e.starts_with("refused: the audit write failed"), "{e}");
     nothing_published(&h);
 }
 
 #[test]
-fn publish_checks_the_shape_of_the_change() {
+fn a_run_that_read_a_restricted_doc_cannot_publish() {
     let h = harness();
-    let mut twice = change("a.rs");
-    twice["files"] = json!([{"path": "a.rs", "content": "1"}, {"path": "a.rs", "content": "2"}]);
-    let e = h.gw.call(TOKEN, "publish", &twice).unwrap_err();
-    assert_eq!(e, "a.rs is listed twice");
-    let mut empty = change("a.rs");
-    empty["files"] = json!([]);
-    assert!(h.gw.call(TOKEN, "publish", &empty).is_err());
-    let mut title = change("a.rs");
-    title["title"] = json!("two\nlines");
-    assert!(h.gw.call(TOKEN, "publish", &title).is_err());
-    let mut binary = change("a.rs");
-    binary["files"] = json!([{"path": "a.rs", "content": [1, 2]}]);
-    assert!(h.gw.call(TOKEN, "publish", &binary).is_err());
+    h.docs
+        .add_classed(LINKED_DOC, "a payroll export", "customer-pii");
+    h.gw.call(TOKEN, "read_doc", &json!({"id": LINKED_DOC}))
+        .unwrap();
+    let e = h.gw.publish("run-1").unwrap_err();
+    assert!(e.starts_with("refused by policy"), "{e}");
+    let (_, input) = h.decisions().pop().unwrap();
+    assert_eq!(
+        input["run"]["data_classes"],
+        json!(["placeholder", "customer-pii"])
+    );
     nothing_published(&h);
 }
 
 #[test]
-fn a_cancel_during_publish_stops_it_before_the_branch_moves() {
+fn a_retry_after_a_lost_pr_response_finds_the_pr() {
     let h = harness();
-    let gw = std::sync::Arc::downgrade(&h.gw);
+    h.github.lose_next_pr();
+    let e = h.gw.publish("run-1").unwrap_err();
+    assert!(e.contains("connection reset"), "{e}");
+    let p = h.gw.publish("run-1").unwrap();
+    assert_eq!(h.github.prs().len(), 1);
+    assert_eq!(h.github.prs()[0].url, p.pr);
+}
+
+#[test]
+fn every_publish_credential_is_revoked_when_it_returns() {
+    let h = harness();
+    h.gw.publish("run-1").unwrap();
+    h.github.fail_next_pr("rate limited");
+    h.gw.publish("run-1").unwrap();
+    h.github.fail_next_pr("rate limited");
+    let mut fresh = run();
+    fresh.id = "run-2".into();
+    h.workspace.set("run-2", collected("src/a.rs"));
+    h.gw.start_run(&"2".repeat(64), fresh).unwrap();
+    assert!(h.gw.publish("run-2").is_err());
+    assert_eq!(h.github.minted().len(), 3);
+    assert!(h.github.live_tokens().is_empty());
+}
+
+#[test]
+fn ending_runs_revokes_their_credentials() {
+    let h = harness();
+    // A credential that outlived its publish, as if the revoke had failed.
+    let token = h.github.mint("run-1", "acme/app").unwrap();
+    h.gw.end_run("run-1").unwrap();
+    assert!(h.github.live_tokens().is_empty());
+    assert!(h.github.set_branch(&token, "acme/app", "x", BASE).is_err());
+    h.github.mint("run-2", "acme/app").unwrap();
+    h.gw.end_all().unwrap();
+    assert!(h.github.live_tokens().is_empty());
+}
+
+#[test]
+fn credentials_never_reach_the_reply_or_the_audit_log() {
+    let h = harness();
+    let leak = "ghs_0123456789abcdef0123456789abcdef";
+    h.github
+        .fail_next_pr(&format!("token {leak} is rate limited"));
+    let e = h.gw.publish("run-1").unwrap_err();
+    assert!(e.contains("rate limited"), "{e}");
+    h.github
+        .fail_mint(&format!("could not mint for url /r/{TOKEN}/mcp ({leak})"));
+    let e2 = h.gw.publish("run-1").unwrap_err();
+    for text in [e, e2, h.raw_log()] {
+        assert!(!text.contains(leak), "{text}");
+        assert!(!text.contains(TOKEN), "{text}");
+        assert!(!text.contains("ghs_fake"), "{text}");
+    }
+}
+
+#[test]
+fn a_cancel_before_the_push_stops_publish() {
+    let h = harness();
+    let runs = h.runs.clone();
     h.github.on_commit(move || {
-        gw.upgrade().unwrap().cancel("run-1");
+        runs.stopped.lock().unwrap().insert("run-1".into());
     });
-    let e =
-        h.gw.call(TOKEN, "publish", &change("src/refund.rs"))
-            .unwrap_err();
-    assert!(e.contains("the run was canceled during publish"), "{e}");
-    assert_eq!(h.github.branch("acme/app", "agent/FAKE-1-run-1"), None);
-    assert!(h.github.prs().is_empty());
+    let e = h.gw.publish("run-1").unwrap_err();
+    assert!(e.contains("canceled during publish"), "{e}");
+    nothing_published(&h);
+}
+
+#[test]
+fn a_cancel_after_the_push_deletes_the_branch_and_opens_no_pr() {
+    let h = harness();
+    let runs = h.runs.clone();
+    h.github.on_set_branch(move || {
+        runs.stopped.lock().unwrap().insert("run-1".into());
+    });
+    let e = h.gw.publish("run-1").unwrap_err();
+    assert!(e.contains("canceled during publish"), "{e}");
+    nothing_published(&h);
+    assert!(h.tracker.prs("FAKE-1").is_empty());
+}
+
+#[test]
+fn a_canceled_run_is_not_published() {
+    let h = harness();
+    h.stop("run-1");
+    assert_eq!(
+        h.gw.publish("run-1").unwrap_err(),
+        "refused: the run is canceled"
+    );
+    nothing_published(&h);
+    assert_eq!(h.github.minted().len(), 0);
+}
+
+#[test]
+fn publish_is_refused_when_the_intent_cannot_be_recorded() {
+    let h = harness();
+    // The policy decision is written; the intent row is refused.
+    let db = rusqlite::Connection::open(&h.audit).unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER no_intent BEFORE INSERT ON audit
+         WHEN json_extract(NEW.payload, '$.kind') = 'tool_call'
+         BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+    )
+    .unwrap();
+    let e = h.gw.publish("run-1").unwrap_err();
+    assert!(e.starts_with("refused: the audit write failed"), "{e}");
+    assert_eq!(h.decisions().len(), 1);
+    assert_eq!(h.github.minted().len(), 0);
+    nothing_published(&h);
+}
+
+#[test]
+fn published_finds_the_pr_of_a_run_that_died_mid_publish() {
+    let h = harness();
+    assert_eq!(h.gw.published("acme/app", "FAKE-1", "run-1").unwrap(), None);
+    let p = h.gw.publish("run-1").unwrap();
+    assert_eq!(
+        h.gw.published("acme/app", "FAKE-1", "run-1").unwrap(),
+        Some(p.pr)
+    );
+    assert!(h.github.live_tokens().is_empty());
+}
+
+#[test]
+fn the_fake_forge_meets_the_contract() {
+    let gh = FakeGitHub::default();
+    gh.add_repo("acme/app", BASE);
+    forge::check(&gh, &gh, "acme/app", BASE).unwrap();
+}
+
+/// A forge that dates each commit with the clock, as `git commit` does when
+/// nothing pins the date.
+#[derive(Default)]
+struct ClockDated(FakeGitHub, AtomicU64);
+
+impl Broker for ClockDated {
+    fn mint(&self, run: &str, repo: &str) -> Result<Secret> {
+        self.0.mint(run, repo)
+    }
+    fn revoke(&self, run: &str) -> Result<()> {
+        self.0.revoke(run)
+    }
+    fn revoke_all(&self) -> Result<()> {
+        self.0.revoke_all()
+    }
+}
+
+impl Forge for ClockDated {
+    fn commit(&self, token: &Secret, commit: &Commit) -> Result<String> {
+        let mut c = commit.clone();
+        c.date = 1_700_000_000 + self.1.fetch_add(1, Ordering::SeqCst) as i64;
+        self.0.commit(token, &c)
+    }
+    fn set_branch(&self, t: &Secret, repo: &str, branch: &str, sha: &str) -> Result<()> {
+        self.0.set_branch(t, repo, branch, sha)
+    }
+    fn delete_branch(&self, t: &Secret, repo: &str, branch: &str) -> Result<()> {
+        self.0.delete_branch(t, repo, branch)
+    }
+    fn find_pr(&self, t: &Secret, repo: &str, branch: &str) -> Result<Option<String>> {
+        self.0.find_pr(t, repo, branch)
+    }
+    fn open_draft_pr(
+        &self,
+        t: &Secret,
+        r: &str,
+        b: &str,
+        title: &str,
+        body: &str,
+    ) -> Result<String> {
+        self.0.open_draft_pr(t, r, b, title, body)
+    }
+}
+
+#[test]
+fn the_contract_catches_a_forge_that_dates_commits_by_the_clock() {
+    let f = ClockDated::default();
+    f.0.add_repo("acme/app", BASE);
+    let e = forge::check(&f, &f, "acme/app", BASE).unwrap_err();
+    assert!(format!("{e:#}").contains("got a new SHA"), "{e:#}");
 }
 ````
 
 - [ ] **Step 2: Run the tests to see them fail**
 
 Run: `cargo test -p kod-tool-gateway --test publish`
-Expected: FAIL to compile: unresolved import `kod_tool_gateway::forge`.
+Expected: FAIL to compile: unresolved imports `kod_tool_gateway::broker`, `kod_tool_gateway::forge`; struct `Adapters` has no field named `broker`.
 
-- [ ] **Step 3: Implement the broker, the forge and publish**
+- [ ] **Step 3: Implement the broker, the forge, its contract and publish**
 
 Create `crates/kod-tool-gateway/src/broker.rs`:
 
@@ -1078,19 +1556,25 @@ impl fmt::Debug for Secret {
     }
 }
 
-/// Mints a short-lived credential that can push agent/* branches and open
-/// draft PRs in one repo, and nothing else.
+/// Mints short-lived credentials that can push agent/* branches and open
+/// draft PRs in one repo, and nothing else. Each belongs to one run, so a
+/// run's end or the kill switch can revoke it before it expires.
 pub trait Broker: Send + Sync {
-    fn mint(&self, repo: &str) -> Result<Secret>;
+    fn mint(&self, run: &str, repo: &str) -> Result<Secret>;
+    /// Revokes every credential minted for the run. Safe to repeat.
+    fn revoke(&self, run: &str) -> Result<()>;
+    /// Revokes every credential this broker minted.
+    fn revoke_all(&self) -> Result<()>;
 }
 ````
 
 Create `crates/kod-tool-gateway/src/forge.rs`:
 
 ````rust
-//! The git host behind the publish operation, and a fake of it for tests.
+//! The git host behind the publish operation, the host-side collector that
+//! supplies the change, and fakes of both for tests.
 use crate::broker::{Broker, Secret};
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap},
@@ -1102,6 +1586,23 @@ use std::{
 pub struct Change {
     pub path: String,
     pub content: Option<String>,
+}
+
+/// What the host collected from a finished run, outside the sandbox.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Collected {
+    /// The workspace diff against the run's base.
+    pub changes: Vec<Change>,
+    /// The host's own check results, for the PR body.
+    pub test_evidence: String,
+}
+
+/// A finished run's collected output. In 6b the runner's collector writes
+/// it next to the sandbox, never inside it (kod-eval's
+/// `collect_out/diff.patch` and check results); the real `Workspace` reads
+/// those files. Nothing the sandbox sends ever becomes a change.
+pub trait Workspace: Send + Sync {
+    fn collected(&self, run: &str) -> Result<Collected>;
 }
 
 /// The agent's committer identity.
@@ -1119,16 +1620,22 @@ pub struct Commit {
     pub changes: Vec<Change>,
     pub message: String,
     pub committer: Identity,
+    /// Unix seconds, used as both the author and the committer date, so
+    /// the same commit always has the same SHA.
+    pub date: i64,
 }
 
 /// The git host calls the publish operation makes. Every call carries the
-/// credential the broker minted for this publish.
+/// credential the broker minted for this publish. `check` is the contract
+/// every adapter must pass.
 pub trait Forge: Send + Sync {
     /// Creates the commit and returns its SHA. The same commit twice gives
     /// the same SHA.
     fn commit(&self, token: &Secret, commit: &Commit) -> Result<String>;
     /// Points the branch at `sha`, creating it if needed.
     fn set_branch(&self, token: &Secret, repo: &str, branch: &str, sha: &str) -> Result<()>;
+    /// Deletes the branch. Deleting a missing branch is not an error.
+    fn delete_branch(&self, token: &Secret, repo: &str, branch: &str) -> Result<()>;
     /// The URL of the open PR from `branch`, if there is one.
     fn find_pr(&self, token: &Secret, repo: &str, branch: &str) -> Result<Option<String>>;
     /// Opens a draft PR from `branch` and returns its URL.
@@ -1142,6 +1649,66 @@ pub trait Forge: Send + Sync {
     ) -> Result<String>;
 }
 
+/// The forge and broker contract, against a repo whose default branch is at
+/// `base`. It replays a publish that died after the push and again after
+/// the PR was opened but before its URL came back: the retry must make the
+/// same commit and find the PR, not open a second one. It ends by checking
+/// that a revoked credential is refused.
+pub fn check(forge: &dyn Forge, broker: &dyn Broker, repo: &str, base: &str) -> Result<()> {
+    let (run, branch) = ("contract-run", "agent/CONTRACT-1-contract-run");
+    let commit = Commit {
+        repo: repo.into(),
+        base: base.into(),
+        changes: vec![Change {
+            path: "contract.txt".into(),
+            content: Some("contract\n".into()),
+        }],
+        message: "contract\n".into(),
+        committer: Identity {
+            name: "kod-agent".into(),
+            email: "agent@kod.invalid".into(),
+        },
+        date: 1_700_000_000,
+    };
+    let token = broker.mint(run, repo).context("mint")?;
+    let first = forge.commit(&token, &commit).context("commit")?;
+    forge
+        .set_branch(&token, repo, branch, &first)
+        .context("set_branch")?;
+    ensure!(
+        forge.find_pr(&token, repo, branch)?.is_none(),
+        "find_pr found a PR nobody opened"
+    );
+    // The process died here; the retry starts over with a fresh credential.
+    let token = broker.mint(run, repo).context("mint on retry")?;
+    let again = forge.commit(&token, &commit).context("commit on retry")?;
+    ensure!(
+        again == first,
+        "the same commit got a new SHA ({first} then {again}), so a retry would move the branch"
+    );
+    forge
+        .set_branch(&token, repo, branch, &again)
+        .context("set_branch on retry")?;
+    let url = forge.open_draft_pr(&token, repo, branch, "contract", "contract")?;
+    // The PR's URL was lost on the way back; the retry must find it.
+    ensure!(
+        forge.find_pr(&token, repo, branch)? == Some(url),
+        "find_pr does not find the PR just opened"
+    );
+    forge
+        .delete_branch(&token, repo, branch)
+        .context("delete_branch")?;
+    forge
+        .delete_branch(&token, repo, branch)
+        .context("delete_branch twice")?;
+    broker.revoke(run).context("revoke")?;
+    ensure!(
+        forge.set_branch(&token, repo, branch, &first).is_err(),
+        "a revoked credential still works"
+    );
+    Ok(())
+}
+
 /// A PR as the fake stores it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FakePr {
@@ -1153,22 +1720,27 @@ pub struct FakePr {
     pub url: String,
 }
 
+type Hook = Box<dyn FnOnce() + Send>;
+
 #[derive(Default)]
 struct Inner {
-    /// Token to the repo it was minted for.
-    tokens: HashMap<String, String>,
+    /// Live token to the run and repo it was minted for.
+    tokens: HashMap<String, (String, String)>,
     minted: u64,
     /// Repo to the commits that exist in it.
     repos: HashMap<String, Vec<String>>,
     commits: HashMap<String, Commit>,
     branches: BTreeMap<(String, String), String>,
     prs: Vec<FakePr>,
-    fail_next_pr: bool,
-    on_commit: Option<Box<dyn FnOnce() + Send>>,
+    lose_next_pr: bool,
+    fail_next_pr: Option<String>,
+    fail_mint: Option<String>,
+    on_commit: Option<Hook>,
+    on_set_branch: Option<Hook>,
 }
 
-/// An in-memory GitHub: it mints repo-scoped tokens and refuses any call
-/// without a live token for that repo.
+/// An in-memory GitHub: it mints run- and repo-scoped tokens and refuses
+/// any call without a live token for that repo.
 #[derive(Default)]
 pub struct FakeGitHub(Mutex<Inner>);
 
@@ -1185,9 +1757,11 @@ impl FakeGitHub {
         (1..=self.lock().minted).map(token).collect()
     }
 
-    /// Revokes every token, as the kill switch does.
-    pub fn revoke_all(&self) {
-        self.lock().tokens.clear();
+    /// The tokens not yet revoked.
+    pub fn live_tokens(&self) -> Vec<String> {
+        let mut live: Vec<String> = self.lock().tokens.keys().cloned().collect();
+        live.sort();
+        live
     }
 
     pub fn branch(&self, repo: &str, branch: &str) -> Option<String> {
@@ -1203,14 +1777,30 @@ impl FakeGitHub {
         self.lock().prs.clone()
     }
 
-    /// The next `open_draft_pr` fails, as if the process died mid-publish.
-    pub fn fail_next_pr(&self) {
-        self.lock().fail_next_pr = true;
+    /// The next `open_draft_pr` opens the PR and then fails, as if the
+    /// process died before the reply came back.
+    pub fn lose_next_pr(&self) {
+        self.lock().lose_next_pr = true;
+    }
+
+    /// The next `open_draft_pr` fails with this message and opens nothing.
+    pub fn fail_next_pr(&self, message: &str) {
+        self.lock().fail_next_pr = Some(message.to_owned());
+    }
+
+    /// The next `mint` fails with this message.
+    pub fn fail_mint(&self, message: &str) {
+        self.lock().fail_mint = Some(message.to_owned());
     }
 
     /// Runs `f` once, at the start of the next `commit`.
     pub fn on_commit(&self, f: impl FnOnce() + Send + 'static) {
         self.lock().on_commit = Some(Box::new(f));
+    }
+
+    /// Runs `f` once, right after the next `set_branch` moves the branch.
+    pub fn on_set_branch(&self, f: impl FnOnce() + Send + 'static) {
+        self.lock().on_set_branch = Some(Box::new(f));
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -1220,7 +1810,7 @@ impl FakeGitHub {
     /// Locks after checking the token is live and minted for `repo`.
     fn authorized(&self, t: &Secret, repo: &str) -> Result<std::sync::MutexGuard<'_, Inner>> {
         let inner = self.lock();
-        if inner.tokens.get(t.expose()).map(String::as_str) != Some(repo) {
+        if inner.tokens.get(t.expose()).map(|(_, r)| r.as_str()) != Some(repo) {
             bail!("fake github: bad credential for {repo}");
         }
         Ok(inner)
@@ -1232,15 +1822,29 @@ fn token(n: u64) -> String {
 }
 
 impl Broker for FakeGitHub {
-    fn mint(&self, repo: &str) -> Result<Secret> {
+    fn mint(&self, run: &str, repo: &str) -> Result<Secret> {
         let mut inner = self.lock();
+        if let Some(m) = inner.fail_mint.take() {
+            bail!("fake github: {m}");
+        }
         if !inner.repos.contains_key(repo) {
             bail!("fake github: no repo {repo}");
         }
         inner.minted += 1;
         let t = token(inner.minted);
-        inner.tokens.insert(t.clone(), repo.to_owned());
+        let scope = (run.to_owned(), repo.to_owned());
+        inner.tokens.insert(t.clone(), scope);
         Ok(Secret::new(t))
+    }
+
+    fn revoke(&self, run: &str) -> Result<()> {
+        self.lock().tokens.retain(|_, (r, _)| r != run);
+        Ok(())
+    }
+
+    fn revoke_all(&self) -> Result<()> {
+        self.lock().tokens.clear();
+        Ok(())
     }
 }
 
@@ -1254,6 +1858,7 @@ impl Forge for FakeGitHub {
         if !inner.repos[&c.repo].contains(&c.base) {
             bail!("fake github: no commit {} in {}", c.base, c.repo);
         }
+        // Like git: the SHA covers the content, the identity and the date.
         let digest = Sha256::digest(format!("{c:?}"));
         let sha: String = digest[..20].iter().map(|b| format!("{b:02x}")).collect();
         inner.repos.get_mut(&c.repo).unwrap().push(sha.clone());
@@ -1268,6 +1873,17 @@ impl Forge for FakeGitHub {
         }
         let key = (repo.to_owned(), branch.to_owned());
         inner.branches.insert(key, sha.to_owned());
+        let hook = inner.on_set_branch.take();
+        drop(inner);
+        if let Some(f) = hook {
+            f();
+        }
+        Ok(())
+    }
+
+    fn delete_branch(&self, t: &Secret, repo: &str, branch: &str) -> Result<()> {
+        let mut inner = self.authorized(t, repo)?;
+        inner.branches.remove(&(repo.to_owned(), branch.to_owned()));
         Ok(())
     }
 
@@ -1289,8 +1905,8 @@ impl Forge for FakeGitHub {
         body: &str,
     ) -> Result<String> {
         let mut inner = self.authorized(t, repo)?;
-        if std::mem::take(&mut inner.fail_next_pr) {
-            bail!("fake github: connection reset");
+        if let Some(m) = inner.fail_next_pr.take() {
+            bail!("fake github: {m}");
         }
         let key = (repo.to_owned(), branch.to_owned());
         if !inner.branches.contains_key(&key) {
@@ -1305,7 +1921,30 @@ impl Forge for FakeGitHub {
             draft: true,
             url: url.clone(),
         });
+        if std::mem::take(&mut inner.lose_next_pr) {
+            bail!("fake github: connection reset");
+        }
         Ok(url)
+    }
+}
+
+/// The collector's output for tests: set a run's by hand.
+#[derive(Default)]
+pub struct FakeWorkspace(Mutex<HashMap<String, Collected>>);
+
+impl FakeWorkspace {
+    pub fn set(&self, run: &str, collected: Collected) {
+        let mut runs = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        runs.insert(run.to_owned(), collected);
+    }
+}
+
+impl Workspace for FakeWorkspace {
+    fn collected(&self, run: &str) -> Result<Collected> {
+        let runs = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        runs.get(run)
+            .cloned()
+            .with_context(|| format!("no collected change for {run}"))
     }
 }
 ````
@@ -1314,32 +1953,37 @@ Apply to `crates/kod-tool-gateway/src/lib.rs` with `git apply`:
 
 ````diff
 diff --git a/crates/kod-tool-gateway/src/lib.rs b/crates/kod-tool-gateway/src/lib.rs
-index 4c24775..5bc4243 100644
+index f022144..cfa5ab4 100644
 --- a/crates/kod-tool-gateway/src/lib.rs
 +++ b/crates/kod-tool-gateway/src/lib.rs
-@@ -2,22 +2,33 @@
- //! and docs tools and for the publish operation. Every call is checked by
- //! kod-policy and recorded in the audit log before it acts; a call that
- //! can't be decided or recorded doesn't happen.
--use anyhow::bail;
-+use anyhow::{Context, bail};
+@@ -2,23 +2,37 @@
+ //! and docs tools. Every call is checked by kod-policy and recorded in the
+ //! audit log before it acts; a call that can't be decided or recorded
+ //! doesn't happen. A canceled run gets nothing.
++//!
++//! Publish is not a tool. The host calls `Gateway::publish` with a run ID
++//! once the run has ended; the change comes from the host's own collector
++//! (`Workspace`), never from the sandbox.
+ use anyhow::bail;
++use anyhow::{Context, anyhow};
 +use broker::Broker;
  use docs::Docs;
-+use forge::{Change, Commit, Forge, Identity};
- use kod_audit::{AuditLog, RUN_AUDIT};
++use forge::{Change, Commit, Forge, Identity, Workspace};
+ use kod_audit::{AuditLog, RUN_AUDIT, redact::REDACTED};
  use kod_policy::Policy;
  use kod_tracker::{Issue, Rework, ReworkKind, State, Tracker};
  use serde_json::{Value, json};
  use sha2::{Digest, Sha256};
++use std::collections::HashSet;
  use std::{
--    collections::HashMap,
-+    collections::{HashMap, HashSet},
+     collections::HashMap,
      sync::{Arc, Mutex},
  };
  
 +pub mod broker;
  pub mod docs;
 +pub mod forge;
+ 
  /// A run token is at least this many lower-case hex characters, as in the
  /// LLM gateway.
  pub const MIN_TOKEN_LEN: usize = 32;
@@ -1347,18 +1991,16 @@ index 4c24775..5bc4243 100644
 +pub const MAX_FILES: usize = 1000;
 +/// At most this many bytes of file text in one publish.
 +pub const MAX_PUBLISH_BYTES: usize = 8 << 20;
-+/// At most this many bytes in a publish title.
-+pub const MAX_TITLE: usize = 200;
-+
- /// A run the gateway serves. `base` is the commit its workspace started from.
- #[derive(Clone, Debug, PartialEq)]
- pub struct Run {
-@@ -38,12 +49,15 @@ struct Live {
- pub struct Adapters {
+ /// The moves the agent may make on its own ticket. Review and done are the
+ /// dispatcher's, on publish.
+ pub const AGENT_TRANSITIONS: [(State, State); 2] = [
+@@ -72,16 +86,28 @@ pub struct Adapters {
      pub tracker: Arc<dyn Tracker>,
      pub docs: Arc<dyn Docs>,
+     pub stopped: Stopped,
 +    pub broker: Arc<dyn Broker>,
 +    pub forge: Arc<dyn Forge>,
++    pub workspace: Arc<dyn Workspace>,
  }
  
  pub struct Gateway {
@@ -1369,41 +2011,43 @@ index 4c24775..5bc4243 100644
      /// Keyed by the token's SHA-256, as in the LLM gateway.
      runs: Mutex<HashMap<String, Live>>,
  }
-@@ -87,16 +101,55 @@ fn issue_json(i: &Issue) -> Value {
+ 
++/// What a publish made.
++#[derive(Clone, Debug, PartialEq)]
++pub struct Published {
++    pub branch: String,
++    pub commit: String,
++    pub pr: String,
++}
++
+ fn hex(bytes: &[u8]) -> String {
+     bytes.iter().map(|b| format!("{b:02x}")).collect()
+ }
+@@ -139,16 +165,45 @@ fn issue_json(i: &Issue) -> Value {
      })
  }
  
-+/// The files of a publish, checked for shape and size. Path rules are the
++/// The collected change, checked for shape and size. Path rules are the
 +/// policy's.
-+fn changes(args: &Value) -> Result<Vec<Change>, String> {
-+    let files = args["files"]
-+        .as_array()
-+        .filter(|f| !f.is_empty() && f.len() <= MAX_FILES)
-+        .ok_or_else(|| format!("files must be a list of 1 to {MAX_FILES} files"))?;
++fn check_changes(changes: &[Change]) -> Result<(), String> {
++    if changes.is_empty() || changes.len() > MAX_FILES {
++        return Err(format!(
++            "the change must have 1 to {MAX_FILES} files, it has {}",
++            changes.len()
++        ));
++    }
 +    let mut seen = HashSet::new();
-+    let mut bytes = 0;
-+    let mut out = vec![];
-+    for f in files {
-+        let path = text(f, "path")?.to_owned();
-+        let content = match &f["content"] {
-+            Value::Null => None,
-+            Value::String(s) => Some(s.clone()),
-+            _ => {
-+                return Err(format!(
-+                    "{path}: content must be a string, or null to delete"
-+                ));
-+            }
-+        };
-+        if !seen.insert(path.clone()) {
-+            return Err(format!("{path} is listed twice"));
-+        }
-+        bytes += content.as_ref().map_or(0, String::len);
-+        out.push(Change { path, content });
++    if let Some(c) = changes.iter().find(|c| !seen.insert(&c.path)) {
++        return Err(format!("{} is in the change twice", c.path));
 +    }
++    let bytes: usize = changes
++        .iter()
++        .map(|c| c.content.as_ref().map_or(0, String::len))
++        .sum();
 +    if bytes > MAX_PUBLISH_BYTES {
-+        return Err(format!("the files are over {MAX_PUBLISH_BYTES} bytes"));
++        return Err(format!("the change is over {MAX_PUBLISH_BYTES} bytes"));
 +    }
-+    Ok(out)
++    Ok(())
 +}
 +
  impl Gateway {
@@ -1425,29 +2069,66 @@ index 4c24775..5bc4243 100644
              runs: Mutex::default(),
          })
      }
-@@ -168,6 +221,7 @@ impl Gateway {
-             "read_doc" => self.read_doc(&run, args),
-             "comment" | "transition" => self.write(&run, canceled, tool, args),
-             "create_linked" => self.create_linked(&run, canceled, args),
-+            "publish" => self.publish(token, &run, canceled, args),
-             other => Err(format!("unknown tool {other:?}")),
-         }
+@@ -199,16 +254,20 @@ impl Gateway {
+         Ok(())
      }
-@@ -313,4 +367,78 @@ impl Gateway {
-         })?;
+ 
+-    /// Stops serving a run: its token stops working. Safe to repeat. The
+-    /// dispatcher calls it when the run ends, however it ends.
++    /// Stops serving a run: its token stops working and every credential
++    /// minted for it is revoked. Safe to repeat. The dispatcher calls it
++    /// when the run ends, however it ends.
+     pub fn end_run(&self, run_id: &str) -> anyhow::Result<()> {
+         self.lock().retain(|_, l| l.run.id != run_id);
++        self.adapters.broker.revoke(run_id)?;
+         Ok(())
+     }
+ 
+-    /// The kill switch: stop serving every run.
++    /// The kill switch: stop serving every run and revoke every agent
++    /// credential.
+     pub fn end_all(&self) -> anyhow::Result<()> {
+         self.lock().clear();
++        self.adapters.broker.revoke_all()?;
+         Ok(())
+     }
+ 
+@@ -410,4 +469,138 @@ impl Gateway {
+         self.update(&run.id, |l| l.created.push(key.clone()));
          Ok(json!({"key": key}))
      }
 +
-+    fn publish(&self, token: &str, run: &Run, canceled: bool, args: &Value) -> Reply {
-+        let title = text(args, "title")?;
-+        if !named(title) || title.len() > MAX_TITLE {
-+            return Err(format!(
-+                "title must be one line of at most {MAX_TITLE} bytes"
-+            ));
++    /// Publishes a run's collected change to `agent/<ticket>-<run>` and
++    /// opens a draft PR. Host only: the dispatcher calls it when the runner
++    /// reports the run done. Idempotent: a retry makes the same commit and
++    /// finds the same PR. The run's credential is revoked when it returns.
++    pub fn publish(&self, run_id: &str) -> Result<Published, String> {
++        let live = self
++            .lock()
++            .values()
++            .find(|l| l.run.id == run_id)
++            .cloned()
++            .ok_or("unknown run")?;
++        let r = self.publish_live(&live);
++        if let Err(e) = self.adapters.broker.revoke(run_id) {
++            let _ = self.audit.append(
++                RUN_AUDIT,
++                &json!({"kind": "revoke_failed", "run": run_id, "error": scrub(&format!("{e:#}"))}),
++            );
 +        }
-+        let summary = text(args, "summary")?;
-+        let evidence = text(args, "test_evidence")?;
-+        let files = changes(args)?;
++        r.map_err(|e| scrub(&e))
++    }
++
++    fn publish_live(&self, live: &Live) -> Result<Published, String> {
++        let run = &live.run;
++        self.not_stopped(&run.id)?;
++        let collected = self
++            .adapters
++            .workspace
++            .collected(&run.id)
++            .map_err(|e| format!("reading the collected change failed: {e:#}"))?;
++        let files = collected.changes;
++        check_changes(&files)?;
 +        let paths: Vec<&str> = files.iter().map(|c| c.path.as_str()).collect();
 +        let branch = format!("agent/{}-{}", run.ticket, run.id);
 +        self.allow(json!({
@@ -1457,8 +2138,8 @@ index 4c24775..5bc4243 100644
 +                "id": run.id,
 +                "ticket": run.ticket,
 +                "repo": run.repo,
-+                "canceled": canceled,
-+                "data_classes": run.data_classes,
++                "canceled": false,
++                "data_classes": live.classes,
 +            },
 +            "target": {"repo": run.repo, "branch": branch, "draft": true},
 +            "changed_paths": paths,
@@ -1467,49 +2148,88 @@ index 4c24775..5bc4243 100644
 +        let tracker = self.adapters.tracker.name();
 +        let a = &self.agent;
 +        let message = format!(
-+            "{title}\n\n{summary}\n\nKod-Ticket: {tracker}:{}\nKod-Run: {}\nCo-Authored-By: {} <{}>\n",
-+            run.ticket, run.id, a.name, a.email
++            "{}\n\nKod-Ticket: {tracker}:{}\nKod-Run: {}\nCo-Authored-By: {} <{}>\n",
++            issue.title, run.ticket, run.id, a.name, a.email
 +        );
 +        let pinned: String = issue
 +            .approved_versions
 +            .iter()
 +            .map(|v| format!("- {v}\n"))
 +            .collect();
++        let changed: String = paths.iter().map(|p| format!("- {p}\n")).collect();
 +        let body = format!(
-+            "{summary}\n\nTicket: {tracker}:{}\nRequirement: {}\nRun: {}\n\nPinned inputs:\n{pinned}\nTest evidence:\n{evidence}\n",
++            "Ticket: {tracker}:{}\nRequirement: {}\nRun: {}\n\nPinned inputs:\n{pinned}\nChanged files:\n{changed}\nTest evidence:\n{}\n",
 +            run.ticket,
 +            issue.requirement_id.as_deref().unwrap_or("none"),
 +            run.id,
++            collected.test_evidence,
 +        );
-+        let pr_title = format!("{}: {title}", run.ticket);
++        let pr_title = format!("{}: {}", run.ticket, issue.title);
 +        let target =
 +            json!({"repo": run.repo, "branch": branch, "draft": true, "changed_paths": paths});
 +        let (f, t) = (&self.adapters.forge, &self.adapters.tracker);
 +        let (sha, pr) = self.act(run, "publish", target, || {
-+            let token_ = self.adapters.broker.mint(&run.repo)?;
-+            let commit = Commit {
-+                repo: run.repo.clone(),
-+                base: run.base.clone(),
-+                changes: files,
-+                message,
-+                committer: a.clone(),
++            let token = self.adapters.broker.mint(&run.id, &run.repo)?;
++            let canceled = || self.not_stopped(&run.id).is_err();
++            let push = || -> anyhow::Result<(String, String)> {
++                let commit = Commit {
++                    repo: run.repo.clone(),
++                    base: run.base.clone(),
++                    changes: files,
++                    message,
++                    committer: a.clone(),
++                    date: run.started_at,
++                };
++                let sha = f.commit(&token, &commit)?;
++                // A cancel can land at any time; check right before each
++                // step anyone else can see.
++                if canceled() {
++                    bail!("the run was canceled during publish");
++                }
++                f.set_branch(&token, &run.repo, &branch, &sha)?;
++                if canceled() {
++                    f.delete_branch(&token, &run.repo, &branch)
++                        .context("the run was canceled during publish; deleting its branch")?;
++                    bail!("the run was canceled during publish");
++                }
++                let pr = match f.find_pr(&token, &run.repo, &branch)? {
++                    Some(url) => url,
++                    None => f.open_draft_pr(&token, &run.repo, &branch, &pr_title, &body)?,
++                };
++                t.link_pr(&run.ticket, &pr)
++                    .context("linking the PR to the ticket")?;
++                Ok((sha, pr))
 +            };
-+            let sha = f.commit(&token_, &commit)?;
-+            // A cancel can land while the commit is made; the branch is the
-+            // first thing anyone else can see, so check again here.
-+            if self.run(token).is_none_or(|(_, c)| c) {
-+                bail!("the run was canceled during publish");
-+            }
-+            f.set_branch(&token_, &run.repo, &branch, &sha)?;
-+            let pr = match f.find_pr(&token_, &run.repo, &branch)? {
-+                Some(url) => url,
-+                None => f.open_draft_pr(&token_, &run.repo, &branch, &pr_title, &body)?,
-+            };
-+            t.link_pr(&run.ticket, &pr)
-+                .context("linking the PR to the ticket")?;
-+            Ok((sha, pr))
++            // An adapter error can echo the credential; it never leaves here.
++            push().map_err(|e| anyhow!("{}", format!("{e:#}").replace(token.expose(), REDACTED)))
 +        })?;
-+        Ok(json!({"branch": branch, "commit": sha, "pr": pr}))
++        Ok(Published {
++            branch,
++            commit: sha,
++            pr,
++        })
++    }
++
++    /// The draft PR a publish of this run opened, if any: how the dispatcher
++    /// settles a run it found in `publishing` after a restart.
++    pub fn published(
++        &self,
++        repo: &str,
++        ticket: &str,
++        run_id: &str,
++    ) -> Result<Option<String>, String> {
++        let branch = format!("agent/{ticket}-{run_id}");
++        let b = &self.adapters.broker;
++        let found = b.mint(run_id, repo).and_then(|token| {
++            self.adapters
++                .forge
++                .find_pr(&token, repo, &branch)
++                .map_err(|e| anyhow!("{}", format!("{e:#}").replace(token.expose(), REDACTED)))
++        });
++        let revoked = b.revoke(run_id);
++        let found = found.map_err(|e| scrub(&format!("{e:#}")))?;
++        revoked.map_err(|e| scrub(&format!("{e:#}")))?;
++        Ok(found)
 +    }
  }
 ````
@@ -1517,13 +2237,13 @@ index 4c24775..5bc4243 100644
 - [ ] **Step 4: Run the tests to see them pass**
 
 Run: `cargo test -p kod-tool-gateway && cargo clippy -p kod-tool-gateway --all-targets -- -D warnings && cargo fmt --all --check`
-Expected: PASS (publish 10, tools 8), clean. `publish_is_refused_when_the_audit_write_fails` takes about 2 s (the audit log's busy timeout).
+Expected: PASS (publish 16, tools 12), clean.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add crates/kod-tool-gateway
-git commit -m "kod-tool-gateway: idempotent publish with a brokered credential"
+git commit -m "kod-tool-gateway: host-only idempotent publish with a brokered, revoked credential"
 ```
 
 ### Task 3: The MCP endpoint
@@ -1534,8 +2254,8 @@ git commit -m "kod-tool-gateway: idempotent publish with a brokered credential"
 - Test: `crates/kod-tool-gateway/tests/common/mod.rs` (modify), `tests/mcp.rs`
 
 **Interfaces:**
-- Consumes: Task 1 and 2's `Gateway::call` and `Reply`.
-- Produces: `kod_tool_gateway::router(Arc<Gateway>, Vec<String>) -> axum::Router` serving `POST /r/{token}/mcp`; `mcp::tools() -> Vec<rmcp::model::Tool>` (the six tools with their input schemas); test helper `common::serve(Arc<Gateway>) -> String` (base URL).
+- Consumes: Task 1's `Gateway::call` and `Reply`.
+- Produces: `kod_tool_gateway::router(Arc<Gateway>, Vec<String>) -> axum::Router` serving `POST /r/{token}/mcp`; `mcp::tools() -> Vec<rmcp::model::Tool>` (the five sandbox tools with their input schemas, never `publish`); test helper `common::serve(Arc<Gateway>) -> String` (base URL).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1570,11 +2290,11 @@ Apply to `crates/kod-tool-gateway/tests/common/mod.rs` with `git apply`:
 
 ````diff
 diff --git a/crates/kod-tool-gateway/tests/common/mod.rs b/crates/kod-tool-gateway/tests/common/mod.rs
-index 4c590d1..bba941c 100644
+index 9d6433a..ebdacf5 100644
 --- a/crates/kod-tool-gateway/tests/common/mod.rs
 +++ b/crates/kod-tool-gateway/tests/common/mod.rs
-@@ -107,3 +107,19 @@ impl Harness {
-             .collect()
+@@ -175,3 +175,19 @@ impl Harness {
+         String::from_utf8_lossy(&std::fs::read(&self.audit).unwrap()).into_owned()
      }
  }
 +
@@ -1652,7 +2372,6 @@ fn the_endpoint_lists_the_tools() {
         "comment",
         "transition",
         "create_linked",
-        "publish",
     ];
     assert_eq!(names, want);
 }
@@ -1679,6 +2398,21 @@ fn a_tool_call_goes_through_the_endpoint_and_the_policy() {
 }
 
 #[test]
+fn a_publish_call_from_the_sandbox_is_refused() {
+    let h = harness();
+    let url = format!("{}/r/{TOKEN}/mcp", serve(h.gw.clone()));
+    let files = json!([{"path": "src/evil.rs", "content": "steal()"}]);
+    let params = json!({"name": "publish", "arguments": {"title": "t", "summary": "s",
+        "test_evidence": "e", "files": files}});
+    let (status, r) = mcp(&url, "tools/call", Some("publish"), params);
+    assert_eq!(status, 200, "{r}");
+    assert_eq!(r["result"]["isError"], true, "{r}");
+    assert!(r.to_string().contains("unknown tool"), "{r}");
+    assert!(h.github.minted().is_empty());
+    assert!(h.github.prs().is_empty());
+}
+
+#[test]
 fn an_unknown_token_gets_no_endpoint() {
     let h = harness();
     let url = format!("{}/r/{}/mcp", serve(h.gw.clone()), "e".repeat(64));
@@ -1691,7 +2425,7 @@ fn an_unknown_token_gets_no_endpoint() {
 - [ ] **Step 2: Run the tests to see them fail**
 
 Run: `cargo test -p kod-tool-gateway --test mcp`
-Expected: FAIL to compile: unresolved import `kod_tool_gateway::router`.
+Expected: FAIL to compile: cannot find function `router` in crate `kod_tool_gateway`.
 
 - [ ] **Step 3: Implement the endpoint**
 
@@ -1740,14 +2474,14 @@ fn schema(props: Value, required: &[&str]) -> Arc<serde_json::Map<String, Value>
     }
 }
 
-/// The tools the endpoint lists. `publish` is listed too; the client in
-/// kod-loop decides not to offer it to the model.
+/// The tools the endpoint lists: everything a run may call. Publish is not
+/// one; only the host publishes, with `Gateway::publish`.
 pub fn tools() -> Vec<Tool> {
     let s = json!({"type": "string"});
     vec![
         Tool::new(
             "get_issue",
-            "Read a ticket: the run's own ticket or one linked to it.",
+            "Read a ticket: the run's own ticket, or a rework request Kod linked to it.",
             schema(json!({"key": s}), &["key"]),
         ),
         Tool::new(
@@ -1757,12 +2491,12 @@ pub fn tools() -> Vec<Tool> {
         ),
         Tool::new(
             "comment",
-            "Comment on the run's ticket or a ticket linked to it.",
+            "Comment on the run's ticket, or a rework request Kod linked to it.",
             schema(json!({"key": s, "text": s}), &["key", "text"]),
         ),
         Tool::new(
             "transition",
-            "Move the run's ticket or a linked ticket to a state: ready, in_progress, in_review, blocked or done.",
+            "Move the run's own ticket from in_progress to blocked, or back.",
             schema(json!({"key": s, "state": s}), &["key", "state"]),
         ),
         Tool::new(
@@ -1772,17 +2506,6 @@ pub fn tools() -> Vec<Tool> {
                 json!({"kind": s, "stage": s, "artifact": s, "version": s, "text": s,
                        "evidence": {"type": "array", "items": s}}),
                 &["kind", "stage", "artifact", "version", "text", "evidence"],
-            ),
-        ),
-        Tool::new(
-            "publish",
-            "Push the run's changes to its agent branch and open a draft PR.",
-            schema(
-                json!({"title": s, "summary": s, "test_evidence": s,
-                       "files": {"type": "array", "items": {"type": "object",
-                         "properties": {"path": s, "content": {"type": ["string", "null"]}},
-                         "required": ["path", "content"]}}}),
-                &["title", "summary", "test_evidence", "files"],
             ),
         ),
     ]
@@ -1869,26 +2592,25 @@ Apply to `crates/kod-tool-gateway/src/lib.rs` with `git apply`:
 
 ````diff
 diff --git a/crates/kod-tool-gateway/src/lib.rs b/crates/kod-tool-gateway/src/lib.rs
-index 5bc4243..d0517ee 100644
+index cfa5ab4..80cd859 100644
 --- a/crates/kod-tool-gateway/src/lib.rs
 +++ b/crates/kod-tool-gateway/src/lib.rs
-@@ -19,6 +19,10 @@ use std::{
+@@ -25,6 +25,9 @@ use std::{
  pub mod broker;
  pub mod docs;
  pub mod forge;
 +mod mcp;
 +
 +pub use mcp::router;
-+
+ 
  /// A run token is at least this many lower-case hex characters, as in the
  /// LLM gateway.
- pub const MIN_TOKEN_LEN: usize = 32;
 ````
 
 - [ ] **Step 4: Run the tests to see them pass**
 
 Run: `cargo test -p kod-tool-gateway && cargo clippy -p kod-tool-gateway --all-targets -- -D warnings && cargo fmt --all --check`
-Expected: PASS (mcp 3, publish 10, tools 8), clean.
+Expected: PASS (mcp 4, publish 16, tools 12), clean.
 
 - [ ] **Step 5: Commit**
 
@@ -1906,7 +2628,7 @@ git commit -m "kod-tool-gateway: MCP endpoint per run token"
 
 **Interfaces:**
 - Consumes: Task 3's `router` and the `/r/{token}/mcp` protocol; kod-loop's `tools::{definitions, call, ToolResult}` and `run`.
-- Produces: `kod_loop::mcp::{Mcp::{connect(&str) -> anyhow::Result<Mcp>, definitions, offers, call(&str, &Value) -> ToolResult}, PROTOCOL, TIMEOUT, HIDDEN}`; `kod_loop::run_with(&Config, Option<&Mcp>, &str, &mut dyn Write) -> Outcome` (`run` is `run_with(.., None, ..)`); `kod-loop` reads optional `KOD_MCP_URL`.
+- Produces: `kod_loop::mcp::{Mcp::{connect(&str) -> anyhow::Result<Mcp>, definitions, offers, call(&str, &Value) -> ToolResult}, PROTOCOL, TIMEOUT, scrub}`; `kod_loop::run_with(&Config, Option<&Mcp>, &str, &mut dyn Write) -> Outcome` (`run` is `run_with(.., None, ..)`); `kod-loop` reads optional `KOD_MCP_URL`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1940,7 +2662,7 @@ use kod_policy::Policy;
 use kod_tool_gateway::{
     Adapters, Gateway, Run,
     docs::FakeDocs,
-    forge::{FakeGitHub, Identity},
+    forge::{FakeGitHub, FakeWorkspace, Identity},
 };
 use kod_tracker::fake::{self, FakeIssue};
 use serde_json::{Value, json};
@@ -1967,8 +2689,10 @@ fn gateway(dir: &std::path::Path) -> (String, PathBuf) {
     let adapters = Adapters {
         tracker: Arc::new(tracker),
         docs: Arc::new(FakeDocs::default()),
+        stopped: Arc::new(|_: &str| Ok(false)),
         broker: github.clone(),
         forge: github,
+        workspace: Arc::new(FakeWorkspace::default()),
     };
     let agent = Identity {
         name: "kod-agent".into(),
@@ -1981,6 +2705,8 @@ fn gateway(dir: &std::path::Path) -> (String, PathBuf) {
         repo: "acme/app".into(),
         base: "b".repeat(40),
         data_classes: vec!["placeholder".into()],
+        linked_tickets: vec![],
+        started_at: 1_700_000_000,
     };
     gw.start_run(TOKEN, run).unwrap();
     let base = serve(kod_tool_gateway::router(gw, vec!["127.0.0.1".into()]));
@@ -2056,6 +2782,35 @@ fn connecting_to_an_unknown_run_fails() {
     let e = Mcp::connect(&wrong).err().unwrap();
     assert!(format!("{e:#}").contains("404"), "{e:#}");
 }
+
+#[test]
+fn an_unreachable_gateway_does_not_leak_the_run_token() {
+    // Nothing listens on port 9.
+    let e = Mcp::connect(&format!("http://127.0.0.1:9/r/{TOKEN}/mcp"))
+        .err()
+        .unwrap();
+    let e = format!("{e:#}");
+    assert!(e.contains("reaching the tool gateway"), "{e}");
+    assert!(!e.contains(TOKEN), "{e}");
+}
+
+#[test]
+fn an_error_page_that_echoes_the_path_does_not_leak_the_run_token() {
+    let app = axum::Router::new().fallback(|uri: axum::http::Uri| async move {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("no handler for {uri}"),
+        )
+    });
+    let base = serve(app);
+    let e = Mcp::connect(&format!("{base}/r/{TOKEN}/mcp"))
+        .err()
+        .unwrap();
+    let e = format!("{e:#}");
+    assert!(e.contains("HTTP 500"), "{e}");
+    assert!(e.contains("/r/[REDACTED]/mcp"), "{e}");
+    assert!(!e.contains(TOKEN), "{e}");
+}
 ````
 
 - [ ] **Step 2: Run the test to see it fail**
@@ -2071,16 +2826,13 @@ Create `crates/kod-loop/src/mcp.rs`:
 //! A client for the tool gateway's MCP endpoint: stateless Streamable HTTP
 //! (protocol 2026-07-28), JSON responses, one POST per call.
 use crate::tools::{self, ToolResult};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use std::time::Duration;
 
 pub const PROTOCOL: &str = "2026-07-28";
 /// One gateway call; a publish of a large change is the slowest.
 pub const TIMEOUT: Duration = Duration::from_secs(120);
-/// Tools the gateway serves that the model is never offered. The run's
-/// caller publishes after the run ends.
-pub const HIDDEN: &[&str] = &["publish"];
 
 pub struct Mcp {
     url: String,
@@ -2117,9 +2869,6 @@ impl Mcp {
             if local.contains(&name) {
                 bail!("the gateway's tool {name:?} would shadow a local tool");
             }
-            if HIDDEN.contains(&name) {
-                continue;
-            }
             mcp.definitions.push(json!({
                 "name": name,
                 "description": t["description"],
@@ -2152,7 +2901,7 @@ impl Mcp {
                     .join("\n");
                 (text, r["isError"] == true)
             }
-            Err(e) => (format!("the tool gateway failed: {e:#}"), true),
+            Err(e) => (scrub(&format!("the tool gateway failed: {e:#}")), true),
         };
         ToolResult {
             text,
@@ -2179,11 +2928,17 @@ impl Mcp {
         if let Some(n) = name {
             req = req.header("mcp-name", n);
         }
-        let resp = req.send().context("reaching the tool gateway")?;
+        // reqwest puts the URL, and so the run token, in its errors.
+        let resp = req
+            .send()
+            .map_err(|e| anyhow!("reaching the tool gateway: {}", e.without_url()))?;
         let status = resp.status();
-        let text = resp.text().context("reading the tool gateway's reply")?;
+        let text = resp
+            .text()
+            .map_err(|e| anyhow!("reading the tool gateway's reply: {}", e.without_url()))?;
         if !status.is_success() {
-            bail!("{method}: HTTP {status}: {}", crate::api::head(&text, 200));
+            let head = scrub(crate::api::head(&text, 200));
+            bail!("{method}: HTTP {status}: {head}");
         }
         let mut r: Value = serde_json::from_str(&text)
             .with_context(|| format!("{method}: the reply is not JSON"))?;
@@ -2195,6 +2950,27 @@ impl Mcp {
             _ => bail!("{method}: the reply has no result"),
         }
     }
+}
+
+/// Replaces a run token in a `/r/<token>/` path with `[REDACTED]`: the
+/// token is the run's credential and must not reach the trace.
+pub fn scrub(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find("/r/") {
+        out.push_str(&rest[..i + 3]);
+        rest = &rest[i + 3..];
+        let hex = rest
+            .bytes()
+            .take_while(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+            .count();
+        if hex >= 32 {
+            out.push_str("[REDACTED]");
+            rest = &rest[hex..];
+        }
+    }
+    out.push_str(rest);
+    out
 }
 ````
 
@@ -2336,7 +3112,7 @@ index b5fd2f2..a1fa4ff 100644
 - [ ] **Step 4: Run the tests to see them pass**
 
 Run: `cargo test --all && cargo clippy --all-targets -- -D warnings && cargo fmt --all --check`
-Expected: PASS (kod-loop mcp 2 and its existing tests unchanged; kod-tool-gateway 21), clean.
+Expected: PASS (kod-loop mcp 4 and its existing tests unchanged; kod-tool-gateway 32), clean.
 
 - [ ] **Step 5: Commit**
 
@@ -2348,21 +3124,34 @@ git commit -m "kod-loop: MCP client for the tool gateway"
 ## Whole-branch review
 
 One fresh reviewer on the most capable model reads the whole branch against the design doc's tool gateway, token broker, trust boundary and action matrix sections and this plan, with these questions:
-- Is there any path from `Gateway::call` to an adapter that skips `Policy::decide`, `record_decision` or `AuditLog::before`?
-- Can a `Secret` reach a reply, an error string, an audit payload or a `Debug` print?
-- Is publish idempotent under every partial failure the fake can simulate, and is a cancel at any point honoured before the branch moves?
+- Is there any path from `Gateway::call` to an adapter that skips the `stopped` check, `Policy::decide`, `record_decision` or `AuditLog::before`?
+- Is there any way for the sandbox to reach `publish`, or to choose what it pushes or which paths the policy sees?
+- Does any policy input use the ticket's live links instead of the run's snapshot?
+- Can a `Secret` or a run token reach a reply, an error string, an audit payload or a `Debug` print? Is every minted credential revoked?
+- Is publish idempotent under every partial failure the fake can simulate, and does `forge::check` require it of any adapter? Is a cancel at any point honoured, with no branch or PR left behind?
 - Do the policy inputs match the policy plan's `read`, `tracker_write` and `publish` contracts field for field?
 - Does `kod-loop` without `KOD_MCP_URL` behave exactly as before?
 
 ## Self-review
 
-- **Spec coverage.** MCP endpoint with tracker and docs tools against the 6a fake: Tasks 1 and 3. Token broker: Task 2 (`Broker`, `Secret`, minted inside publish only). Publish (agent branch, draft PR, idempotent, refused when canceled, checked against `changed_paths`): Task 2. MCP client in kod-loop: Task 4. Policy and audit before acting, failing closed: Tasks 1 and 2. Overview exit criteria: a tool call through the endpoint (`a_tool_call_goes_through_the_endpoint_and_the_policy`, `the_agents_tracker_calls_go_through_the_gateway`); a planted secret refused and audited (`a_planted_secret_cannot_be_read_and_the_attempt_is_audited`); the PR carries the story ID and agent trailers (`publish_pushes_the_agent_branch_and_opens_a_draft_pr`); a test per publish refusal in the matrix row: canceled, audit write fails, data class not cleared, a path that raises the risk class (Task 2).
+- **Spec coverage.**
+  - MCP endpoint with tracker and docs tools against the 6a fake: Tasks 1 and 3.
+  - Token broker: Task 2 (`Broker`, `Secret`, minted inside publish only, revoked after it and on run end).
+  - Publish (agent branch, draft PR, idempotent, refused when canceled, checked against `changed_paths` computed from the collected change, host-only): Task 2.
+  - MCP client in kod-loop: Task 4.
+  - Policy and audit before acting, failing closed: Tasks 1 and 2.
+  - Overview exit criteria:
+    - a tool call through the endpoint (`a_tool_call_goes_through_the_endpoint_and_the_policy`, `the_agents_tracker_calls_go_through_the_gateway`);
+    - a planted secret refused and audited (`a_planted_secret_cannot_be_read_and_the_attempt_is_audited`);
+    - the PR carries the story ID and agent trailers (`publish_pushes_the_collected_change_and_opens_a_draft_pr`);
+    - a test per publish refusal in the matrix row: canceled, intent not recordable, data class not cleared, a path that raises the risk class (Task 2).
 - **Placeholders.** None.
-- **Type consistency.** `Gateway`, `Run`, `Adapters`, `Reply`, `Secret`, `Broker`, `Forge`, `Change`, `Identity`, `Commit`, `FakeGitHub`, `Mcp` are spelled the same in every task; the code was compiled and tested in task order on top of sub-plans 3, 4, 6a and 2, and the plan text was replayed from scratch.
-- **Review Focus.** Each of the five lines names its test and task above.
+- **Type consistency.** `Gateway`, `Run`, `Adapters`, `Stopped`, `Reply`, `Published`, `Secret`, `Broker`, `Forge`, `Workspace`, `Change`, `Collected`, `Identity`, `Commit`, `FakeGitHub`, `FakeWorkspace` and `Mcp` are spelled the same in every task. The code was compiled and tested in task order on top of sub-plans 3, 4, 6a and 2. Each task's tests were run against the previous task's code to see them fail. The plan text was replayed from scratch.
+- **Review Focus.** Each line names its tests and task above.
 
 ## Open items
 
-- **The real broker** (owner, 6b): a GitHub App installation token scoped to the one repo (recommended), or a fine-grained token. The `Broker` trait is the same either way.
+- **The real broker** (owner, 6b): a GitHub App installation token scoped to the one repo (recommended), or a fine-grained token. Either must support revocation. The `Broker` trait is the same either way.
+- **The real forge adapter** (6b) must pass `forge::check`, including the pinned commit date.
 - **Which process serves the router** (owner, 6b): the LLM gateway's process as the overview says (D1), with one token per run for both routes.
-- **Binary files in publish**: UTF-8 only now (D7). Say if agents must publish binary files; it needs base64 content in the change set.
+- **Binary files in publish**: UTF-8 only now (D9). Say if agents must publish binary files; it needs base64 content in the change set.
