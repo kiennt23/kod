@@ -69,6 +69,7 @@ The plan ends with one whole-branch review.
 - Idempotency must be a property of the forge contract: `the_fake_forge_meets_the_contract`, `the_contract_catches_a_forge_that_dates_commits_by_the_clock`, `a_retry_after_a_lost_pr_response_finds_the_pr` (Task 2).
 - A document outside the model token's admitted classes must not be returned: `a_doc_outside_the_runs_admitted_classes_is_not_returned` (Task 1). A run admitted for restricted documents must not publish to an uncleared repo: `a_run_admitted_for_restricted_docs_cannot_publish_to_an_uncleared_repo` (Task 2).
 - Canceling and revoking the push token together must still delete the branch: `cancel_revocation_does_not_prevent_branch_cleanup` (Task 2). Cleanup mints a fresh credential inside publish and the final revoke covers it too.
+- Cleanup of a run that never started succeeds on retry without touching another run's token or credential: `ending_a_never_started_run_succeeds_without_revoking_another_run` (Task 2). The real 6b dispatcher adapter must also pass its shared `check_absent_run` contract for revoke and sandbox stop.
 - The agent must not move its ticket to review or done, or move another ticket: `the_agent_moves_only_its_own_ticket_between_in_progress_and_blocked` (Task 1).
 
 ## File Structure
@@ -735,7 +736,6 @@ struct Live {
     run: Run,
     /// Rework requests this run created; it may read and comment on them.
     created: Vec<String>,
-    classes: Vec<String>,
 }
 
 impl Live {
@@ -872,13 +872,11 @@ impl Gateway {
         if runs.values().any(|l| l.run.id == run.id) || runs.contains_key(&key(token)) {
             bail!("run {} is already started", run.id);
         }
-        let classes = run.data_classes.clone();
         runs.insert(
             key(token),
             Live {
                 run,
                 created: vec![],
-                classes,
             },
         );
         Ok(())
@@ -1386,6 +1384,18 @@ fn ending_runs_revokes_their_credentials() {
     h.github.mint("run-2", "acme/app").unwrap();
     h.gw.end_all().unwrap();
     assert!(h.github.live_tokens().is_empty());
+}
+
+#[test]
+fn ending_a_never_started_run_succeeds_without_revoking_another_run() {
+    let h = harness();
+    let token = h.github.mint("run-1", "acme/app").unwrap();
+    h.gw.end_run("never-started").unwrap();
+    h.gw.end_run("never-started").unwrap();
+    assert!(h.gw.run(TOKEN).is_some());
+    h.github
+        .set_branch(&token, "acme/app", "unaffected", BASE)
+        .unwrap();
 }
 
 #[test]
@@ -1979,6 +1989,7 @@ Apply to `crates/kod-tool-gateway/src/lib.rs` with `git apply`:
 
 ````diff
 diff --git a/crates/kod-tool-gateway/src/lib.rs b/crates/kod-tool-gateway/src/lib.rs
+index 2d27bd8..397fbad 100644
 --- a/crates/kod-tool-gateway/src/lib.rs
 +++ b/crates/kod-tool-gateway/src/lib.rs
 @@ -2,23 +2,37 @@
@@ -2019,7 +2030,7 @@ diff --git a/crates/kod-tool-gateway/src/lib.rs b/crates/kod-tool-gateway/src/li
  /// The moves the agent may make on its own ticket. Review and done are the
  /// dispatcher's, on publish.
  pub const AGENT_TRANSITIONS: [(State, State); 2] = [
-@@ -71,16 +85,28 @@ pub struct Adapters {
+@@ -70,16 +84,28 @@ pub struct Adapters {
      pub tracker: Arc<dyn Tracker>,
      pub docs: Arc<dyn Docs>,
      pub stopped: Stopped,
@@ -2048,7 +2059,7 @@ diff --git a/crates/kod-tool-gateway/src/lib.rs b/crates/kod-tool-gateway/src/li
  fn hex(bytes: &[u8]) -> String {
      bytes.iter().map(|b| format!("{b:02x}")).collect()
  }
-@@ -138,16 +164,45 @@ fn issue_json(i: &Issue) -> Value {
+@@ -137,16 +163,45 @@ fn issue_json(i: &Issue) -> Value {
      })
  }
  
@@ -2094,7 +2105,7 @@ diff --git a/crates/kod-tool-gateway/src/lib.rs b/crates/kod-tool-gateway/src/li
              runs: Mutex::default(),
          })
      }
-@@ -198,16 +253,20 @@ impl Gateway {
+@@ -195,16 +250,20 @@ impl Gateway {
          Ok(())
      }
  
@@ -2118,7 +2129,7 @@ diff --git a/crates/kod-tool-gateway/src/lib.rs b/crates/kod-tool-gateway/src/li
          Ok(())
      }
  
-@@ -409,4 +468,143 @@ impl Gateway {
+@@ -406,4 +465,143 @@ impl Gateway {
          self.update(&run.id, |l| l.created.push(key.clone()));
          Ok(json!({"key": key}))
      }
@@ -2164,7 +2175,7 @@ diff --git a/crates/kod-tool-gateway/src/lib.rs b/crates/kod-tool-gateway/src/li
 +                "ticket": run.ticket,
 +                "repo": run.repo,
 +                "canceled": false,
-+                "data_classes": live.classes,
++                "data_classes": live.run.data_classes,
 +            },
 +            "target": {"repo": run.repo, "branch": branch, "draft": true},
 +            "changed_paths": paths,
@@ -2267,7 +2278,7 @@ diff --git a/crates/kod-tool-gateway/src/lib.rs b/crates/kod-tool-gateway/src/li
 - [ ] **Step 4: Run the tests to see them pass**
 
 Run: `cargo test -p kod-tool-gateway && cargo clippy -p kod-tool-gateway --all-targets -- -D warnings && cargo fmt --all --check`
-Expected: PASS (publish 17, tools 13), clean.
+Expected: PASS (publish 18, tools 13), clean.
 
 - [ ] **Step 5: Commit**
 
@@ -2622,7 +2633,7 @@ Apply to `crates/kod-tool-gateway/src/lib.rs` with `git apply`:
 
 ````diff
 diff --git a/crates/kod-tool-gateway/src/lib.rs b/crates/kod-tool-gateway/src/lib.rs
-index cfa5ab4..80cd859 100644
+index 397fbad..f420208 100644
 --- a/crates/kod-tool-gateway/src/lib.rs
 +++ b/crates/kod-tool-gateway/src/lib.rs
 @@ -25,6 +25,9 @@ use std::{
@@ -2640,7 +2651,7 @@ index cfa5ab4..80cd859 100644
 - [ ] **Step 4: Run the tests to see them pass**
 
 Run: `cargo test -p kod-tool-gateway && cargo clippy -p kod-tool-gateway --all-targets -- -D warnings && cargo fmt --all --check`
-Expected: PASS (mcp 4, publish 17, tools 13), clean.
+Expected: PASS (mcp 4, publish 18, tools 13), clean.
 
 - [ ] **Step 5: Commit**
 
@@ -3142,7 +3153,7 @@ index b5fd2f2..a1fa4ff 100644
 - [ ] **Step 4: Run the tests to see them pass**
 
 Run: `cargo test --all && cargo clippy --all-targets -- -D warnings && cargo fmt --all --check`
-Expected: PASS (kod-loop mcp 4 and its existing tests unchanged; kod-tool-gateway 34), clean.
+Expected: PASS (kod-loop mcp 4 and its existing tests unchanged; kod-tool-gateway 35), clean.
 
 - [ ] **Step 5: Commit**
 
