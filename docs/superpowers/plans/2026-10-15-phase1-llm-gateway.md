@@ -19,7 +19,7 @@
 - **D5. Budgets reserve the worst case, then settle.** Before forwarding, a request reserves body bytes + `RESERVE_SLACK` (4096) + `IMAGE_TOKENS` (5000) per image input tokens and `max_tokens` output tokens, priced at the model's input and output rates. A reservation that would take the run past either limit is refused (`over_spend`, 403). When the response ends, the reservation is replaced by the cost the response reported. A response that reported no usage is charged its whole reservation. A cost above the reservation is charged and halts the run (`halted`, 403 for every later request). `count_tokens` reserves nothing. Error responses are not charged.
 - **D6. Prices are integers.** `prices.json` gives micro-USD per million tokens for `input`, `output`, `cache_write` and `cache_read`, per model; every allowed model must have a price. Spend is kept in picodollars (one token at one micro-USD per million tokens is one picodollar), so there is no rounding. `cache_write` is the 5-minute cache price; a request asking for any other cache `ttl` is refused (D12), so the table needs no second write price.
 - **D7. Capture goes to kod-audit.** The prompt is appended as record type `prompts` and the response as `model_outputs`; kod-audit redacts secrets before storing. Secrets are redacted (kod-audit's `redact`) before the cut, so a cut can't leave part of one behind. Each capture keeps the first 128 KiB (`CAPTURE_MAX`) of the redacted text plus the full length, the SHA-256 of the full bytes, and a `truncated` flag. For a stream, the capture is the assembled content (the text, tool input JSON and thinking of each block, up to `ASSEMBLE_MAX`, 1 MiB), not the raw events, so a secret split across deltas is whole when it is redacted. A failed prompt write refuses the request. A failed output write cannot un-send the response, so it halts the run.
-- **D8. Request count and concurrency are per run.** `KOD_MAX_REQUESTS` and `KOD_MAX_CONCURRENT` keep their phase 0 meaning, now per run rather than per process.
+- **D8. Request count and concurrency are per run.** `KOD_MAX_REQUESTS` and `KOD_MAX_CONCURRENT` keep their phase 0 meaning, now per run rather than per process. A concurrency permit is held through response settlement and the output audit write; a queued request rechecks the halt after acquiring it, so a cost overrun or failed output write stops it before forwarding.
 - **D9. kod-eval: one gateway per eval run.** It replaces one container per case. Its files (`prices.json`, `runs.json`, `audit.db`) live in `<run dir>/gateway/`, the repo's `policy/` is mounted read-only, and each case's `proxy.log` is the gateway's lines for that case. The per-case budget comes from two new required flags, `--run-max-tokens` and `--run-max-cost-micro-usd`, and the price table from the required `--prices`. There is no default budget.
 - **D10. Compare stays valid.** The manifest gains `spend` (the budget and the price table). Two runs with budgets must have the same one. A phase 0 baseline has none; it compares with a budgeted run only if that run's budget refused nothing (no `over_spend` and no `halted` lines), because then the budget did not change what the agent saw.
 - **D11. No OpenAI-compatible route.** Neither runner needs one.
@@ -55,6 +55,7 @@ The plan ends with one whole-branch review.
 ## Review Focus
 
 - Two requests from one run in flight at once must not together pass the budget: `concurrent_requests_cannot_overspend_together` (Task 2).
+- A request queued behind a response that halts the run must never reach the upstream: `a_queued_request_is_refused_after_the_run_halts` (Task 2).
 - A response that costs more than its reservation, or reports no usage, must not let spend run past the budget unnoticed: `a_cost_above_its_reservation_is_charged_and_halts_the_run`, `unknown_usage_is_charged_the_whole_reservation` (Task 1) and `a_response_costing_more_than_its_reservation_halts_the_run` (Task 2).
 - A locked or unwritable audit db must refuse the request, not forward it unrecorded: `a_failed_audit_write_refuses_the_request` (Task 2).
 - Code in the sandbox calling the gateway with no token, a wrong token or a bare `/r/` must reach nothing: `an_unknown_run_is_refused_without_a_call` (Task 2).
@@ -1099,9 +1100,12 @@ async fn an_unknown_data_class_is_refused_and_recorded() {
         .await;
         assert_eq!(status(&g, msg(MODEL, 10)).await, 403, "{classes:?}");
         let e = entries(&g.db);
-        assert_eq!(e.len(), 1, "{e:?}");
+        assert_eq!(e.len(), 2, "{e:?}");
         assert_eq!(e[0].0, "run_audit");
         assert_eq!(e[0].1["decision"]["allow"], false);
+        assert_eq!(e[1].0, "run_audit");
+        assert_eq!(e[1].1["kind"], "gateway_refusal");
+        assert_eq!(e[1].1["event"], "deny_route");
     }
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
@@ -1239,6 +1243,89 @@ async fn a_response_costing_more_than_its_reservation_halts_the_run() {
             && p["reason"] == "a response cost more than its reservation"),
         "{e:?}"
     );
+}
+
+#[tokio::test]
+async fn a_queued_request_is_refused_after_the_run_halts() {
+    queued_request_is_refused(false).await;
+    queued_request_is_refused(true).await;
+}
+
+async fn queued_request_is_refused(audit_failure: bool) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    let finish = Arc::new(tokio::sync::Notify::new());
+    let release = finish.clone();
+    let up = serve(Router::new().route(
+        "/v1/messages",
+        post(move || {
+            let release = release.clone();
+            let first = seen.fetch_add(1, Ordering::SeqCst) == 0;
+            async move {
+                if first {
+                    release.notified().await;
+                }
+                let usage = if audit_failure {
+                    SMALL
+                } else {
+                    r#"{"input_tokens":10,"output_tokens":1000000}"#
+                };
+                format!(r#"{{"usage":{usage}}}"#)
+            }
+        }),
+    ))
+    .await;
+    let g = gateway(
+        &up,
+        Setup {
+            limits: Limits {
+                max_concurrent: 1,
+                ..limits()
+            },
+            ..Setup::default()
+        },
+    )
+    .await;
+    let mut tasks = vec![];
+    for _ in 0..2 {
+        let url = g.url.clone();
+        tasks.push(tokio::spawn(async move {
+            let response = post_msg(&url, msg(MODEL, 10)).await;
+            let status = response.status().as_u16();
+            response.bytes().await.unwrap();
+            status
+        }));
+    }
+    // Both requests have reserved and written their prompts; one is queued.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while entries(&g.db)
+            .iter()
+            .filter(|(t, _)| t == "prompts")
+            .count()
+            < 2
+            || calls.load(Ordering::SeqCst) == 0
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    if audit_failure {
+        std::fs::remove_file(&g.db).unwrap();
+    }
+    finish.notify_one();
+    let mut statuses = vec![];
+    for task in tasks {
+        statuses.push(
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    statuses.sort();
+    assert_eq!(statuses, [200, 403]);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -2201,7 +2288,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
 };
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Never forwarded in either direction. Client credentials are replaced.
 const DROP: [&str; 6] = [
@@ -2663,14 +2750,13 @@ async fn forward(State(st): State<Arc<AppState>>, req: Request) -> Response {
         .await;
     }
     if !allow {
-        log_with(
-            "deny_route",
+        return refuse(
+            &st,
             id,
             &path,
-            403,
-            Map::from_iter([("reasons".into(), json!(reasons))]),
-        );
-        return StatusCode::FORBIDDEN.into_response();
+            ("deny_route", StatusCode::FORBIDDEN, reasons.join("; ")),
+        )
+        .await;
     }
     // count_tokens is free, so it reserves nothing.
     let Some(price) = st.cfg.prices.get(&model).copied() else {
@@ -2717,7 +2803,8 @@ async fn forward(State(st): State<Arc<AppState>>, req: Request) -> Response {
         )
         .await;
     }
-    // Held until the response body has been fully streamed.
+    // Held through settlement and the output audit write, so queued calls
+    // see any halt before they can reach the upstream.
     let Ok(permit) = run.in_flight.clone().acquire_owned().await else {
         release(&run);
         let why = "the run's request limit was closed".into();
@@ -2729,6 +2816,11 @@ async fn forward(State(st): State<Arc<AppState>>, req: Request) -> Response {
         )
         .await;
     };
+    if run.ledger.lock().map_or(true, |l| l.halted()) {
+        release(&run);
+        let why = "the run is halted".into();
+        return refuse(&st, id, &path, ("halted", StatusCode::FORBIDDEN, why)).await;
+    }
     match st
         .client
         .request(method, url)
@@ -2762,10 +2854,10 @@ async fn forward(State(st): State<Arc<AppState>>, req: Request) -> Response {
                 price,
                 path: path.clone(),
                 status: up.status().as_u16(),
+                permit: Some(permit),
             };
             // Streamed, so server-sent events reach the runner as they arrive.
             let stream = up.bytes_stream().map(move |chunk| {
-                let _held = &permit;
                 if let Ok(c) = &chunk {
                     meter.feed(c);
                 }
@@ -2830,6 +2922,7 @@ struct Meter {
     price: Price,
     path: String,
     status: u16,
+    permit: Option<OwnedSemaphorePermit>,
 }
 
 impl Meter {
@@ -2888,7 +2981,9 @@ impl Drop for Meter {
             "response": capture(&text, complete, self.bytes, sha),
         });
         let (run, log, path) = (self.run.clone(), self.audit.clone(), self.path.clone());
+        let permit = self.permit.take();
         tokio::task::spawn_blocking(move || {
+            let _held = permit;
             let id = &run.spec.id;
             if newly_halted {
                 record_halt(&log, id, "a response cost more than its reservation");
@@ -3148,7 +3243,7 @@ index 2044505..dcdbb27 100644
 - [ ] **Step 4: Run the tests to see them pass**
 
 Run: `cargo test -p kod-llm-proxy -p kod-loop && cargo clippy --all-targets -- -D warnings`
-Expected: PASS (kod-llm-proxy: budget 9, config 6, gateway 17, proxy 12; kod-loop proxy 4), clippy clean.
+Expected: PASS (kod-llm-proxy: budget 9, config 6, gateway 18, proxy 12; kod-loop proxy 4), clippy clean.
 
 - [ ] **Step 5: Commit**
 

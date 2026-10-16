@@ -746,6 +746,8 @@ fn a_signed_webhook_that_is_malformed_is_an_error() {
         json!({"delivery": "m2", "type": "label_added", "issue": "FAKE-1", "label": "kod"}),
         json!({"delivery": "m3", "type": "comment", "issue": 1, "user": "dev", "body": "x"}),
         json!({"delivery": 4, "type": "comment", "issue": "FAKE-1", "user": "dev", "body": "x"}),
+        json!({"delivery": "m6", "type": 4}),
+        json!({"delivery": "m7"}),
     ] {
         assert!(t.parse_webhook(&t.webhook(&body)).is_err(), "{body}");
     }
@@ -1232,14 +1234,14 @@ impl Tracker for FakeTracker {
         if !self.lock().deliveries.insert(id.clone()) {
             bail!("fake: delivery {id} was already accepted (a replay)");
         }
-        let event = match v["type"].as_str() {
-            Some("label_added") if text("label")? == self.mapping.trigger_label => {
+        let event = match text("type")?.as_str() {
+            "label_added" if text("label")? == self.mapping.trigger_label => {
                 Some(TaskEvent::Labeled {
                     issue: text("issue")?,
                     by: text("user")?,
                 })
             }
-            Some("comment") => Some(TaskEvent::Commented {
+            "comment" => Some(TaskEvent::Commented {
                 issue: text("issue")?,
                 author: text("user")?,
                 body: text("body")?,
