@@ -38,10 +38,10 @@ Tests use the 6a fake tracker (wrapped to inject faults) and a fake gateway that
 | D9 | kod-tracker gains `TaskEvent::Unlabeled { issue, by }` and `TaskEvent::Edited { issue }`. The fake parses `label_removed` (trigger label only) and `issue_edited`, and drops its in-memory replay set. `contract::check` and its negative fakes cover the new events. | 6a's events cover labelling and comments only, and the overview's cancel needs these two. An adapter that drops them must fail the contract. |
 | D10 | A label removal or an edit that changes the revision cancels the live run with no policy decision. The run row, the delivery mark and the follow-ups commit in one transaction, then follow-ups run with revokes and stops first, then the best-effort `cancel` audit record. An edit returns the ticket to ready at its new revision; a new run needs a new label. An edit that doesn't change the revision does nothing. | Stopping is always safe. A run's own cancel must not depend on the policy, the audit log or the tracker being up. |
 | D11 | Humans reach the dispatcher only from an authenticated identity: a signed tracker comment whose first line is `/kod kill` or `/kod cancel` (the author is taken from the signed payload), or `signed_command`, a JSON request `{command, by, at}` HMAC-signed with that login's CLI key, at most 300 s old and used once. If replay storage fails, a verified owner or backup may still stop everything with a signed CLI kill; that request reports the storage error. Resume and other identities stay fail closed. `/kod resume` in a comment is refused with a comment saying resume is accepted only as a signed CLI request. A login string the caller passes in is never trusted. | The review's S13: stopping is safe from any authenticated channel; restarting needs the owner's or backup's own key, so it never rests on a tracker login matching a GitHub login. Emergency stopping must still work without the store. |
-| D12 | The kill switch: the owner or backup named in the dispatcher's own config is honoured without the policy and without a working audit log (the audit record is best effort); anyone else goes through the policy's `cancel` `scope: "all"` rule with a recorded decision. One transaction sets the persisted `halted` flag, cancels every live run and queues each run's revoke and stop and the ticket follow-ups. `Gateway::stop_all` is then always called, even if that transaction failed, and is queued for retry if it fails, tagged with the kill switch's epoch; `resume` moves the epoch on, so a stale retry is dropped and never stops a run started after the resume (the kill's runs keep their own stops). The error names every part that didn't complete. | Policy plan D14: the owner's or backup's kill switch must not depend on the policy. Stopping the sandboxes must not depend on the store either. |
-| D13 | `resume` comes only from the owner or backup, as a signed CLI request, through the policy's `resume` rule with a recorded decision; it fails while the policy is unavailable. While halted, admission refuses every ticket and queued runs aren't started. `/kod cancel` cancels the ticket's live run for the owner, the backup, or anyone the policy's `cancel` `scope: "run"` rule allows (a tech lead). | D14: restart only by the owner or backup. Restarting is not urgent, so it stays behind the policy. |
+| D12 | The kill switch: the owner or backup named in the dispatcher's own config is honoured without the policy and without a working audit log (the audit record is best effort); anyone else goes through the policy's `cancel` `scope: "all"` rule with a recorded decision. One transaction sets `halted`, cancels every live run, captures the kill epoch and queues each run's revoke, stop and tracker follow-ups. Each run's credential revoke is attempted before the blocking `Gateway::stop_all`; failures remain queued and do not suppress shutdown. `stop_all` is always attempted even if the transaction failed. A failed global stop is retried with the captured epoch; resume advances it, invalidating old retries. Global stops and resume share a mutex in the single dispatcher instance, including the retry's epoch check and adapter call. The error names every part that didn't complete. | Policy plan D14: the owner's or backup's kill switch must not depend on the policy or audit log. Stopping must not depend on the store or on a successful revoke. A hung shutdown must not delay the initial revokes. |
+| D13 | `resume` comes only from the owner or backup, as a signed CLI request, through the policy's `resume` rule with a recorded decision; it fails while the policy is unavailable. It also refuses promptly while any global stop is in flight; retry with a fresh signed request after the stop returns. While halted, admission refuses every ticket and queued runs aren't started. `/kod cancel` cancels the ticket's live run for the owner, the backup, or anyone the policy's `cancel` `scope: "run"` rule allows (a tech lead). | D14: restart only by the owner or backup. Restarting must not overlap a global stop that could reach new runs. The dispatcher remains one instance in one process (D1). |
 | D14 | Run outcomes: `finished(run, outcome, reason)` takes an ended state for a `running` run. `Done` moves through `publishing`, calls `Gateway::publish(run_id)` and ends `done` (ticket to in review) or `needs_human` if publish fails. Other endings are recorded as given; `canceled` comes only from the cancel paths. A run whose start fails ends `needs_human`. Every ending queues a revoke (the run's token and forge credentials end at once) and a stop. A cancel that lands after the gateway's last check inside publish, so the draft PR opens anyway, is recorded in the audit log (`canceled_after_publish`) and said on the ticket with the PR: close it, do not merge it. An `IMMEDIATE` transaction checks halted and claims `queued` to `running` before the external start; only the worker that changed the row starts it, and a cancel during that start still queues a stop. | The design's lifecycle. Concurrent workers must not start a run twice or stop another worker's successful start. Publish is refused for a canceled run, because a canceled run can't reach `publishing`, and the gateway checks `stopped` again inside publish. |
-| D15 | Crash recovery: on open, every run left in `publishing` is resolved with `Gateway::find_published` (the branch's PR, found by the run's idempotency key `agent/<ticket>-<run>`). It ends `done` if there is a PR and `needs_human` if there is none or the check fails, then the follow-ups run. | A crash mid-publish must not leave a live run that holds the WIP slot forever. |
+| D15 | Crash recovery: on open, every run left in `publishing` is resolved with `Gateway::find_published` (the branch's PR, found by `agent/<ticket>-<run>`). It ends `done` if there is a PR and `needs_human` otherwise. Before calling publish, the same transaction that enters `publishing` queues a dormant `check_publish` follow-up. When publish returns, its ending transaction activates the check, carrying the PR URL if known; on open, all pending checks are activated. For a canceled run, the check uses the known URL or `find_published` after a lost response. Lookup errors retry with capped backoff without a dead-letter limit. The warning and check completion commit together, then the audit record is attempted. | A crash must not leave a live run holding WIP or lose the warning for a canceled draft PR. The dormant check cannot run before the in-process publish returns; restart treats that process as gone. |
 | D16 | Ticket moves: admitted → in progress; done → in review; canceled → ready; blocked, needs_human, over_budget → blocked. Every ending is commented with the run ID, the state and the reason. | The 6a adapter's five states. |
 | D17 | A library and a router, no binary. `Config` is `{repo, owner, backup}` JSON with exact keys, logins lower-cased and the backup different from the owner, checked at load. CLI keys are given with `with_cli_key(login, key)`. | 6b wires the process, the real adapters and the key storage. |
 
@@ -79,6 +79,8 @@ The plan ends with one whole-branch review.
 
 ## Review Focus
 
+- A blocked global stop must not delay revocation or allow resume to admit work it could stop: `kill_revokes_before_waiting_for_global_stop`, `a_kill_finishing_after_resume_does_not_stop_new_runs`, `resume_cannot_cross_an_inflight_stop_all_retry` (Task 4, `review_edges`).
+- A canceled publication with a lost response must still be reconciled, including after a crash and more than five failed forge lookups: `a_canceled_publish_with_a_lost_response_still_marks_the_pr`, `a_canceled_publish_is_reconciled_after_a_crash_and_a_forge_outage` (Task 4, `review_edges`).
 - A replay must never start a second run: after a restart (`a_duplicate_delivery_never_starts_a_second_run`), or under a new unsigned delivery ID (`a_replay_under_a_new_unsigned_delivery_id_is_a_duplicate`) (Task 3).
 - A store write that failed must not spend the delivery: `a_delivery_whose_write_failed_is_queued_on_the_retry` (Task 3).
 - One failing delivery must not block others, and must end as a dead letter said on the ticket: `a_failing_delivery_backs_off_without_holding_up_other_tickets` (Task 3); nor hold up a cancel for its own ticket: `a_cancel_does_not_wait_behind_a_failing_event_for_its_ticket` (Task 4).
@@ -116,6 +118,7 @@ crates/kod-dispatcher/
   tests/common/mod.rs                        create: FakeGateway, the faulty tracker and the harness (Task 3), modify (Task 4)
   tests/admission.rs                         create (Task 3)
   tests/cancel.rs                            create (Task 4)
+  tests/review_edges.rs                      create (Task 4): shutdown ordering, concurrent resume and canceled-publish recovery
 ```
 
 Execution order: this plan runs after sub-plans 3 (policy), 4 (audit), 6a (tracker), 2 (LLM gateway) and 5 (tool gateway). It doesn't use 5's code; its diffs apply on top of it.
@@ -847,7 +850,7 @@ CREATE TRIGGER IF NOT EXISTS run_key_is_fixed BEFORE UPDATE OF ticket, revision 
 BEGIN SELECT RAISE(ABORT, 'a run keeps its ticket and revision'); END;
 CREATE TABLE IF NOT EXISTS followups (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    kind TEXT NOT NULL CHECK (kind IN ('revoke', 'stop', 'stop_all', 'transition', 'comment')),
+    kind TEXT NOT NULL CHECK (kind IN ('revoke', 'stop', 'stop_all', 'transition', 'comment', 'check_publish')),
     target TEXT NOT NULL,
     arg TEXT NOT NULL,
     attempts INTEGER NOT NULL DEFAULT 0,
@@ -2044,6 +2047,7 @@ pub struct Dispatcher {
     tracker: Arc<dyn Tracker>,
     gateway: Arc<dyn Gateway>,
     db: Mutex<Connection>,
+    global_stop: Mutex<()>,
 }
 
 impl Dispatcher {
@@ -2065,6 +2069,7 @@ impl Dispatcher {
             tracker,
             gateway,
             db: Mutex::new(store::open(db)?),
+            global_stop: Mutex::new(()),
         };
         d.recover()?;
         Ok(d)
@@ -2112,6 +2117,11 @@ impl Dispatcher {
             Self::end(&tx, seq_of(&run.id)?, to, &why, &[RunState::Publishing])?;
             tx.commit()?;
         }
+        self.db().execute(
+            "UPDATE followups SET next_at = 0 WHERE kind = 'check_publish' AND done = 0",
+            [],
+        )?;
+        self.follow_up(now())?;
         self.follow_up(now())
     }
 
@@ -2228,8 +2238,8 @@ impl Dispatcher {
             let mut s = c.prepare(
                 "SELECT id, kind, target, arg, attempts FROM followups
                  WHERE done = 0 AND next_at <= ?1
-                 ORDER BY CASE kind WHEN 'revoke' THEN 0 WHEN 'transition' THEN 2
-                     WHEN 'comment' THEN 2 ELSE 1 END, id",
+                 ORDER BY CASE kind WHEN 'revoke' THEN 0 WHEN 'check_publish' THEN 2
+                     WHEN 'transition' THEN 2 WHEN 'comment' THEN 2 ELSE 1 END, id",
             )?;
             s.query_map([now], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
@@ -2240,14 +2250,18 @@ impl Dispatcher {
             let r = match kind.as_str() {
                 "revoke" => self.gateway.revoke(&target),
                 "stop" => self.gateway.stop(&target),
-                "stop_all" if arg != Self::epoch(&self.db())?.to_string() => {
-                    self.db().execute(
-                        "UPDATE followups SET done = 1, error = 'the kill switch was lifted' WHERE id = ?1",
-                        [id],
-                    )?;
-                    continue;
+                "stop_all" => {
+                    let _stop = self.global_stop.lock().unwrap_or_else(|e| e.into_inner());
+                    if arg != Self::epoch(&self.db())?.to_string() {
+                        self.db().execute(
+                            "UPDATE followups SET done = 1, error = 'the kill switch was lifted' WHERE id = ?1",
+                            [id],
+                        )?;
+                        continue;
+                    }
+                    self.gateway.stop_all()
                 }
-                "stop_all" => self.gateway.stop_all(),
+                "check_publish" => self.reconcile_publish(id, &target, &arg),
                 "transition" => state_named(&arg).and_then(|s| self.tracker.transition(&target, s)),
                 "comment" => self.tracker.comment(&target, &arg),
                 k => Err(anyhow!("unknown follow-up {k}")),
@@ -2259,7 +2273,7 @@ impl Dispatcher {
                     let attempts = attempts + 1;
                     let error = scrub(&e);
                     let stopping = matches!(kind.as_str(), "revoke" | "stop" | "stop_all");
-                    let dead = !stopping && attempts >= MAX_ATTEMPTS;
+                    let dead = !stopping && kind != "check_publish" && attempts >= MAX_ATTEMPTS;
                     c.execute(
                         "UPDATE followups SET attempts = ?2, next_at = ?3, error = ?4, done = ?5
                          WHERE id = ?1",
@@ -2549,12 +2563,22 @@ impl Dispatcher {
         let seq = seq_of(run)?;
         match outcome {
             RunState::Done => {
-                let moved = self.db().execute(
-                    "UPDATE runs SET state = 'publishing' WHERE seq = ?1 AND state = 'running'",
-                    [seq],
-                )?;
-                if moved == 0 {
-                    bail!("{run} is not running");
+                {
+                    let mut c = self.db();
+                    let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                    let moved = tx.execute(
+                        "UPDATE runs SET state = 'publishing' WHERE seq = ?1 AND state = 'running'",
+                        [seq],
+                    )?;
+                    if moved == 0 {
+                        bail!("{run} is not running");
+                    }
+                    tx.execute(
+                        "INSERT INTO followups (kind, target, arg, next_at)
+                         VALUES ('check_publish', ?1, '', ?2)",
+                        params![run, i64::MAX],
+                    )?;
+                    tx.commit()?;
                 }
                 let published = self.gateway.publish(run);
                 let (to, why) = match &published {
@@ -2564,11 +2588,19 @@ impl Dispatcher {
                         format!("publish failed: {}", scrub(e)),
                     ),
                 };
-                if !self.end_now(seq, to, &why, &[RunState::Publishing])?
-                    && let Ok(pr) = &published
                 {
-                    self.canceled_after_publish(seq, pr)?;
+                    let mut c = self.db();
+                    let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                    Self::end(&tx, seq, to, &why, &[RunState::Publishing])?;
+                    tx.execute(
+                        "UPDATE followups SET next_at = 0, arg = ?2
+                         WHERE kind = 'check_publish' AND target = ?1 AND done = 0",
+                        params![run, published.as_ref().map_or("", String::as_str)],
+                    )?;
+                    tx.commit()?;
                 }
+                self.follow_up(now())?;
+                self.follow_up(now())?;
                 Ok(())
             }
             RunState::Blocked | RunState::NeedsHuman | RunState::OverBudget => {
@@ -2581,31 +2613,60 @@ impl Dispatcher {
         }
     }
 
-    /// The run was canceled after the gateway's last check, and its draft PR
-    /// opened anyway: record it, and mark it on the ticket so nobody merges
-    /// it.
-    fn canceled_after_publish(&self, seq: i64, pr: &str) -> Result<()> {
-        let run = run_id(seq);
-        let _ = self.audit.append(
-            RUN_AUDIT,
-            &json!({"kind": "canceled_after_publish", "run": run, "pr": pr}),
-        );
-        {
-            let c = self.db();
-            let ticket: String =
-                c.query_row("SELECT ticket FROM runs WHERE seq = ?1", [seq], |r| {
-                    r.get(0)
-                })?;
-            follow(
-                &c,
-                "comment",
-                &ticket,
-                &format!(
-                    "Kod {run} was canceled while it published. Its draft PR {pr} is not Kod's work: close it, do not merge it."
-                ),
-            )?;
+    fn reconcile_publish(&self, followup: i64, run: &str, known_pr: &str) -> Result<()> {
+        let (start, canceled) = self.db().query_row(
+            "SELECT ticket, revision, state = 'canceled' FROM runs WHERE seq = ?1",
+            [seq_of(run)?],
+            |r| {
+                Ok((
+                    RunStart {
+                        id: run.to_owned(),
+                        ticket: r.get(0)?,
+                        revision: r.get(1)?,
+                        repo: self.config.repo.clone(),
+                    },
+                    r.get::<_, bool>(2)?,
+                ))
+            },
+        )?;
+        if !canceled {
+            return Ok(());
         }
-        self.follow_up(now())
+        let pr = if known_pr.is_empty() {
+            self.gateway.find_published(&start)?
+        } else {
+            Some(known_pr.to_owned())
+        };
+        let Some(pr) = pr else {
+            return Ok(());
+        };
+        let recorded = {
+            let mut c = self.db();
+            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let recorded = tx.execute(
+                "UPDATE followups SET done = 1 WHERE id = ?1 AND done = 0",
+                [followup],
+            )? == 1;
+            if recorded {
+                follow(
+                    &tx,
+                    "comment",
+                    &start.ticket,
+                    &format!(
+                        "Kod {run} was canceled while it published. Its draft PR {pr} is not Kod's work: close it, do not merge it."
+                    ),
+                )?;
+            }
+            tx.commit()?;
+            recorded
+        };
+        if recorded {
+            let _ = self.audit.append(
+                RUN_AUDIT,
+                &json!({"kind": "canceled_after_publish", "run": run, "pr": pr}),
+            );
+        }
+        Ok(())
     }
 
     /// Whether the run must stop: what the gateway's `Stopped` check asks.
@@ -2719,7 +2780,7 @@ git commit -m "kod-dispatcher: verified deliveries with retry, atomic admission,
 **Files:**
 - Modify: `crates/kod-dispatcher/src/lib.rs`
 - Create: `crates/kod-dispatcher/src/command.rs`
-- Test: `crates/kod-dispatcher/tests/common/mod.rs` (modify), `tests/cancel.rs`
+- Test: `crates/kod-dispatcher/tests/common/mod.rs` (modify), `tests/cancel.rs`, `tests/review_edges.rs`
 
 **Interfaces:**
 - Consumes: Task 3's `Dispatcher`, `Gateway::{revoke, stop, stop_all}`, the harness; `Config::may_always_stop`; the policy plan's `cancel` input (`scope` `run` or `all`, `actor` `{kind: "human", login}` or `{kind: "label_removal"}`, `run.id`, `target.run`) and `resume` input (`scope: "all"`, `actor: {kind: "human", login}`); `kod_audit::{AuditLog::append, RUN_AUDIT}`.
@@ -3257,9 +3318,278 @@ fn retrying_an_old_transition_does_not_undo_a_cancel() {
 }
 ````
 
+Create `crates/kod-dispatcher/tests/review_edges.rs`:
+
+````rust
+mod common;
+
+use common::*;
+use kod_dispatcher::{Dispatcher, Gateway, RunStart, RunState};
+use std::sync::{
+    Arc, Condvar, Mutex,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
+use std::time::Duration;
+
+struct SlowKill {
+    inner: Arc<FakeGateway>,
+    first: AtomicBool,
+    entered: mpsc::Sender<()>,
+    release: (Mutex<bool>, Condvar),
+}
+
+impl Gateway for SlowKill {
+    fn start(&self, run: &RunStart) -> anyhow::Result<()> {
+        self.inner.start(run)
+    }
+    fn revoke(&self, run: &str) -> anyhow::Result<()> {
+        self.inner.revoke(run)
+    }
+    fn stop(&self, run: &str) -> anyhow::Result<()> {
+        self.inner.stop(run)
+    }
+    fn stop_all(&self) -> anyhow::Result<()> {
+        if self.first.swap(false, Ordering::SeqCst) {
+            self.entered.send(()).unwrap();
+            let (lock, ready) = &self.release;
+            drop(ready.wait_while(lock.lock().unwrap(), |v| !*v).unwrap());
+            anyhow::bail!("stop_all timed out");
+        }
+        self.inner.stop_all()
+    }
+    fn publish(&self, run: &str) -> anyhow::Result<String> {
+        self.inner.publish(run)
+    }
+    fn find_published(&self, run: &RunStart) -> anyhow::Result<Option<String>> {
+        self.inner.find_published(run)
+    }
+}
+
+fn with_gateway(h: &Harness, gateway: Arc<dyn Gateway>) -> Arc<Dispatcher> {
+    Arc::new(
+        Dispatcher::open(
+            kod_dispatcher::Config::parse(CONFIG).unwrap(),
+            &h.db,
+            kod_policy::Policy::load(&policy_dir()).map(Arc::new),
+            Arc::new(kod_audit::AuditLog::open(&h.audit).unwrap()),
+            h.flaky.clone(),
+            gateway,
+        )
+        .unwrap()
+        .with_cli_key("kiennt23", OWNER_KEY),
+    )
+}
+
+#[test]
+fn a_kill_finishing_after_resume_does_not_stop_new_runs() {
+    let h = harness();
+    h.running();
+    let (tx, rx) = mpsc::channel();
+    let gateway = Arc::new(SlowKill {
+        inner: h.gw.clone(),
+        first: AtomicBool::new(true),
+        entered: tx,
+        release: (Mutex::new(false), Condvar::new()),
+    });
+    let d = with_gateway(&h, gateway.clone());
+    let kill_d = d.clone();
+    let kill = std::thread::spawn(move || {
+        let (body, sig) = cli("kill", "kiennt23", NOW, OWNER_KEY);
+        kill_d.signed_command(&body, &sig, NOW)
+    });
+    rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let (body, sig) = cli("resume", "kiennt23", NOW + 1, OWNER_KEY);
+    let resumed = d.signed_command(&body, &sig, NOW + 1);
+    if let Err(e) = &resumed {
+        assert!(
+            e.to_string().contains("global stop is still in flight"),
+            "{e:#}"
+        );
+        assert!(d.is_halted().unwrap());
+    } else {
+        d.receive(&label(&h.tracker, "new", "FAKE-2", "dev"))
+            .unwrap();
+        d.work_at(NOW + 1).unwrap();
+    }
+    *gateway.release.0.lock().unwrap() = true;
+    gateway.release.1.notify_all();
+    assert!(kill.join().unwrap().is_err());
+    if resumed.is_err() {
+        let (body, sig) = cli("resume", "kiennt23", NOW + 2, OWNER_KEY);
+        d.signed_command(&body, &sig, NOW + 2).unwrap();
+        d.receive(&label(&h.tracker, "new", "FAKE-2", "dev"))
+            .unwrap();
+        d.work_at(NOW + 2).unwrap();
+    }
+    let calls = h.gw.calls();
+    let start = calls
+        .iter()
+        .position(|c| c.starts_with("start run-2 "))
+        .unwrap();
+    assert!(
+        !calls[start + 1..].iter().any(|c| c == "stop_all"),
+        "{calls:?}"
+    );
+}
+
+#[test]
+fn kill_revokes_before_waiting_for_global_stop() {
+    let h = harness();
+    h.running();
+    let (tx, rx) = mpsc::channel();
+    let gateway = Arc::new(SlowKill {
+        inner: h.gw.clone(),
+        first: AtomicBool::new(true),
+        entered: tx,
+        release: (Mutex::new(false), Condvar::new()),
+    });
+    let d = with_gateway(&h, gateway.clone());
+    let kill = std::thread::spawn(move || {
+        let (body, sig) = cli("kill", "kiennt23", NOW, OWNER_KEY);
+        d.signed_command(&body, &sig, NOW)
+    });
+    rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let revoked = h.gw.revoked();
+    *gateway.release.0.lock().unwrap() = true;
+    gateway.release.1.notify_all();
+    assert!(kill.join().unwrap().is_err());
+    assert!(
+        revoked.contains(&"run-1".to_owned()),
+        "revoked when stop_all began: {revoked:?}"
+    );
+}
+
+struct LostPublish(Arc<FakeGateway>);
+impl Gateway for LostPublish {
+    fn start(&self, run: &RunStart) -> anyhow::Result<()> {
+        self.0.start(run)
+    }
+    fn revoke(&self, run: &str) -> anyhow::Result<()> {
+        self.0.revoke(run)
+    }
+    fn stop(&self, run: &str) -> anyhow::Result<()> {
+        self.0.stop(run)
+    }
+    fn stop_all(&self) -> anyhow::Result<()> {
+        self.0.stop_all()
+    }
+    fn publish(&self, run: &str) -> anyhow::Result<String> {
+        let pr = self.0.publish(run)?;
+        *self.0.published.lock().unwrap() = Ok(Some(pr));
+        anyhow::bail!("the PR response was lost");
+    }
+    fn find_published(&self, run: &RunStart) -> anyhow::Result<Option<String>> {
+        self.0.find_published(run)
+    }
+}
+
+#[test]
+fn a_canceled_publish_with_a_lost_response_still_marks_the_pr() {
+    let h = harness();
+    h.running();
+    let d = with_gateway(&h, Arc::new(LostPublish(h.gw.clone())));
+    let cancel_d = d.clone();
+    let tracker = h.tracker.clone();
+    *h.gw.on_publish.lock().unwrap() = Some(Box::new(move || {
+        cancel_d
+            .receive(&unlabel(&tracker, "cancel-publish", "FAKE-1", "dev"))
+            .unwrap();
+        cancel_d.work_at(NOW).unwrap();
+    }));
+    d.finished("run-1", RunState::Done, "tests pass").unwrap();
+    let reopened = h.reopen();
+    reopened.work_at(NOW + 1000).unwrap();
+    assert!(h.gw.published.lock().unwrap().as_ref().unwrap().is_some());
+    let c = rusqlite::Connection::open(&h.audit).unwrap();
+    let marked: i64 = c
+        .query_row(
+            "SELECT count(*) FROM audit WHERE payload LIKE '%canceled_after_publish%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        marked, 1,
+        "the canceled run's existing draft PR was never flagged"
+    );
+}
+
+#[test]
+fn a_canceled_publish_is_reconciled_after_a_crash_and_a_forge_outage() {
+    let h = harness();
+    h.running();
+    h.sql("UPDATE runs SET state = 'publishing' WHERE seq = 1");
+    h.sql(
+        "INSERT INTO followups(kind,target,arg,next_at)
+           VALUES('check_publish','run-1','',9223372036854775807)",
+    );
+    h.deliver(&unlabel(&h.tracker, "crash-cancel", "FAKE-1", "dev"));
+    *h.gw.published.lock().unwrap() = Err("forge unavailable".into());
+    let reopened = h.reopen();
+    for attempt in 1..=7 {
+        reopened.work_at(NOW + attempt * 1000).unwrap();
+    }
+    assert_eq!(
+        h.count("SELECT done FROM followups WHERE kind = 'check_publish'"),
+        0
+    );
+    *h.gw.published.lock().unwrap() = Ok(Some("https://github.example/acme/app/pull/9".into()));
+    reopened.work_at(NOW + 10000).unwrap();
+    assert!(
+        h.last_comment("FAKE-1")
+            .contains("pull/9 is not Kod's work: close it")
+    );
+    assert_eq!(
+        h.count("SELECT done FROM followups WHERE kind = 'check_publish'"),
+        1
+    );
+}
+
+#[test]
+fn resume_cannot_cross_an_inflight_stop_all_retry() {
+    let h = harness();
+    h.running();
+    h.gw.fail_stop_all.store(true, Ordering::SeqCst);
+    h.say("kill-before-retry", "kiennt23", "/kod kill");
+    h.sql(&format!(
+        "UPDATE followups SET next_at = {NOW} WHERE kind = 'stop_all'"
+    ));
+    h.gw.fail_stop_all.store(false, Ordering::SeqCst);
+    let (tx, rx) = mpsc::channel();
+    let gateway = Arc::new(SlowKill {
+        inner: h.gw.clone(),
+        first: AtomicBool::new(true),
+        entered: tx,
+        release: (Mutex::new(false), Condvar::new()),
+    });
+    let d = with_gateway(&h, gateway.clone());
+    let retry_d = d.clone();
+    let retry = std::thread::spawn(move || retry_d.work_at(NOW + 1000));
+    rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let (body, sig) = cli("resume", "kiennt23", NOW + 1, OWNER_KEY);
+    let resumed = d.signed_command(&body, &sig, NOW + 1);
+    *gateway.release.0.lock().unwrap() = true;
+    gateway.release.1.notify_all();
+    retry.join().unwrap().unwrap();
+    assert!(
+        resumed
+            .unwrap_err()
+            .to_string()
+            .contains("global stop is still in flight")
+    );
+    let (body, sig) = cli("resume", "kiennt23", NOW + 2, OWNER_KEY);
+    d.signed_command(&body, &sig, NOW + 2).unwrap();
+    d.receive(&label(&h.tracker, "after-retry", "FAKE-2", "dev"))
+        .unwrap();
+    d.work_at(NOW + 2000).unwrap();
+    assert_eq!(h.states()[1].1, "running");
+}
+````
+
 - [ ] **Step 2: Run the tests to see them fail**
 
-Run: `cargo test -p kod-dispatcher --test cancel`
+Run: `cargo test -p kod-dispatcher --test cancel --test review_edges`
 Expected: FAIL to compile: no method named `with_cli_key` found for struct `Dispatcher`; no method named `signed_command` found for struct `Arc<Dispatcher>`; cannot find `command` in `kod_dispatcher`.
 
 - [ ] **Step 3: Implement cancel, the commands, the kill switch and resume**
@@ -3319,7 +3649,6 @@ Apply to `crates/kod-dispatcher/src/lib.rs` with `git apply`:
 
 ````diff
 diff --git a/crates/kod-dispatcher/src/lib.rs b/crates/kod-dispatcher/src/lib.rs
-index f5202f8..72240b3 100644
 --- a/crates/kod-dispatcher/src/lib.rs
 +++ b/crates/kod-dispatcher/src/lib.rs
 @@ -21,6 +21,7 @@ use kod_tracker::{Issue, State, TaskEvent, Tracker, Webhook};
@@ -3424,24 +3753,24 @@ index f5202f8..72240b3 100644
              _ => bail!("unknown queued event {v}"),
          })
      }
-@@ -299,6 +342,8 @@ pub struct Dispatcher {
-     tracker: Arc<dyn Tracker>,
+@@ -300,6 +343,8 @@ pub struct Dispatcher {
      gateway: Arc<dyn Gateway>,
      db: Mutex<Connection>,
+     global_stop: Mutex<()>,
 +    /// The signed CLI's keys, by login.
 +    cli_keys: HashMap<String, Vec<u8>>,
  }
  
  impl Dispatcher {
-@@ -320,6 +365,7 @@ impl Dispatcher {
-             tracker,
+@@ -322,6 +367,7 @@ impl Dispatcher {
              gateway,
              db: Mutex::new(store::open(db)?),
+             global_stop: Mutex::new(()),
 +            cli_keys: HashMap::new(),
          };
          d.recover()?;
          Ok(d)
-@@ -370,6 +416,13 @@ impl Dispatcher {
+@@ -377,6 +423,13 @@ impl Dispatcher {
          self.follow_up(now())
      }
  
@@ -3455,7 +3784,7 @@ index f5202f8..72240b3 100644
      /// Checks the webhook and queues its event. Errors are store errors only;
      /// a failed write spends nothing, so the tracker's retry is queued.
      pub fn receive(&self, webhook: &Webhook) -> Result<Received> {
-@@ -461,7 +514,9 @@ impl Dispatcher {
+@@ -468,7 +521,9 @@ impl Dispatcher {
      fn handle(&self, id: &str, event: &str) -> Result<()> {
          match Event::decode(&serde_json::from_str(event)?)? {
              Event::Labeled { issue, by } => self.admit(id, &issue, &by),
@@ -3466,7 +3795,7 @@ index f5202f8..72240b3 100644
          }
      }
  
-@@ -868,6 +923,278 @@ impl Dispatcher {
+@@ -926,6 +981,314 @@ impl Dispatcher {
          store::stopped(&self.db(), run_id)
      }
  
@@ -3610,7 +3939,8 @@ index f5202f8..72240b3 100644
 +            }))
 +            .with_context(|| format!("{by} may not use the kill switch"))?;
 +        }
-+        let ended = (|| -> Result<()> {
++        let stop = self.global_stop.lock().unwrap_or_else(|e| e.into_inner());
++        let ended = (|| -> Result<(i64, Vec<String>)> {
 +            let mut c = self.db();
 +            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
 +            tx.execute(
@@ -3626,6 +3956,7 @@ index f5202f8..72240b3 100644
 +                    Ok((r.get(0)?, r.get(1)?))
 +                })?
 +                .collect::<rusqlite::Result<_>>()?;
++            let runs: Vec<String> = ended.iter().map(|(seq, _)| run_id(*seq)).collect();
 +            for (seq, ticket) in ended {
 +                follow(&tx, "revoke", &run_id(seq), "")?;
 +                follow(&tx, "stop", &run_id(seq), "")?;
@@ -3640,21 +3971,48 @@ index f5202f8..72240b3 100644
 +                    ),
 +                )?;
 +            }
++            let epoch = Self::epoch(&tx)?;
 +            tx.commit()?;
-+            Ok(())
++            Ok((epoch, runs))
 +        })();
++        let mut errors = vec![];
++        let epoch = match &ended {
++            Ok((epoch, _)) => Some(*epoch),
++            Err(_) => match Self::epoch(&self.db()) {
++                Ok(epoch) => Some(epoch),
++                Err(e) => {
++                    errors.push(format!("the kill epoch could not be read: {}", scrub(&e)));
++                    None
++                }
++            },
++        };
++        if let Ok((_, runs)) = &ended {
++            for run in runs {
++                if let Err(e) = self.gateway.revoke(run) {
++                    errors.push(format!(
++                        "the credential revoke for {run} failed: {}",
++                        scrub(&e)
++                    ));
++                }
++            }
++        }
 +        let stopped = self.gateway.stop_all();
 +        if self.config.may_always_stop(by) {
 +            let _ = self
 +                .audit
 +                .append(RUN_AUDIT, &json!({"kind": "kill_switch", "by": by}));
 +        }
-+        if stopped.is_err() {
-+            let c = self.db();
-+            let _ = Self::epoch(&c).and_then(|e| follow(&c, "stop_all", "", &e.to_string()));
++        if stopped.is_err()
++            && let Some(epoch) = epoch
++            && let Err(e) = follow(&self.db(), "stop_all", "", &epoch.to_string())
++        {
++            errors.push(format!(
++                "the global stop retry could not be queued: {}",
++                scrub(&e)
++            ));
 +        }
++        drop(stop);
 +        let _ = self.follow_up(now());
-+        let mut errors = vec![];
 +        if let Err(e) = ended {
 +            errors.push(format!("the store did not take it: {}", scrub(&e)));
 +        }
@@ -3678,6 +4036,13 @@ index f5202f8..72240b3 100644
 +        if !self.config.may_always_stop(by) {
 +            bail!("only the owner or backup may resume");
 +        }
++        let _stop = match self.global_stop.try_lock() {
++            Ok(guard) => guard,
++            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
++            Err(std::sync::TryLockError::WouldBlock) => {
++                bail!("a global stop is still in flight; retry resume after it returns")
++            }
++        };
 +        self.human_may(&json!({
 +            "action": "resume",
 +            "scope": "all",
@@ -3745,7 +4110,7 @@ index f5202f8..72240b3 100644
      pub fn is_halted(&self) -> Result<bool> {
          Self::halted(&self.db())
      }
-@@ -903,9 +1230,12 @@ impl Dispatcher {
+@@ -961,9 +1324,12 @@ impl Dispatcher {
  
  /// The routes: `POST /webhook` answers 202 queued, 200 duplicate or
  /// ignored, 401 refused, 500 when the store fails (the tracker retries).
@@ -3758,7 +4123,7 @@ index f5202f8..72240b3 100644
          .with_state(dispatcher)
  }
  
-@@ -929,3 +1259,20 @@ async fn webhook(
+@@ -987,3 +1353,20 @@ async fn webhook(
          Ok(Err(_)) | Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "error".into()),
      }
  }
@@ -3784,7 +4149,7 @@ index f5202f8..72240b3 100644
 - [ ] **Step 4: Run the tests to see them pass**
 
 Run: `cargo test --all && cargo clippy --all-targets -- -D warnings && cargo fmt --all --check`
-Expected: PASS (kod-dispatcher cancel 24, admission 20, config 3, store 2; everything else unchanged), clean. The tests that lock the audit log or the store take about 2 s each (the busy timeout); the emergency CLI test can wait through three of them before reporting.
+Expected: PASS (kod-dispatcher cancel 24, admission 20, review_edges 5, config 3, store 2; everything else unchanged), clean. The tests that lock the audit log or the store take about 2 s each (the busy timeout); the emergency CLI test can wait through three of them before reporting.
 
 - [ ] **Step 5: Commit**
 
