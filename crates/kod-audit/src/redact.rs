@@ -181,9 +181,17 @@ fn token_at(text: &str, i: usize) -> Option<usize> {
 fn value_end(text: &str, i: usize) -> usize {
     let bytes = text.as_bytes();
     match bytes[i] {
-        q @ (b'"' | b'\'') => text[i + 1..]
-            .find(q as char)
-            .map_or(text.len(), |e| i + e + 2),
+        q @ (b'"' | b'\'') => {
+            let mut j = i + 1;
+            while j < bytes.len() {
+                match bytes[j] {
+                    b'\\' => j += 2,
+                    b if b == q => return j + 1,
+                    _ => j += 1,
+                }
+            }
+            text.len()
+        }
         _ => {
             let stop = |b: u8| b.is_ascii_whitespace() || b"\"'&;,".contains(&b);
             let mut j = i;
