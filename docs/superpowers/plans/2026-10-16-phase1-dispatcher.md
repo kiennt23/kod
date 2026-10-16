@@ -30,7 +30,7 @@ Tests use the 6a fake tracker (wrapped to inject faults) and a fake gateway that
 | D1 | SQLite (rusqlite 0.40, bundled), one database file owned by the dispatcher, `synchronous = FULL`, a 2 s busy timeout. | The same engine and settings as kod-audit. The dispatcher is one process (the design), so a server database buys nothing in phase 1. Postgres is the upgrade if the dispatcher ever runs as more than one process. |
 | D2 | Dedup is the dispatcher's alone. A delivery's key is the SHA-256 of its signed body. `receive` stores a verified delivery with `INSERT OR IGNORE`, and a stored key is a `Duplicate`, even after a restart. The tracker adapter keeps no record of IDs; the delivery ID it reports must come from the signed payload. | A replay can't be dressed up as new with an unsigned header. A failed store write never spends an ID, so the tracker's retry is queued. |
 | D3 | Deliveries are retried per delivery: a failed handling sets `next_at` with exponential backoff (2 s, 4 s, ... 256 s), and after five attempts the delivery is dead (`done = 2`) and the ticket gets a comment saying so. Label removals, edits and commands go first and bypass older admissions, including those for the same ticket. A cancellation retires older pending labels for its ticket in the same transaction; admission rechecks that its delivery is pending before inserting a run. | A delivery that keeps failing can't block every ticket behind it. A cancel must not wait behind a failing admission, and retrying that older label must not restart canceled work. |
-| D4 | A delivery is marked done in the same transaction as the state change it causes. External effects (revoke, stop, stop all, transition, comment) are rows in `followups`, written in that same transaction and run after it: revokes first, then stops, then the tracker, each retried with backoff (2 s doubling, capped at about 4 minutes). A tracker call is a dead letter after five attempts. A revoke or a stop is never given up: at the fifth attempt Kod says once on the ticket and in the audit log (`stop_overdue`) that it has not confirmed the stop and keeps trying. A new ticket transition supersedes older pending transitions for that ticket. | A crash between the work and the mark can't run it twice. A tracker or gateway outage can't undo or block the state change, and the effect is still done once they are back. A sandbox nobody confirmed gone must not be forgotten. A delayed admission transition must not move a canceled ticket back to in progress. |
+| D4 | A delivery is marked done in the same transaction as the state change it causes. External effects (revoke, stop, stop all, transition, comment) are durable follow-ups: revokes first, then stops, then tracker calls, retried with capped backoff. Tracker calls dead-letter after five attempts. Revoke and stop calls retry indefinitely; at attempt five a structured `stop_overdue` event goes to host stderr before the best-effort audit write, plus a comment when a run has a ticket. This alerts even for `stop_all`, which has no ticket, while audit is down. A new ticket transition supersedes older pending transitions. | An unconfirmed sandbox must not be forgotten. The alarm must not depend on the audit log, and delayed tracker updates must not undo a cancellation. |
 | D5 | Admission does the WIP count, the live-run check, the kill-switch check, the `delegate` decision and the run insert in one `IMMEDIATE` transaction. The WIP count is every live run (`queued`, `running`, `publishing`). Bounces are the ticket's runs that ended `blocked`; a failed publish ends `needs_human`, so it isn't counted as one. | The design's atomic admission: two deliveries can't both take the last WIP slot. A publish failure is Kod's, not a bounce of the work. |
 | D6 | The database enforces the run rules: a `CHECK` on the eight state names, a unique index allowing one live run per ticket, a trigger refusing any state move that isn't forward (`queued` 0, `running` 1, `publishing` 2, ended 3), and a trigger refusing a change to a run's ticket or revision. | Forward-only holds even against a bug in the code above it. |
 | D7 | The run's row is the one durable cancel flag. `Dispatcher::stopped(run)` is true unless the run is `queued`, `running` or `publishing`; an unknown run is stopped. 6b passes it to the tool gateway as `Adapters::stopped`, which checks it on every call and inside publish. A cancel commits the row before any external call. | One source of truth that survives a crash and that the gateway reads at the moment it acts. |
@@ -44,6 +44,7 @@ Tests use the 6a fake tracker (wrapped to inject faults) and a fake gateway that
 | D15 | Crash recovery: on open, every run left in `publishing` is resolved with `Gateway::find_published` (the branch's PR, found by `agent/<ticket>-<run>`). It ends `done` if there is a PR and `needs_human` otherwise. Before calling publish, the same transaction that enters `publishing` queues a dormant `check_publish` follow-up. When publish returns, its ending transaction activates the check, carrying the PR URL if known; on open, all pending checks are activated. For a canceled run, the check uses the known URL or `find_published` after a lost response. Lookup errors retry with capped backoff without a dead-letter limit. The warning and check completion commit together, then the audit record is attempted. | A crash must not leave a live run holding WIP or lose the warning for a canceled draft PR. The dormant check cannot run before the in-process publish returns; restart treats that process as gone. |
 | D16 | Ticket moves: admitted → in progress; done → in review; canceled → ready; blocked, needs_human, over_budget → blocked. Every ending is commented with the run ID, the state and the reason. | The 6a adapter's five states. |
 | D17 | A library and a router, no binary. `Config` is `{repo, owner, backup}` JSON with exact keys, logins lower-cased and the backup different from the owner, checked at load. CLI keys are given with `with_cli_key(login, key)`. | 6b wires the process, the real adapters and the key storage. |
+| D18 | If cancellation wins while `Gateway::start` is still registering a token, the post-start check queues revoke again before stop. Cleanup of a never-started run succeeds: every gateway adapter must pass `check_absent_run` with a dedicated unused ID, including repeated revoke and stop. 6b must run this shared contract against its real gateway; the fake and negative adapters exercise it here. | The first cancel can precede token registration. Queued runs may also be canceled before any sandbox exists; their cleanup must finish rather than retry forever. |
 
 How 6b wires the runner and publish: the runner starts the sandbox for `Gateway::start`. When the agent loop exits, the kod-eval collector writes `collect_out/diff.patch` and the check results next to the sandbox, never inside it. The runner then calls `finished(run, outcome, reason)`. For `Done`, `finished` calls `Gateway::publish(run_id)`, which the tool gateway's `publish` implements by reading the change through its `Workspace` adapter from that collector output.
 
@@ -79,6 +80,7 @@ The plan ends with one whole-branch review.
 
 ## Review Focus
 
+- Issue #18: a token registered after cancellation is revoked (`cancellation_during_start_revokes_a_token_registered_after_cancel`, Task 4); a global-stop alarm reaches host stderr with audit writes rejected (`overdue_global_stop_alert_does_not_depend_on_audit`, Task 4); absent-run cleanup passes the shared gateway contract and rejects adapters that error on either operation (`gateway_contract`, Task 3).
 - A blocked global stop must not delay revocation or allow resume to admit work it could stop: `kill_revokes_before_waiting_for_global_stop`, `a_kill_finishing_after_resume_does_not_stop_new_runs`, `resume_cannot_cross_an_inflight_stop_all_retry` (Task 4, `review_edges`).
 - A canceled publication with a lost response must still be reconciled, including after a crash and more than five failed forge lookups: `a_canceled_publish_with_a_lost_response_still_marks_the_pr`, `a_canceled_publish_is_reconciled_after_a_crash_and_a_forge_outage` (Task 4, `review_edges`).
 - A replay must never start a second run: after a restart (`a_duplicate_delivery_never_starts_a_second_run`), or under a new unsigned delivery ID (`a_replay_under_a_new_unsigned_delivery_id_is_a_duplicate`) (Task 3).
@@ -117,6 +119,7 @@ crates/kod-dispatcher/
   tests/store.rs                             create (Task 2)
   tests/common/mod.rs                        create: FakeGateway, the faulty tracker and the harness (Task 3), modify (Task 4)
   tests/admission.rs                         create (Task 3)
+  tests/gateway_contract.rs                  create (Task 3): never-started cleanup contract and negative adapters
   tests/cancel.rs                            create (Task 4)
   tests/review_edges.rs                      create (Task 4): shutdown ordering, concurrent resume and canceled-publish recovery
 ```
@@ -928,7 +931,7 @@ git commit -m "kod-dispatcher: config and a store that keeps runs moving forward
 
 **Files:**
 - Modify: `crates/kod-dispatcher/src/lib.rs` (replace), `src/store.rs`
-- Test: `crates/kod-dispatcher/tests/common/mod.rs`, `tests/admission.rs`
+- Test: `crates/kod-dispatcher/tests/common/mod.rs`, `tests/admission.rs`, `tests/gateway_contract.rs`
 
 **Interfaces:**
 - Consumes: Task 1's events; Task 2's `Config`, `store::{open, LIVE}`; `kod_policy::Policy::{load, decide}` with the policy plan's `delegate` input (`ticket.{repo, risk_class, acceptance_criteria, bounces}`, `wip_in_progress`); `kod_audit::AuditLog::{open, record_decision}`; `kod_tracker::{Tracker, Issue, State, TaskEvent, Webhook}`.
@@ -1736,9 +1739,69 @@ fn concurrent_workers_start_a_queued_run_once() {
 }
 ````
 
+Create `crates/kod-dispatcher/tests/gateway_contract.rs`:
+
+````rust
+mod common;
+
+use common::FakeGateway;
+use kod_dispatcher::{Gateway, RunStart, check_absent_run};
+
+#[test]
+fn the_fake_accepts_revoke_and_stop_for_a_never_started_run() {
+    let gateway = FakeGateway::default();
+    check_absent_run(&gateway, "never-started").unwrap();
+    assert_eq!(gateway.revoked(), ["never-started", "never-started"]);
+    assert_eq!(
+        gateway.calls(),
+        ["stop never-started", "stop never-started"]
+    );
+}
+
+struct RejectsMissing(bool);
+
+impl Gateway for RejectsMissing {
+    fn start(&self, _: &RunStart) -> anyhow::Result<()> {
+        unreachable!()
+    }
+    fn revoke(&self, _: &str) -> anyhow::Result<()> {
+        if self.0 {
+            anyhow::bail!("unknown run");
+        }
+        Ok(())
+    }
+    fn stop(&self, _: &str) -> anyhow::Result<()> {
+        if !self.0 {
+            anyhow::bail!("unknown run");
+        }
+        Ok(())
+    }
+    fn stop_all(&self) -> anyhow::Result<()> {
+        unreachable!()
+    }
+    fn publish(&self, _: &str) -> anyhow::Result<String> {
+        unreachable!()
+    }
+    fn find_published(&self, _: &RunStart) -> anyhow::Result<Option<String>> {
+        unreachable!()
+    }
+}
+
+#[test]
+fn the_contract_refuses_an_adapter_that_errors_on_either_absent_operation() {
+    for rejects_revoke in [true, false] {
+        let result = check_absent_run(&RejectsMissing(rejects_revoke), "never-started");
+        assert!(
+            result.is_err(),
+            "accepted an adapter that rejects an absent run"
+        );
+    }
+}
+````
+
 - [ ] **Step 2: Run the tests to see them fail**
 
-Run: `cargo test -p kod-dispatcher --test admission`
+Run: `cargo test -p kod-dispatcher --test admission --test gateway_contract`
 Expected: FAIL to compile: unresolved imports `kod_dispatcher::Dispatcher`, `kod_dispatcher::Gateway`, `kod_dispatcher::RunStart`.
 
 - [ ] **Step 3: Implement admission, runs and the route**
@@ -1879,9 +1942,9 @@ pub struct RunStart {
 pub trait Gateway: Send + Sync {
     fn start(&self, run: &RunStart) -> Result<()>;
     /// Ends the run's tool-gateway token and revokes its forge credentials
-    /// at once, without waiting for the sandbox.
+    /// at once, without waiting for the sandbox. A never-started run is Ok.
     fn revoke(&self, run_id: &str) -> Result<()>;
-    /// Stops the run's sandbox. Ok only once the sandbox is confirmed gone.
+    /// Stops the run's sandbox. Ok only once confirmed gone; a never-started run is already gone.
     fn stop(&self, run_id: &str) -> Result<()>;
     /// The kill switch: stop every sandbox and revoke every agent identity.
     fn stop_all(&self) -> Result<()>;
@@ -1889,6 +1952,20 @@ pub trait Gateway: Send + Sync {
     fn publish(&self, run_id: &str) -> Result<String>;
     /// After a restart: the draft PR a publish of this run opened, if any.
     fn find_published(&self, run: &RunStart) -> Result<Option<String>>;
+}
+
+/// Adapter contract: the caller supplies a run ID that was never started.
+/// Revoking and stopping that absent run must succeed, including on retry.
+pub fn check_absent_run(gateway: &dyn Gateway, run_id: &str) -> Result<()> {
+    for _ in 0..2 {
+        gateway
+            .revoke(run_id)
+            .context("revoking a never-started run")?;
+        gateway
+            .stop(run_id)
+            .context("stopping a never-started run")?;
+    }
+    Ok(())
 }
 
 /// What `receive` did with a webhook.
@@ -2305,10 +2382,9 @@ impl Dispatcher {
         attempts: i64,
         error: &str,
     ) -> Result<()> {
-        let _ = audit.append(
-            RUN_AUDIT,
-            &json!({"kind": "stop_overdue", "call": kind, "run": target, "error": error}),
-        );
+        let record = json!({"kind": "stop_overdue", "call": kind, "run": target, "attempts": attempts, "error": error});
+        eprintln!("{record}");
+        let _ = audit.append(RUN_AUDIT, &record);
         let ticket: Option<String> = match seq_of(target) {
             Ok(seq) => c
                 .query_row("SELECT ticket FROM runs WHERE seq = ?1", [seq], |r| {
@@ -2485,6 +2561,7 @@ impl Dispatcher {
                 Ok(()) => {
                     if Self::halted(&tx)? || store::stopped(&tx, &run.id)? {
                         // Canceled while starting.
+                        follow(&tx, "revoke", &run.id, "")?;
                         follow(&tx, "stop", &run.id, "")?;
                     }
                 }
@@ -2766,7 +2843,7 @@ index 4166e35..de740e7 100644
 - [ ] **Step 4: Run the tests to see them pass**
 
 Run: `cargo test -p kod-dispatcher && cargo clippy -p kod-dispatcher --all-targets -- -D warnings && cargo fmt --all --check`
-Expected: PASS (admission 20, config 3, store 2), clean. `concurrent_admissions_respect_the_wip_limit` and the restart tests take about 2 s together (the busy timeout).
+Expected: PASS (admission 20, gateway_contract 2, config 3, store 2), clean. `concurrent_admissions_respect_the_wip_limit` and the restart tests take about 2 s together (the busy timeout).
 
 - [ ] **Step 5: Commit**
 
@@ -3585,6 +3662,114 @@ fn resume_cannot_cross_an_inflight_stop_all_retry() {
     d.work_at(NOW + 2000).unwrap();
     assert_eq!(h.states()[1].1, "running");
 }
+
+struct LateStart {
+    inner: Arc<FakeGateway>,
+    cancel: Mutex<Option<Box<dyn Fn() + Send>>>,
+    token_live: AtomicBool,
+}
+
+impl Gateway for LateStart {
+    fn start(&self, run: &RunStart) -> anyhow::Result<()> {
+        self.inner.start(run)?;
+        if let Some(cancel) = self.cancel.lock().unwrap().take() {
+            cancel();
+        }
+        self.token_live.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+    fn revoke(&self, run: &str) -> anyhow::Result<()> {
+        self.inner.revoke(run)?;
+        self.token_live.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+    fn stop(&self, run: &str) -> anyhow::Result<()> {
+        self.inner.stop(run)
+    }
+    fn stop_all(&self) -> anyhow::Result<()> {
+        self.inner.stop_all()
+    }
+    fn publish(&self, run: &str) -> anyhow::Result<String> {
+        self.inner.publish(run)
+    }
+    fn find_published(&self, run: &RunStart) -> anyhow::Result<Option<String>> {
+        self.inner.find_published(run)
+    }
+}
+
+#[test]
+fn cancellation_during_start_revokes_a_token_registered_after_cancel() {
+    let h = harness();
+    h.queued("FAKE-1");
+    let gateway = Arc::new(LateStart {
+        inner: h.gw.clone(),
+        cancel: Mutex::new(None),
+        token_live: AtomicBool::new(false),
+    });
+    let d = with_gateway(&h, gateway.clone());
+    let canceled = Arc::downgrade(&d);
+    let tracker = h.tracker.clone();
+    *gateway.cancel.lock().unwrap() = Some(Box::new(move || {
+        let d = canceled.upgrade().unwrap();
+        d.receive(&unlabel(&tracker, "cancel-start", "FAKE-1", "dev"))
+            .unwrap();
+        d.work_at(NOW).unwrap();
+    }));
+    d.work_at(NOW).unwrap();
+    assert_eq!(h.states()[0].1, "canceled");
+    assert!(
+        !gateway.token_live.load(Ordering::SeqCst),
+        "the start registered a live token after the first revoke"
+    );
+}
+
+#[test]
+fn overdue_global_stop_alert_does_not_depend_on_audit() {
+    const CHILD: &str = "KOD_TEST_STOP_ALARM_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let h = harness();
+        h.running();
+        rusqlite::Connection::open(&h.audit)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER refuse_alarm_audit BEFORE INSERT ON audit
+             BEGIN SELECT RAISE(ABORT, 'audit unavailable'); END;",
+            )
+            .unwrap();
+        h.gw.fail_stop_all.store(true, Ordering::SeqCst);
+        h.say("alarm-kill", "kiennt23", "/kod kill");
+        for attempt in 1..=8 {
+            h.d.work_at(NOW + attempt * 1000).unwrap();
+        }
+        return;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "overdue_global_stop_alert_does_not_depend_on_audit",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let alerts: Vec<serde_json::Value> = String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    assert_eq!(
+        alerts
+            .iter()
+            .filter(|e| e["kind"] == "stop_overdue" && e["call"] == "stop_all")
+            .count(),
+        1,
+        "{alerts:?}"
+    );
+}
 ````
 
 - [ ] **Step 2: Run the tests to see them fail**
@@ -3667,7 +3852,7 @@ diff --git a/crates/kod-dispatcher/src/lib.rs b/crates/kod-dispatcher/src/lib.rs
  pub mod config;
  pub mod store;
  
-@@ -187,9 +189,32 @@ pub fn revision(i: &Issue) -> String {
+@@ -201,9 +203,32 @@ pub fn revision(i: &Issue) -> String {
  /// A queued event, as the store keeps it.
  #[derive(Clone, Debug, PartialEq)]
  enum Event {
@@ -3703,7 +3888,7 @@ diff --git a/crates/kod-dispatcher/src/lib.rs b/crates/kod-dispatcher/src/lib.rs
  }
  
  impl Event {
-@@ -206,8 +231,17 @@ impl Event {
+@@ -220,8 +245,17 @@ impl Event {
              TaskEvent::Edited { issue } => Event::Edited {
                  issue: issue.clone(),
              },
@@ -3723,7 +3908,7 @@ diff --git a/crates/kod-dispatcher/src/lib.rs b/crates/kod-dispatcher/src/lib.rs
          })
      }
  
-@@ -215,6 +249,7 @@ impl Event {
+@@ -229,6 +263,7 @@ impl Event {
          match self {
              Event::Labeled { issue, .. } | Event::Unlabeled { issue, .. } => issue,
              Event::Edited { issue } => issue,
@@ -3731,7 +3916,7 @@ diff --git a/crates/kod-dispatcher/src/lib.rs b/crates/kod-dispatcher/src/lib.rs
          }
      }
  
-@@ -232,6 +267,9 @@ impl Event {
+@@ -246,6 +281,9 @@ impl Event {
              Event::Unlabeled { issue, by } => {
                  json!({"type": "unlabeled", "issue": issue, "by": by})
              }
@@ -3741,7 +3926,7 @@ diff --git a/crates/kod-dispatcher/src/lib.rs b/crates/kod-dispatcher/src/lib.rs
              Event::Edited { issue } => json!({"type": "edited", "issue": issue}),
          }
      }
-@@ -254,6 +292,11 @@ impl Event {
+@@ -268,6 +306,11 @@ impl Event {
              Some("edited") => Event::Edited {
                  issue: text("issue")?,
              },
@@ -3753,7 +3938,7 @@ diff --git a/crates/kod-dispatcher/src/lib.rs b/crates/kod-dispatcher/src/lib.rs
              _ => bail!("unknown queued event {v}"),
          })
      }
-@@ -300,6 +343,8 @@ pub struct Dispatcher {
+@@ -314,6 +357,8 @@ pub struct Dispatcher {
      gateway: Arc<dyn Gateway>,
      db: Mutex<Connection>,
      global_stop: Mutex<()>,
@@ -3762,7 +3947,7 @@ diff --git a/crates/kod-dispatcher/src/lib.rs b/crates/kod-dispatcher/src/lib.rs
  }
  
  impl Dispatcher {
-@@ -322,6 +367,7 @@ impl Dispatcher {
+@@ -336,6 +381,7 @@ impl Dispatcher {
              gateway,
              db: Mutex::new(store::open(db)?),
              global_stop: Mutex::new(()),
@@ -3770,7 +3955,7 @@ diff --git a/crates/kod-dispatcher/src/lib.rs b/crates/kod-dispatcher/src/lib.rs
          };
          d.recover()?;
          Ok(d)
-@@ -377,6 +423,13 @@ impl Dispatcher {
+@@ -391,6 +437,13 @@ impl Dispatcher {
          self.follow_up(now())
      }
  
@@ -3784,7 +3969,7 @@ diff --git a/crates/kod-dispatcher/src/lib.rs b/crates/kod-dispatcher/src/lib.rs
      /// Checks the webhook and queues its event. Errors are store errors only;
      /// a failed write spends nothing, so the tracker's retry is queued.
      pub fn receive(&self, webhook: &Webhook) -> Result<Received> {
-@@ -468,7 +521,9 @@ impl Dispatcher {
+@@ -482,7 +535,9 @@ impl Dispatcher {
      fn handle(&self, id: &str, event: &str) -> Result<()> {
          match Event::decode(&serde_json::from_str(event)?)? {
              Event::Labeled { issue, by } => self.admit(id, &issue, &by),
@@ -3795,7 +3980,7 @@ diff --git a/crates/kod-dispatcher/src/lib.rs b/crates/kod-dispatcher/src/lib.rs
          }
      }
  
-@@ -926,6 +981,314 @@ impl Dispatcher {
+@@ -940,6 +995,314 @@ impl Dispatcher {
          store::stopped(&self.db(), run_id)
      }
  
@@ -4110,7 +4295,7 @@ diff --git a/crates/kod-dispatcher/src/lib.rs b/crates/kod-dispatcher/src/lib.rs
      pub fn is_halted(&self) -> Result<bool> {
          Self::halted(&self.db())
      }
-@@ -961,9 +1324,12 @@ impl Dispatcher {
+@@ -975,9 +1338,12 @@ impl Dispatcher {
  
  /// The routes: `POST /webhook` answers 202 queued, 200 duplicate or
  /// ignored, 401 refused, 500 when the store fails (the tracker retries).
@@ -4123,7 +4308,7 @@ diff --git a/crates/kod-dispatcher/src/lib.rs b/crates/kod-dispatcher/src/lib.rs
          .with_state(dispatcher)
  }
  
-@@ -987,3 +1353,20 @@ async fn webhook(
+@@ -1001,3 +1367,20 @@ async fn webhook(
          Ok(Err(_)) | Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "error".into()),
      }
  }
@@ -4149,7 +4334,7 @@ diff --git a/crates/kod-dispatcher/src/lib.rs b/crates/kod-dispatcher/src/lib.rs
 - [ ] **Step 4: Run the tests to see them pass**
 
 Run: `cargo test --all && cargo clippy --all-targets -- -D warnings && cargo fmt --all --check`
-Expected: PASS (kod-dispatcher cancel 24, admission 20, review_edges 5, config 3, store 2; everything else unchanged), clean. The tests that lock the audit log or the store take about 2 s each (the busy timeout); the emergency CLI test can wait through three of them before reporting.
+Expected: PASS (kod-dispatcher cancel 24, admission 20, review_edges 7, gateway_contract 2, config 3, store 2; everything else unchanged), clean. The tests that lock the audit log or the store take about 2 s each (the busy timeout); the emergency CLI test can wait through three of them before reporting.
 
 - [ ] **Step 5: Commit**
 
@@ -4200,5 +4385,5 @@ One fresh reviewer on the most capable model reads the whole branch against the 
 - **Re-running after an edit** (owner): an edit stops the run and returns the ticket to ready; a new label starts the next run (D10). Say if an edit should restart it automatically.
 - **Bounces** (owner): counted as the ticket's runs that ended `blocked` until rework (sub-plan 7) counts rework requests. A failed publish ends `needs_human` and is not counted.
 - **Rework requests across runs** (6b, sub-plan 7): `RunStart` carries no linked-ticket snapshot yet. The tool gateway's `Run::linked_tickets` starts empty in phase 1, and a run reaches only the rework requests it creates itself. Sub-plan 7 records the requests Kod creates so the next run's snapshot can include them.
-- **The stop alarm** (owner, 6b): the alarm after five failed stop attempts is a ticket comment and a `stop_overdue` audit record. 6b may page as well.
+- **The stop alarm** (owner, 6b): the alarm already emits structured JSON to host stderr independently of audit and tracker availability. The 6b service must preserve stderr in its host logs; routing that event to a pager is an operational choice.
 - **Runs left `running` by a crash** (6b): the dispatcher resolves `publishing` runs on open; `running` runs need the sandbox state 6b owns.

@@ -69,6 +69,7 @@ The plan ends with one whole-branch review.
 - Idempotency must be a property of the forge contract: `the_fake_forge_meets_the_contract`, `the_contract_catches_a_forge_that_dates_commits_by_the_clock`, `a_retry_after_a_lost_pr_response_finds_the_pr` (Task 2).
 - A document outside the model token's admitted classes must not be returned: `a_doc_outside_the_runs_admitted_classes_is_not_returned` (Task 1). A run admitted for restricted documents must not publish to an uncleared repo: `a_run_admitted_for_restricted_docs_cannot_publish_to_an_uncleared_repo` (Task 2).
 - Canceling and revoking the push token together must still delete the branch: `cancel_revocation_does_not_prevent_branch_cleanup` (Task 2). Cleanup mints a fresh credential inside publish and the final revoke covers it too.
+- Cleanup of a run that never started succeeds on retry without touching another run's token or credential: `ending_a_never_started_run_succeeds_without_revoking_another_run` (Task 2). The real 6b dispatcher adapter must also pass its shared `check_absent_run` contract for revoke and sandbox stop.
 - The agent must not move its ticket to review or done, or move another ticket: `the_agent_moves_only_its_own_ticket_between_in_progress_and_blocked` (Task 1).
 
 ## File Structure
@@ -1386,6 +1387,18 @@ fn ending_runs_revokes_their_credentials() {
 }
 
 #[test]
+fn ending_a_never_started_run_succeeds_without_revoking_another_run() {
+    let h = harness();
+    let token = h.github.mint("run-1", "acme/app").unwrap();
+    h.gw.end_run("never-started").unwrap();
+    h.gw.end_run("never-started").unwrap();
+    assert!(h.gw.run(TOKEN).is_some());
+    h.github
+        .set_branch(&token, "acme/app", "unaffected", BASE)
+        .unwrap();
+}
+
+#[test]
 fn credentials_never_reach_the_reply_or_the_audit_log() {
     let h = harness();
     let leak = "ghs_0123456789abcdef0123456789abcdef";
@@ -2265,7 +2278,7 @@ index 2d27bd8..397fbad 100644
 - [ ] **Step 4: Run the tests to see them pass**
 
 Run: `cargo test -p kod-tool-gateway && cargo clippy -p kod-tool-gateway --all-targets -- -D warnings && cargo fmt --all --check`
-Expected: PASS (publish 17, tools 13), clean.
+Expected: PASS (publish 18, tools 13), clean.
 
 - [ ] **Step 5: Commit**
 
@@ -2638,7 +2651,7 @@ index 397fbad..f420208 100644
 - [ ] **Step 4: Run the tests to see them pass**
 
 Run: `cargo test -p kod-tool-gateway && cargo clippy -p kod-tool-gateway --all-targets -- -D warnings && cargo fmt --all --check`
-Expected: PASS (mcp 4, publish 17, tools 13), clean.
+Expected: PASS (mcp 4, publish 18, tools 13), clean.
 
 - [ ] **Step 5: Commit**
 
@@ -3140,7 +3153,7 @@ index b5fd2f2..a1fa4ff 100644
 - [ ] **Step 4: Run the tests to see them pass**
 
 Run: `cargo test --all && cargo clippy --all-targets -- -D warnings && cargo fmt --all --check`
-Expected: PASS (kod-loop mcp 4 and its existing tests unchanged; kod-tool-gateway 34), clean.
+Expected: PASS (kod-loop mcp 4 and its existing tests unchanged; kod-tool-gateway 35), clean.
 
 - [ ] **Step 5: Commit**
 
