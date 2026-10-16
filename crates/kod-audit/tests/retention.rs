@@ -254,3 +254,54 @@ fn a_forged_well_formed_retention_record_fails_automatically() {
         assert!(err.to_string().contains(want), "{err:#}");
     }
 }
+
+/// With ~100k rows, one purge batch must not hold the write lock anywhere
+/// near the 2 s busy timeout. Without the record_type index every trigger
+/// check scanned the table: ~2.5 s per batch at 100k rows in release, more in
+/// debug. With it, well under 0.5 s even in debug.
+#[test]
+fn a_purge_batch_stays_fast_on_a_large_log() {
+    let f = fixture();
+    let c = Connection::open(f.db()).unwrap();
+    c.execute_batch(&format!(
+        "BEGIN;
+         WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 100000)
+         INSERT INTO audit
+         SELECT i, 1000, CASE WHEN i <= {PURGE_BATCH} THEN 'run_audit' ELSE 'prompts' END,
+                '{{}}', '{z}', '{z}' FROM n;
+         COMMIT;",
+        z = "0".repeat(64)
+    ))
+    .unwrap();
+    let dir =
+        policy_with_compliance(json!({"profiles": {"a": {"retention_days": {"run_audit": 0}}}}));
+    let policy = Policy::load(dir.path()).unwrap();
+    let t = std::time::Instant::now();
+    assert_eq!(
+        f.log.purge(&policy, RUN_AUDIT, now().unwrap()).unwrap(),
+        PURGE_BATCH
+    );
+    let took = t.elapsed();
+    assert!(took.as_secs_f64() < 1.0, "purge batch took {took:?}");
+}
+
+#[test]
+fn only_the_newest_retention_record_authorises_clearing_a_payload() {
+    let f = fixture();
+    f.log.append(RUN_AUDIT, &json!({"n": 1})).unwrap();
+    let cover = |seqs: &[i64]| json!({"record_type": RUN_AUDIT, "seqs": seqs}).to_string();
+    append_raw(&f.db(), now().unwrap(), RETENTION, &cover(&[1]));
+    let c = Connection::open(f.db()).unwrap();
+    // Newest retention record (seq 2) covers seq 1: allowed.
+    c.execute("UPDATE audit SET payload = NULL WHERE seq = 1", [])
+        .unwrap();
+    f.log.append(RUN_AUDIT, &json!({"n": 3})).unwrap();
+    append_raw(&f.db(), now().unwrap(), RETENTION, &cover(&[]));
+    // Seq 3 is listed by no retention record; seq 1 only by an older one.
+    for seq in [1, 3] {
+        let err = c
+            .execute("UPDATE audit SET payload = NULL WHERE seq = ?1", [seq])
+            .unwrap_err();
+        assert!(err.to_string().contains("append-only"), "{err}");
+    }
+}

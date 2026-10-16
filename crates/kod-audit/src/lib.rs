@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS audit (
     payload_sha256 TEXT NOT NULL,
     hash TEXT NOT NULL
 ) STRICT;
+CREATE INDEX IF NOT EXISTS audit_record_type ON audit(record_type);
 CREATE TRIGGER IF NOT EXISTS audit_append_only BEFORE INSERT ON audit
 WHEN NEW.seq IS NOT (SELECT COALESCE(MAX(seq), 0) + 1 FROM audit)
 BEGIN SELECT RAISE(ABORT, 'audit log is append-only'); END;
@@ -59,7 +60,8 @@ WHEN NEW.payload IS NOT NULL OR NEW.seq IS NOT OLD.seq OR NEW.at IS NOT OLD.at
   OR NEW.payload_sha256 IS NOT OLD.payload_sha256 OR NEW.hash IS NOT OLD.hash
   OR NOT EXISTS (
     SELECT 1 FROM audit AS r, json_each(r.payload, '$.seqs') AS s
-    WHERE r.record_type = 'retention' AND r.seq > OLD.seq
+    WHERE r.seq = (SELECT MAX(seq) FROM audit WHERE record_type = 'retention')
+      AND r.seq > OLD.seq
       AND json_extract(r.payload, '$.record_type') = OLD.record_type
       AND s.value = OLD.seq)
 BEGIN SELECT RAISE(ABORT, 'audit log is append-only'); END;
