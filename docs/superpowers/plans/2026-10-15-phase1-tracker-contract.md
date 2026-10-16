@@ -6,7 +6,7 @@
 
 **Architecture:** The core sees only standard states (`ready`, `in_progress`, `in_review`, `blocked`, `done`) and standard fields. Everything tracker-specific (workflow state names, custom field ids, the trigger label, the team group) lives in one mapping file per tracker, which `Mapping::parse` checks completely before anything uses it. `contract::check(&dyn Tracker, &Sandbox)` is a plain function that panics on the first broken rule, so any adapter's own test calls it with its sandbox project and recorded webhooks. The fake stores issues the way a real tracker does (workflow states and custom fields) and reads them through a `Mapping`, so it exercises the mapping too.
 
-**Tech Stack:** Rust 1.99.0 (edition 2024), anyhow, serde_json, sha2 0.10 (the fake's webhook signature). Tests: std, tempfile.
+**Tech Stack:** Rust 1.99.0 (edition 2024), anyhow, serde_json, sha2 0.10 and subtle 2.6 (the fake's HMAC-SHA256 webhook signature and its constant-time compare; both already in `Cargo.lock`, `hmac` is not). Tests: std, tempfile.
 
 **Spec:** `docs/kod-harness-design.md` (the tracker adapter section: the operations, `create_linked`, the registry mapping, contract tests), row 6a of `docs/superpowers/plans/2026-10-14-phase1-overview.md`, `docs/adr/0001-per-task-execution-mode.md`.
 
@@ -14,11 +14,12 @@
 
 - **D1. The trait is blocking.** `Tracker: Send + Sync` with plain `fn`s returning `anyhow::Result`. Real adapters make a few HTTP calls per task; async callers use `tokio::task::spawn_blocking`. This keeps the crate free of an async runtime and lets the contract be a plain function.
 - **D2. The operations** are the design's: `get_issue`, `comment`, `transition`, `link_pr`, `create_linked`, `is_team_member`, `parse_webhook`, plus `name` (the tracker name audit records store next to the story key). The story key is the tracker's own key, as a `String`.
-- **D3. `parse_webhook` separates "not for us" from "not genuine".** A missing or wrong signature, or a signed body that is malformed, is `Err`. A genuine request that is not a task event is `Ok(None)`. A tampered request never turns into a quiet `None`.
+- **D3. `parse_webhook` separates "not for us" from "not genuine", and accepts each delivery once.** A missing or wrong signature, or a signed body that is malformed, is `Err`. A genuine request that is not a task event is `Ok(None)`. A tampered request never turns into a quiet `None`. A genuine request returns a `Delivery { id, event }`; a signed request with no delivery ID is `Err`, and a delivery ID seen before is `Err` (a replay). An ID is spent only by a request whose signature checked out, so a forged request can't burn a real one. Trackers also sign a timestamp; refusing stale deliveries by it is tracker-specific and a 6c contract item.
 - **D4. The mapping format is JSON.** The design says registry files are YAML, Markdown or Rego; JSON is valid YAML, matches `policy/*.json`, and needs no new dependency. Shape: `{"tracker", "states": {<standard>: [workflow names]}, "fields": {"requirement_id", "risk_class"}, "trigger_label", "team_group"}`. All five standard states are required, each with at least one workflow name; the first is where `transition` moves an issue. A workflow name mapped to two states, an unknown or missing key, an empty or padded name, or the two fields naming the same custom field is an error at load. Reading an issue in a workflow state the mapping does not list is an error, never a guess.
 - **D5. `create_linked(story, kind, &Rework)`** opens the rework request in a `ready`-mapped state, linked to the story, with the stage, the target artifact and its approved version, the kind (question, amendment, re-plan), the text and the evidence. It returns the new key.
 - **D6. Membership is a yes/no from the tracker.** `is_team_member(user)` answers for the mapping's team group; the core alone decides what a member's comment may do.
-- **D7. No real tracker, no registry file.** The fake's mapping is a const in the crate. Where real mappings live in the registry is decided with 6b and 6c.
+- **D7. The fake signs like a real tracker.** HMAC-SHA256 of the body with a shared secret, hex in `x-fake-signature`, compared in constant time (`subtle`). `fake::hmac_sha256` is written over `sha2` (RFC 2104) and tested against RFC 4231, because `hmac` is not in `Cargo.lock`.
+- **D8. No real tracker, no registry file.** The fake's mapping is a const in the crate. Where real mappings live in the registry is decided with 6b and 6c.
 
 ## Execution
 
@@ -43,8 +44,8 @@ The plan ends with one whole-branch review.
 ## Review Focus
 
 - An issue sitting in a workflow state the mapping does not list (someone added "Won't Do") must be an error, not mapped to a guess: `an_unmapped_workflow_state_is_an_error` (Task 2).
-- A webhook with a changed body or no signature must be an error, and an adapter that swallows it must fail the contract: the tampered and unsigned checks in `contract::check` and `the_contract_fails_an_adapter_with_any_one_flaw` (Task 2).
-- One workflow state listed under two standard states must stop the mapping from loading: the "mapped twice" case in `refuses_a_mapping_with_any_fault` (Task 1).
+- A webhook with a changed (still valid JSON) body, a signature one digit off, or no signature must be an error, and an adapter that only checks the header is present must fail the contract: the `tampered`, `wrong_signature` and unsigned checks in `contract::check` and the `ChecksPresenceOnly` flaw in `the_contract_fails_an_adapter_with_any_one_flaw` (Task 2).
+- A recorded webhook sent again must be an error, not a second task: the replay checks in `contract::check`, the `AcceptsReplays` flaw and `delivery_ids_are_spent_only_by_signed_requests` (Task 2).
 - An issue without the requirement or risk custom field must read as `None`, not as an empty string: `missing_custom_fields_read_as_none` (Task 2).
 - A correctly signed but malformed webhook (missing user, wrong type) must be an error, not `None`: `a_signed_webhook_that_is_malformed_is_an_error` (Task 2).
 
@@ -54,7 +55,7 @@ The plan ends with one whole-branch review.
 Cargo.toml                       modify: add crates/kod-tracker to members
 crates/kod-tracker/
   Cargo.toml                     create
-  src/lib.rs                     create: State, Issue, Rework, TaskEvent, Webhook, the Tracker trait
+  src/lib.rs                     create: State, Issue, Rework, TaskEvent, Delivery, Webhook, the Tracker trait
   src/mapping.rs                 create: the registry mapping, validated at load
   src/contract.rs                create: Sandbox and check
   src/fake.rs                    create: FakeTracker, FAKE_MAPPING, sandbox()
@@ -78,10 +79,10 @@ This plan's own PR links it from row 6a of the overview.
 - Consumes: nothing.
 - Produces:
   - `State { Ready, InProgress, InReview, Blocked, Done }` with `State::ALL` and `name() -> &'static str`.
-  - `Issue { key, title, body: String, acceptance_criteria: Vec<String>, requirement_id, risk_class: Option<String>, reporter: String, approved_versions: Vec<String>, state: State }`.
+  - `Issue { key, title, body: String, acceptance_criteria: Vec<String>, requirement_id, risk_class: Option<String>, reporter: String, approved_versions: Vec<String>, links: Vec<String>, state: State }`.
   - `ReworkKind { Question, Amendment, Replan }`, `Rework { stage, artifact, version, text: String, evidence: Vec<String> }`.
-  - `TaskEvent::{Labeled { issue, by }, Commented { issue, author, body }}`, `Webhook { headers: Vec<(String, String)>, body: Vec<u8> }` with `header(name) -> Option<&str>` (case-insensitive).
-  - `trait Tracker` (D2).
+  - `TaskEvent::{Labeled { issue, by }, Commented { issue, author, body }}`, `Delivery { id: String, event: TaskEvent }`, `Webhook { headers: Vec<(String, String)>, body: Vec<u8> }` with `header(name) -> Option<&str>` (case-insensitive).
+  - `trait Tracker` (D2), with `parse_webhook(&self, &Webhook) -> Result<Option<Delivery>>` (D3).
   - `mapping::Mapping { pub tracker, pub requirement_id_field, pub risk_class_field, pub trigger_label, pub team_group }` with `Mapping::load(&Path)`, `Mapping::parse(at: &str, text: &str)`, `standard(workflow: &str) -> Option<State>`, `target(State) -> &str`.
 
 In the root `Cargo.toml`, add `"crates/kod-tracker"` to `members`, keeping the list sorted.
@@ -312,6 +313,8 @@ pub struct Issue {
     pub reporter: String,
     /// Links to the approved artifact versions the issue pins.
     pub approved_versions: Vec<String>,
+    /// Keys of the issues linked to this one, e.g. its rework requests.
+    pub links: Vec<String>,
     pub state: State,
 }
 
@@ -352,6 +355,15 @@ pub enum TaskEvent {
     },
 }
 
+/// A verified task event and the tracker's ID for its delivery. The
+/// dispatcher keeps the IDs it has acted on, so a redelivery is not a second
+/// instruction.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Delivery {
+    pub id: String,
+    pub event: TaskEvent,
+}
+
 /// A webhook request as received: headers and the raw body.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Webhook {
@@ -384,9 +396,11 @@ pub trait Tracker: Send + Sync {
     fn create_linked(&self, story: &str, kind: ReworkKind, fields: &Rework) -> Result<String>;
     fn is_team_member(&self, user: &str) -> Result<bool>;
     /// Checks the signature first: a bad or missing one is an error. A
-    /// signed request that is not a task event (another label, another
-    /// event type) is `Ok(None)`.
-    fn parse_webhook(&self, request: &Webhook) -> Result<Option<TaskEvent>>;
+    /// signed request with no delivery ID, or with the ID of a delivery this
+    /// adapter already accepted, is an error too (a replay). A signed request
+    /// that is not a task event (another label, another event type) is
+    /// `Ok(None)`.
+    fn parse_webhook(&self, request: &Webhook) -> Result<Option<Delivery>>;
 }
 ````
 
@@ -524,17 +538,17 @@ git commit -m "kod-tracker: adapter trait and the registry mapping format"
 ### Task 2: The contract and the fake
 
 **Files:**
-- Modify: `crates/kod-tracker/src/lib.rs` (two `pub mod` lines)
+- Modify: `crates/kod-tracker/src/lib.rs` (two `pub mod` lines), `crates/kod-tracker/Cargo.toml` (`subtle`)
 - Create: `crates/kod-tracker/src/contract.rs`, `crates/kod-tracker/src/fake.rs`
 - Test: `crates/kod-tracker/tests/contract.rs`, `crates/kod-tracker/tests/fake.rs`
 
 **Interfaces:**
 - Consumes: Task 1's types, `Tracker` and `Mapping`.
 - Produces:
-  - `contract::Sandbox { issue: Issue, missing, member, outsider: String, trigger: Webhook, trigger_event: TaskEvent, comment: Webhook, comment_event: TaskEvent, ignored: Webhook }` and `contract::check(t: &dyn Tracker, s: &Sandbox)`. 6c builds a `Sandbox` from its sandbox project and recorded webhooks and calls `check`.
-  - `fake::FAKE_MAPPING`, `fake::SIGNATURE`, `fake::FakeIssue`, `fake::FakeTracker::{new, add_issue, add_member, issue, comments, prs, webhook}`, and `fake::sandbox() -> (FakeTracker, Sandbox)` for other sub-plans' tests.
+  - `contract::Sandbox { issue: Issue, missing, member, outsider: String, transitions: Vec<State>, trigger: Webhook, trigger_event: Delivery, comment: Webhook, comment_event: Delivery, ignored: Webhook, tampered, wrong_signature, unidentified: Webhook }` and `contract::check(t: &dyn Tracker, s: &Sandbox)`. `transitions` is a walk that must visit all five states; `tampered` is a valid-JSON body changed under the original signature, `wrong_signature` the original body with one signature digit changed, `unidentified` a signed request with no delivery ID. 6c builds a `Sandbox` from its sandbox project and recorded webhooks and calls `check`.
+  - `fake::FAKE_MAPPING`, `fake::SIGNATURE`, `fake::hmac_sha256(key, data) -> [u8; 32]`, `fake::FakeIssue`, `fake::FakeTracker::{new, add_issue, add_member, issue, comments, prs, sign, webhook}`, and `fake::sandbox() -> (FakeTracker, Sandbox)` for other sub-plans' tests.
 
-The contract test also runs `check` against the fake with one flaw at a time (accepts any signature, everyone is a member, transition does nothing, a missing issue is fine, the requirement ID is dropped) and expects each to fail, so a weakened contract shows up as a failing test.
+The contract test also runs `check` against the fake with one flaw at a time (accepts any signature, checks only that a signature is present, accepts replays, everyone is a member, transition does nothing, a missing issue is fine, the requirement ID is dropped, links are dropped) and expects each to fail, so a weakened contract shows up as a failing test.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -543,11 +557,15 @@ Create `crates/kod-tracker/tests/contract.rs`:
 ````rust
 use anyhow::Result;
 use kod_tracker::{
-    Issue, Rework, ReworkKind, State, TaskEvent, Tracker, Webhook,
+    Delivery, Issue, Rework, ReworkKind, State, Tracker, Webhook,
     contract::check,
-    fake::{FakeTracker, sandbox},
+    fake::{FakeTracker, SIGNATURE, sandbox},
 };
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::{
+    collections::HashMap,
+    panic::{AssertUnwindSafe, catch_unwind},
+    sync::Mutex,
+};
 
 #[test]
 fn the_fake_passes_the_contract() {
@@ -566,14 +584,20 @@ fn the_fake_passes_the_contract() {
 #[derive(Clone, Copy, Debug)]
 enum Flaw {
     IgnoresSignatures,
+    /// Accepts any request that has a signature header, whatever its value.
+    ChecksPresenceOnly,
+    /// Keeps no delivery IDs, so a recorded webhook can be sent again.
+    AcceptsReplays,
     EveryoneIsAMember,
     TransitionDoesNothing,
     MissingIssueIsOk,
     DropsRequirementId,
+    DropsLinks,
 }
 
-/// The fake with one flaw, to show the contract catches it.
-struct Broken(FakeTracker, Flaw);
+/// The fake with one flaw, to show the contract catches it. `seen` holds
+/// what AcceptsReplays answered, by body.
+struct Broken(FakeTracker, Flaw, Mutex<HashMap<Vec<u8>, Option<Delivery>>>);
 
 impl Tracker for Broken {
     fn name(&self) -> &str {
@@ -581,8 +605,10 @@ impl Tracker for Broken {
     }
     fn get_issue(&self, key: &str) -> Result<Issue> {
         let mut i = self.0.get_issue(key)?;
-        if matches!(self.1, Flaw::DropsRequirementId) {
-            i.requirement_id = None;
+        match self.1 {
+            Flaw::DropsRequirementId => i.requirement_id = None,
+            Flaw::DropsLinks => i.links.clear(),
+            _ => {}
         }
         Ok(i)
     }
@@ -610,11 +636,28 @@ impl Tracker for Broken {
             _ => self.0.is_team_member(user),
         }
     }
-    fn parse_webhook(&self, request: &Webhook) -> Result<Option<TaskEvent>> {
-        match (self.1, self.0.parse_webhook(request)) {
-            (Flaw::IgnoresSignatures, Err(_)) => Ok(None),
-            (_, r) => r,
+    fn parse_webhook(&self, request: &Webhook) -> Result<Option<Delivery>> {
+        let mut request = request.clone();
+        match self.1 {
+            // As if the check were skipped: every request is signed afresh.
+            Flaw::IgnoresSignatures => {
+                request.headers = vec![(SIGNATURE.into(), self.0.sign(&request.body))];
+            }
+            Flaw::ChecksPresenceOnly if request.header(SIGNATURE).is_some() => {
+                request.headers = vec![(SIGNATURE.into(), self.0.sign(&request.body))];
+            }
+            Flaw::AcceptsReplays => {
+                let mut seen = self.2.lock().unwrap();
+                if let Some(d) = seen.get(&request.body) {
+                    return Ok(d.clone());
+                }
+                let d = self.0.parse_webhook(&request)?;
+                seen.insert(request.body.clone(), d.clone());
+                return Ok(d);
+            }
+            _ => {}
         }
+        self.0.parse_webhook(&request)
     }
 }
 
@@ -622,13 +665,16 @@ impl Tracker for Broken {
 fn the_contract_fails_an_adapter_with_any_one_flaw() {
     for flaw in [
         Flaw::IgnoresSignatures,
+        Flaw::ChecksPresenceOnly,
+        Flaw::AcceptsReplays,
         Flaw::EveryoneIsAMember,
         Flaw::TransitionDoesNothing,
         Flaw::MissingIssueIsOk,
         Flaw::DropsRequirementId,
+        Flaw::DropsLinks,
     ] {
         let (t, s) = sandbox();
-        let broken = Broken(t, flaw);
+        let broken = Broken(t, flaw, Mutex::default());
         let r = catch_unwind(AssertUnwindSafe(|| check(&broken, &s)));
         assert!(
             r.is_err(),
@@ -636,14 +682,22 @@ fn the_contract_fails_an_adapter_with_any_one_flaw() {
         );
     }
 }
+
+#[test]
+fn the_contract_refuses_a_walk_that_misses_a_state() {
+    let (t, mut s) = sandbox();
+    s.transitions.retain(|st| *st != State::Blocked);
+    let r = catch_unwind(AssertUnwindSafe(|| check(&t, &s)));
+    assert!(r.is_err(), "a walk without blocked passed");
+}
 ````
 
 Create `crates/kod-tracker/tests/fake.rs`:
 
 ````rust
 use kod_tracker::{
-    State, TaskEvent, Tracker,
-    fake::{FakeIssue, sandbox},
+    Delivery, State, TaskEvent, Tracker,
+    fake::{FakeIssue, hmac_sha256, sandbox},
 };
 use serde_json::json;
 
@@ -688,23 +742,60 @@ fn missing_custom_fields_read_as_none() {
 fn a_signed_webhook_that_is_malformed_is_an_error() {
     let (t, _) = sandbox();
     for body in [
-        json!({"type": "comment", "issue": "FAKE-1", "user": "dev"}),
-        json!({"type": "label_added", "issue": "FAKE-1", "label": "kod"}),
-        json!({"type": "comment", "issue": 1, "user": "dev", "body": "x"}),
+        json!({"delivery": "m1", "type": "comment", "issue": "FAKE-1", "user": "dev"}),
+        json!({"delivery": "m2", "type": "label_added", "issue": "FAKE-1", "label": "kod"}),
+        json!({"delivery": "m3", "type": "comment", "issue": 1, "user": "dev", "body": "x"}),
+        json!({"delivery": 4, "type": "comment", "issue": "FAKE-1", "user": "dev", "body": "x"}),
     ] {
         assert!(t.parse_webhook(&t.webhook(&body)).is_err(), "{body}");
     }
     // Header names are case-insensitive, as in HTTP.
-    let mut w = t.webhook(&json!({"type": "comment", "issue": "FAKE-1", "user": "u", "body": "b"}));
+    let mut w = t.webhook(
+        &json!({"delivery": "m5", "type": "comment", "issue": "FAKE-1", "user": "u", "body": "b"}),
+    );
     w.headers[0].0 = "X-Fake-Signature".into();
     assert_eq!(
         t.parse_webhook(&w).unwrap(),
-        Some(TaskEvent::Commented {
-            issue: "FAKE-1".into(),
-            author: "u".into(),
-            body: "b".into()
+        Some(Delivery {
+            id: "m5".into(),
+            event: TaskEvent::Commented {
+                issue: "FAKE-1".into(),
+                author: "u".into(),
+                body: "b".into()
+            }
         })
     );
+}
+
+/// RFC 4231, test case 2.
+#[test]
+fn the_signature_is_hmac_sha256() {
+    let mac = hmac_sha256(b"Jefe", b"what do ya want for nothing?");
+    let hex: String = mac.iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(
+        hex,
+        "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+    );
+    // A key longer than a block is hashed first (RFC 4231, test case 6).
+    let mac = hmac_sha256(
+        &[0xaa; 131],
+        b"Test Using Larger Than Block-Size Key - Hash Key First",
+    );
+    assert_eq!(mac[..4], [0x60, 0xe4, 0x31, 0x59]);
+}
+
+/// A request that fails the signature check doesn't use up its delivery ID,
+/// so a forger can't block the real delivery; the ID is spent once the real
+/// one is accepted, and a signed request with no ID is refused.
+#[test]
+fn delivery_ids_are_spent_only_by_signed_requests() {
+    let (t, s) = sandbox();
+    assert!(t.parse_webhook(&s.tampered).is_err());
+    assert!(t.parse_webhook(&s.trigger).unwrap().is_some());
+    let e = t.parse_webhook(&s.trigger).unwrap_err().to_string();
+    assert!(e.contains("already accepted"), "{e}");
+    let e = t.parse_webhook(&s.unidentified).unwrap_err().to_string();
+    assert!(e.contains("no delivery ID"), "{e}");
 }
 ````
 
@@ -721,25 +812,35 @@ Create `crates/kod-tracker/src/contract.rs`:
 //! The contract every adapter must pass, against a recorded webhook and a
 //! sandbox project. An adapter counts as supported once `check` passes.
 //! It panics on the first broken rule, like a test.
-use crate::{Issue, Rework, ReworkKind, State, TaskEvent, Tracker, Webhook};
+use crate::{Delivery, Issue, Rework, ReworkKind, State, Tracker, Webhook};
 
 /// What the sandbox project holds. For a real tracker: a story set up by
 /// hand, and webhooks recorded from it.
 pub struct Sandbox {
-    /// A story as `get_issue` must read it. Its state is not compared: the
-    /// check moves the story through every state.
+    /// A story as `get_issue` must read it, with no links yet. Its state is
+    /// not compared: the check moves the story along `transitions`.
     pub issue: Issue,
+    /// A walk through the tracker's workflow from the story's state, as its
+    /// rules allow; it must reach all 5 standard states.
+    pub transitions: Vec<State>,
     /// A key with no issue.
     pub missing: String,
     /// A user in the team group, and one outside it.
     pub member: String,
     pub outsider: String,
-    /// A recorded webhook adding the trigger label, and its event.
+    /// A recorded webhook adding the trigger label, and its delivery.
     pub trigger: Webhook,
-    pub trigger_event: TaskEvent,
-    /// A recorded comment webhook, and its event.
+    pub trigger_event: Delivery,
+    /// The trigger with a value in its body changed (still valid JSON, same
+    /// delivery ID) and its signature kept.
+    pub tampered: Webhook,
+    /// The trigger with one character of its signature value changed.
+    pub wrong_signature: Webhook,
+    /// A signed webhook with no delivery ID.
+    pub unidentified: Webhook,
+    /// A recorded comment webhook, and its delivery.
     pub comment: Webhook,
-    pub comment_event: TaskEvent,
+    pub comment_event: Delivery,
     /// A recorded, signed webhook that is not a task event.
     pub ignored: Webhook,
 }
@@ -764,6 +865,13 @@ pub fn check(t: &dyn Tracker, s: &Sandbox) {
     );
 
     for state in State::ALL {
+        assert!(
+            s.transitions.contains(&state),
+            "the sandbox walk never reaches {}",
+            state.name()
+        );
+    }
+    for &state in &s.transitions {
         t.transition(key, state).expect("transition");
         let now = t.get_issue(key).expect("get_issue after transition").state;
         assert_eq!(now, state, "transition to {}", state.name());
@@ -805,6 +913,11 @@ pub fn check(t: &dyn Tracker, s: &Sandbox) {
         r.body.contains(&rework.text),
         "the rework request lacks its text: {r:?}"
     );
+    let story = t.get_issue(key).expect("get_issue after create_linked");
+    assert!(
+        story.links.contains(&created),
+        "the story does not link its rework request: {story:?}"
+    );
     assert!(
         t.create_linked(missing, ReworkKind::Question, &rework)
             .is_err(),
@@ -821,6 +934,28 @@ pub fn check(t: &dyn Tracker, s: &Sandbox) {
     );
 
     let parse = |w: &Webhook| t.parse_webhook(w);
+    // Forgeries first, while the trigger's delivery ID is unspent, so only a
+    // signature check can refuse them; they are errors, never a quiet None.
+    assert!(
+        parse(&s.tampered).is_err(),
+        "a changed body passed the signature check"
+    );
+    assert!(
+        parse(&s.wrong_signature).is_err(),
+        "a wrong signature value was accepted"
+    );
+    let unsigned = Webhook {
+        headers: vec![],
+        body: s.trigger.body.clone(),
+    };
+    assert!(
+        parse(&unsigned).is_err(),
+        "an unsigned webhook was accepted"
+    );
+    assert!(
+        parse(&s.unidentified).is_err(),
+        "a webhook with no delivery ID was accepted"
+    );
     assert_eq!(
         parse(&s.trigger).expect("trigger webhook"),
         Some(s.trigger_event.clone())
@@ -830,21 +965,13 @@ pub fn check(t: &dyn Tracker, s: &Sandbox) {
         Some(s.comment_event.clone())
     );
     assert_eq!(parse(&s.ignored).expect("ignored webhook"), None);
-    // Tampering is an error, never a quiet None.
-    let mut tampered = s.trigger.clone();
-    let last = tampered.body.len() - 1;
-    tampered.body[last] ^= 1;
     assert!(
-        parse(&tampered).is_err(),
-        "a changed body passed the signature check"
+        parse(&s.trigger).is_err(),
+        "a replayed trigger was accepted"
     );
-    let unsigned = Webhook {
-        headers: vec![],
-        body: s.trigger.body.clone(),
-    };
     assert!(
-        parse(&unsigned).is_err(),
-        "an unsigned webhook was accepted"
+        parse(&s.comment).is_err(),
+        "a replayed comment was accepted"
     );
 }
 ````
@@ -856,7 +983,7 @@ Create `crates/kod-tracker/src/fake.rs`:
 //! workflow states and custom fields, as a real tracker does, and reads them
 //! through a `Mapping`, so it exercises the mapping too.
 use crate::{
-    Issue, Rework, ReworkKind, State, TaskEvent, Tracker, Webhook, contract::Sandbox,
+    Delivery, Issue, Rework, ReworkKind, State, TaskEvent, Tracker, Webhook, contract::Sandbox,
     mapping::Mapping,
 };
 use anyhow::{Context, Result, bail};
@@ -866,6 +993,7 @@ use std::{
     collections::{BTreeMap, HashSet},
     sync::Mutex,
 };
+use subtle::ConstantTimeEq;
 
 /// The fake's mapping, in the registry format.
 pub const FAKE_MAPPING: &str = r#"{
@@ -882,8 +1010,29 @@ pub const FAKE_MAPPING: &str = r#"{
   "team_group": "kod-team"
 }"#;
 
-/// The signature header: hex SHA-256 of the secret followed by the body.
+/// The signature header: hex HMAC-SHA256 of the body, keyed by the secret.
+/// The body's "delivery" field is the delivery ID, so it is signed too.
 pub const SIGNATURE: &str = "x-fake-signature";
+
+/// HMAC-SHA256 (RFC 2104) over sha2, which the workspace already has.
+pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    let mut block = [0u8; 64];
+    if key.len() > 64 {
+        block[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        block[..key.len()].copy_from_slice(key);
+    }
+    let pad = |byte: u8| block.map(|b| b ^ byte);
+    let inner = Sha256::new()
+        .chain_update(pad(0x36))
+        .chain_update(data)
+        .finalize();
+    Sha256::new()
+        .chain_update(pad(0x5c))
+        .chain_update(inner)
+        .finalize()
+        .into()
+}
 
 /// An issue as the fake stores it: tracker names, not standard ones.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -907,6 +1056,8 @@ struct Inner {
     prs: Vec<(String, String)>,
     members: HashSet<String>,
     created: u64,
+    /// Delivery IDs of the webhooks accepted so far.
+    deliveries: HashSet<String>,
 }
 
 pub struct FakeTracker {
@@ -955,11 +1106,12 @@ impl FakeTracker {
         }
     }
 
-    fn sign(&self, body: &[u8]) -> String {
-        let mut h = Sha256::new();
-        h.update(self.secret.as_bytes());
-        h.update(body);
-        h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    /// The signature header value for this body.
+    pub fn sign(&self, body: &[u8]) -> String {
+        hmac_sha256(self.secret.as_bytes(), body)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -1009,6 +1161,7 @@ impl Tracker for FakeTracker {
             acceptance_criteria: i.acceptance_criteria,
             reporter: i.reporter,
             approved_versions: i.approved_versions,
+            links: i.links,
             state,
         })
     }
@@ -1058,11 +1211,12 @@ impl Tracker for FakeTracker {
         Ok(self.lock().members.contains(user))
     }
 
-    fn parse_webhook(&self, request: &Webhook) -> Result<Option<TaskEvent>> {
+    fn parse_webhook(&self, request: &Webhook) -> Result<Option<Delivery>> {
         let sig = request
             .header(SIGNATURE)
             .context("fake: the webhook has no signature")?;
-        if sig != self.sign(&request.body) {
+        let want = self.sign(&request.body);
+        if !bool::from(sig.as_bytes().ct_eq(want.as_bytes())) {
             bail!("fake: the webhook signature does not match");
         }
         let v: Value =
@@ -1072,7 +1226,13 @@ impl Tracker for FakeTracker {
                 .map(str::to_owned)
                 .with_context(|| format!("fake: the webhook has no {k}"))
         };
-        Ok(match v["type"].as_str() {
+        let id = text("delivery").context("fake: the webhook has no delivery ID")?;
+        // Spent only now, after the signature: a forged request can't use up
+        // the ID of the real one.
+        if !self.lock().deliveries.insert(id.clone()) {
+            bail!("fake: delivery {id} was already accepted (a replay)");
+        }
+        let event = match v["type"].as_str() {
             Some("label_added") if text("label")? == self.mapping.trigger_label => {
                 Some(TaskEvent::Labeled {
                     issue: text("issue")?,
@@ -1085,7 +1245,8 @@ impl Tracker for FakeTracker {
                 body: text("body")?,
             }),
             _ => None,
-        })
+        };
+        Ok(event.map(|event| Delivery { id, event }))
     }
 }
 
@@ -1113,28 +1274,58 @@ pub fn sandbox() -> (FakeTracker, Sandbox) {
     );
     t.add_member("dev");
     let expected = t.get_issue("FAKE-1").expect("the fake story reads");
+    let trigger = t.webhook(
+        &json!({"delivery": "d-1", "type": "label_added", "issue": "FAKE-1", "label": "kod", "user": "dev"}),
+    );
+    // The trigger with "dev" changed to "eve", under the trigger's signature.
+    let mut tampered = t.webhook(
+        &json!({"delivery": "d-1", "type": "label_added", "issue": "FAKE-1", "label": "kod", "user": "eve"}),
+    );
+    tampered.headers = trigger.headers.clone();
+    // The trigger with one hex digit of its signature changed.
+    let mut wrong_signature = trigger.clone();
+    let sig = &mut wrong_signature.headers[0].1;
+    let first = if sig.starts_with('0') { "1" } else { "0" };
+    sig.replace_range(..1, first);
     let s = Sandbox {
         issue: expected.clone(),
         missing: "FAKE-404".into(),
         member: "dev".into(),
         outsider: "mallory".into(),
-        trigger: t.webhook(
+        transitions: vec![
+            State::Ready,
+            State::InProgress,
+            State::Blocked,
+            State::InProgress,
+            State::InReview,
+            State::Done,
+        ],
+        trigger,
+        trigger_event: Delivery {
+            id: "d-1".into(),
+            event: TaskEvent::Labeled {
+                issue: "FAKE-1".into(),
+                by: "dev".into(),
+            },
+        },
+        tampered,
+        wrong_signature,
+        unidentified: t.webhook(
             &json!({"type": "label_added", "issue": "FAKE-1", "label": "kod", "user": "dev"}),
         ),
-        trigger_event: TaskEvent::Labeled {
-            issue: "FAKE-1".into(),
-            by: "dev".into(),
-        },
         comment: t.webhook(
-            &json!({"type": "comment", "issue": "FAKE-1", "user": "dev", "body": "@kod use the v2 API"}),
+            &json!({"delivery": "d-2", "type": "comment", "issue": "FAKE-1", "user": "dev", "body": "@kod use the v2 API"}),
         ),
-        comment_event: TaskEvent::Commented {
-            issue: "FAKE-1".into(),
-            author: "dev".into(),
-            body: "@kod use the v2 API".into(),
+        comment_event: Delivery {
+            id: "d-2".into(),
+            event: TaskEvent::Commented {
+                issue: "FAKE-1".into(),
+                author: "dev".into(),
+                body: "@kod use the v2 API".into(),
+            },
         },
         ignored: t.webhook(
-            &json!({"type": "label_added", "issue": "FAKE-1", "label": "frontend", "user": "dev"}),
+            &json!({"delivery": "d-3", "type": "label_added", "issue": "FAKE-1", "label": "frontend", "user": "dev"}),
         ),
     };
     (t, s)
@@ -1145,7 +1336,7 @@ Apply to `crates/kod-tracker/src/lib.rs` with `git apply`:
 
 ````diff
 diff --git a/crates/kod-tracker/src/lib.rs b/crates/kod-tracker/src/lib.rs
-index 773d913..fb31b43 100644
+index 0b78940..d38c7b1 100644
 --- a/crates/kod-tracker/src/lib.rs
 +++ b/crates/kod-tracker/src/lib.rs
 @@ -3,6 +3,8 @@
@@ -1159,15 +1350,32 @@ index 773d913..fb31b43 100644
  /// The standard workflow states. The core uses only these.
 ````
 
+Apply to `crates/kod-tracker/Cargo.toml` with `git apply`:
+
+````diff
+diff --git a/crates/kod-tracker/Cargo.toml b/crates/kod-tracker/Cargo.toml
+index 5e38c1e..c67e2dd 100644
+--- a/crates/kod-tracker/Cargo.toml
++++ b/crates/kod-tracker/Cargo.toml
+@@ -8,6 +8,7 @@ publish = false
+ anyhow = "1"
+ serde_json = "1"
+ sha2 = "0.10"
++subtle = "2.6"
+ 
+ [dev-dependencies]
+ tempfile = "3"
+````
+
 - [ ] **Step 4: Run the tests to see them pass**
 
 Run: `cargo test --all && cargo clippy --all-targets -- -D warnings && cargo fmt --all --check`
-Expected: PASS (kod-tracker: contract 2, fake 3, mapping 3), clean.
+Expected: PASS (kod-tracker: contract 3, fake 5, mapping 3), clean.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/kod-tracker
+git add Cargo.lock crates/kod-tracker
 git commit -m "kod-tracker: contract test suite and a fake adapter that passes it"
 ```
 
@@ -1177,16 +1385,18 @@ One fresh reviewer on the most capable model reads the whole branch against the 
 - Does any standard name leak a tracker name, or any tracker name reach the core types?
 - Can an invalid mapping load, or an unmapped state read as a standard one?
 - Would a real adapter that passes `check` be safe to trust with webhooks and membership?
+- Does the real adapter compare signatures in constant time? The contract can't see that from outside; 6c's review must check it in the code.
 
 ## Self-review
 
 - **Spec coverage.** The seven operations plus `name`: Task 1. The mapping (states, the two custom fields, trigger label, team group) validated at load: Task 1. The contract test: Task 2. A fake for other sub-plans' tests that passes the contract: Task 2. A real tracker: not built, as the overview says.
 - **Placeholders.** None.
-- **Type consistency.** `State`, `Issue`, `Rework`, `ReworkKind`, `TaskEvent`, `Webhook`, `Mapping`, `Sandbox`, `FakeTracker` are spelled the same in both tasks; the code was compiled and tested in this order.
+- **Type consistency.** `State`, `Issue`, `Rework`, `ReworkKind`, `TaskEvent`, `Delivery`, `Webhook`, `Mapping`, `Sandbox`, `FakeTracker` are spelled the same in both tasks; the code was compiled and tested in this order.
 - **Review Focus.** Each of the five lines names its test and task above.
 
 ## Open items
 
 - **Mapping file format** (owner): JSON now (D4). Say if the registry must be YAML; the shape stays the same and only the parser changes.
 - **Where mappings live in the registry** (owner, with 6b): the file path and how a tracker is chosen per repo.
+- **Stale deliveries**: refusing old deliveries by the tracker's signed timestamp is a 6c contract item (D3).
 - **Rework request fields**: the fake writes them into the body. A real adapter may use custom fields instead; 6c decides per tracker.

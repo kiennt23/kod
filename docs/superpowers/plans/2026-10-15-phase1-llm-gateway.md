@@ -12,17 +12,21 @@
 
 ## Decisions
 
-- **D1. One gateway, a token per run.** The run token is a path prefix, not a header, so runners need no change and a script in the sandbox gets the same treatment as the runner. A request with no known token gets 401 and no log line: it is not a run, so there is nothing to charge or record. Tokens are at least 32 lower-case hex characters; kod-eval makes 128-bit ones.
+- **D1. One gateway, a token per run.** The run token is a path prefix, not a header, so runners need no change and a script in the sandbox gets the same treatment as the runner. A request with no known token gets 401 and no log line: it is not a run, so there is nothing to charge or record. Tokens are at least 32 lower-case hex characters; kod-eval makes 128-bit ones. The gateway keeps runs keyed by the token's SHA-256, so a lookup takes no time that depends on how much of a guessed token is right. A token is a credential: kod-loop's request errors drop the URL (`without_url`).
 - **D2. Runs are declared at start in `runs.json`** (`KOD_RUNS`): token → id, ticket, repo, data classes, token budget, cost budget in micro-USD. That is all phase 1 needs: kod-eval knows its cases before it starts, and the loop (sub-plan 5) is in the same process later. Adding runs to a live gateway waits for sub-plan 5 to need it.
-- **D3. Routing goes through kod-policy, per request.** The gateway builds the `model_request` input (actor agent, the run's id, ticket, repo, data classes, `auth_mode` `api_key`, the endpoint name) and asks `Policy::decide`. The policy is the only place routing values live; today `policy/routing.json` allows class `placeholder` on endpoint `placeholder` and nothing else, so an unknown class, a run with no class, and any other endpoint are refused. The gateway has exactly one upstream endpoint (`KOD_ENDPOINT`, default `placeholder`, plus `KOD_UPSTREAM` and `KOD_API_KEY`). More endpoints wait for the routing values.
+- **D3. Routing goes through kod-policy, per request.** The gateway builds the `model_request` input (actor agent, the run's id, ticket, repo, data classes, `auth_mode` `api_key`, the endpoint name) and asks `Policy::decide`. The policy is the only place routing values live; today `policy/routing.json` allows class `placeholder` on endpoint `placeholder` and nothing else, so an unknown class, a run with no class, and any other endpoint are refused. The gateway has exactly one upstream endpoint: `KOD_ENDPOINT` (its routing name) and `KOD_UPSTREAM` (its URL), both required with no default so the name and the URL are always set together, plus `KOD_API_KEY`. More endpoints wait for the routing values.
 - **D4. Every decision is recorded before the call.** `record_decision` runs for allowed and refused requests alike. If it fails, the request is refused with 503 `audit_error` and nothing is forwarded (the design's "the gateway refuses the external write").
-- **D5. Budgets reserve the worst case, then settle.** Before forwarding, a request reserves body bytes + `RESERVE_SLACK` (4096) input tokens and `max_tokens` output tokens, priced at the model's input and output rates. A reservation that would take the run past either limit is refused (`over_spend`, 403). When the response ends, the reservation is replaced by the cost the response reported. A response that reported no usage is charged its whole reservation. A cost above the reservation is charged and halts the run (`halted`, 403 for every later request). `count_tokens` reserves nothing. Error responses are not charged.
-- **D6. Prices are integers.** `prices.json` gives micro-USD per million tokens for `input`, `output`, `cache_write` and `cache_read`, per model; every allowed model must have a price. Spend is kept in picodollars (one token at one micro-USD per million tokens is one picodollar), so there is no rounding.
-- **D7. Capture goes to kod-audit.** The prompt is appended as record type `prompts` and the response as `model_outputs`; kod-audit redacts secrets before storing. Each capture keeps the first 128 KiB (`CAPTURE_MAX`) as text plus the full length, the SHA-256 of the full bytes, and a `truncated` flag. A failed prompt write refuses the request. A failed output write cannot un-send the response, so it halts the run.
+- **D5. Budgets reserve the worst case, then settle.** Before forwarding, a request reserves body bytes + `RESERVE_SLACK` (4096) + `IMAGE_TOKENS` (5000) per image input tokens and `max_tokens` output tokens, priced at the model's input and output rates. A reservation that would take the run past either limit is refused (`over_spend`, 403). When the response ends, the reservation is replaced by the cost the response reported. A response that reported no usage is charged its whole reservation. A cost above the reservation is charged and halts the run (`halted`, 403 for every later request). `count_tokens` reserves nothing. Error responses are not charged.
+- **D6. Prices are integers.** `prices.json` gives micro-USD per million tokens for `input`, `output`, `cache_write` and `cache_read`, per model; every allowed model must have a price. Spend is kept in picodollars (one token at one micro-USD per million tokens is one picodollar), so there is no rounding. `cache_write` is the 5-minute cache price; a request asking for any other cache `ttl` is refused (D12), so the table needs no second write price.
+- **D7. Capture goes to kod-audit.** The prompt is appended as record type `prompts` and the response as `model_outputs`; kod-audit redacts secrets before storing. Secrets are redacted (kod-audit's `redact`) before the cut, so a cut can't leave part of one behind. Each capture keeps the first 128 KiB (`CAPTURE_MAX`) of the redacted text plus the full length, the SHA-256 of the full bytes, and a `truncated` flag. For a stream, the capture is the assembled content (the text, tool input JSON and thinking of each block, up to `ASSEMBLE_MAX`, 1 MiB), not the raw events, so a secret split across deltas is whole when it is redacted. A failed prompt write refuses the request. A failed output write cannot un-send the response, so it halts the run.
 - **D8. Request count and concurrency are per run.** `KOD_MAX_REQUESTS` and `KOD_MAX_CONCURRENT` keep their phase 0 meaning, now per run rather than per process.
 - **D9. kod-eval: one gateway per eval run.** It replaces one container per case. Its files (`prices.json`, `runs.json`, `audit.db`) live in `<run dir>/gateway/`, the repo's `policy/` is mounted read-only, and each case's `proxy.log` is the gateway's lines for that case. The per-case budget comes from two new required flags, `--run-max-tokens` and `--run-max-cost-micro-usd`, and the price table from the required `--prices`. There is no default budget.
 - **D10. Compare stays valid.** The manifest gains `spend` (the budget and the price table). Two runs with budgets must have the same one. A phase 0 baseline has none; it compares with a budgeted run only if that run's budget refused nothing (no `over_spend` and no `halted` lines), because then the budget did not change what the agent saw.
 - **D11. No OpenAI-compatible route.** Neither runner needs one.
+- **D12. The body is allowlisted, not denylisted.** The gateway forwards only what it can price and see: the top-level fields `model`, `max_tokens`, `messages`, `system`, `metadata`, `stop_sequences`, `stream`, `temperature`, `top_k`, `top_p`, `tools`, `tool_choice` and `thinking`; content blocks `text`, `image` (base64 only), `document` (plain text only), `tool_use`, `tool_result` (checked recursively), `thinking` and `redacted_thinking`; tools with only `name`, `description`, `input_schema` and `cache_control` (a tool with a `type` is a server tool, billed outside `usage` or fetching what the gateway never sees); at most 100 images; and no `anthropic-beta` value (the allowlist starts empty). Anything else is refused with 400 `deny_shape` before anything is forwarded: `mcp_servers`, `container`, `service_tier`, URL and file sources, PDFs, server tools and 1-hour cache writes among them. kod-eval sets `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1` for claude-code so it sends no beta header.
+- **D13. Every refusal and every halt is an audit record.** Besides the log line, a refusal appends a `run_audit` record (`kind` `gateway_refusal`, run, event, path, status, reason) and a halt appends one with `kind` `gateway_halt`. The request is refused whether or not that record is written.
+- **D14. Load-time checks are complete.** `KOD_ALLOWED_PATHS` must be a subset of `/v1/messages` and `/v1/messages/count_tokens`, the only priced paths, and every `KOD_MAX_*` limit must be a whole number above zero.
+- **D15. A gateway that dies ends the eval run.** Budgets live in the gateway's memory, so it is not restarted. Before each case kod-eval checks the gateway is running; if it is not, that case and the rest are cancelled ("the gateway stopped before it started") and `run_all` fails. The kill switch is checked first, since it stops the gateway too.
 
 ## Execution
 
@@ -41,7 +45,7 @@ The plan ends with one whole-branch review.
 
 - Toolchain 1.99.0 (`rust-toolchain.toml`), edition 2024, resolver 3.
 - CI runs `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all` and cargo-deny with the existing `deny.toml`, unchanged.
-- Fail closed: a bad or missing config file or setting stops the gateway before it prints `ready`; anything the policy does not allow is refused.
+- Fail closed: a bad or missing config file or setting stops the gateway before it prints `ready`; anything the policy does not allow is refused; any request body shape outside the allowlist (D12) is refused.
 - Routing values are placeholders until the owner sets them: one class `placeholder`, one endpoint `placeholder`, everything else refused.
 - The audit write happens before the call it records, and a failed write refuses the call.
 - kod-audit (sub-plan 4) must be merged first; this plan codes against its plan's API: `AuditLog::open(&Path)`, `append(&str, &Value) -> Result<u64>`, `record_decision(&Value, &Decision) -> Result<u64>`.
@@ -63,7 +67,7 @@ crates/kod-llm-proxy/
   Cargo.toml          modify: kod-audit, kod-policy, sha2; dev: rusqlite, tempfile
   src/config.rs       create: prices.json and runs.json, validated
   src/budget.rs       create: Spend, reservation, cost, Ledger
-  src/lib.rs          replace: the gateway (runs, routing, budget, capture)
+  src/lib.rs          replace: the gateway (runs, body allowlist, routing, budget, capture)
   src/main.rs         replace: reads the new settings, prints "ready"
   tests/common/mod.rs create: a gateway on 127.0.0.1 with a temp audit db
   tests/config.rs     create
@@ -72,13 +76,16 @@ crates/kod-llm-proxy/
   tests/proxy.rs      modify: phase 0 tests, now through a run
 crates/kod-loop/
   Cargo.toml          modify: dev-deps kod-audit, kod-policy
-  tests/proxy.rs      replace: the loop against the gateway, plus a budget test
+  src/api.rs          modify: request errors drop the URL, which holds the token
+  tests/proxy.rs      replace: the loop against the gateway, plus budget and token tests
 crates/kod-eval/
   src/run.rs          modify: one gateway per eval run, spend in the manifest
   src/runner.rs       modify: env takes the run's base URL
   src/main.rs         modify: --policy-dir, --prices, --run-max-tokens, --run-max-cost-micro-usd
   src/report.rs       modify: compare checks spend budgets; report shows them
   tests/{run,runner,sandbox,report,docker}.rs, tests/e2e/mod.rs  modify
+  tests/gateway_down.rs  create: a gateway that dies mid-run
+.github/workflows/ci.yml  modify: runs the new docker test binary
 README.md             modify: the eval command with prices and a budget
 ```
 
@@ -98,7 +105,8 @@ README.md             modify: the eval command with prices and a budget
 - Produces:
   - `config::Price { input, output, cache_write, cache_read: u64 }`, `config::Prices = HashMap<String, Price>`, `config::Budget { max_tokens, max_cost_micro_usd: u64 }`, `config::RunSpec { id, ticket, repo: String, data_classes: Vec<String>, budget: Budget }`.
   - `config::parse_prices(text: &str, allowed_models: &[String]) -> Result<Prices>` and `config::parse_runs(text: &str) -> Result<HashMap<String, RunSpec>>` (keyed by token).
-  - `budget::Spend { tokens, pico_usd: u64 }`, `budget::RESERVE_SLACK`, `budget::reservation(&Price, body_len: usize, max_tokens: u64) -> Spend`, `budget::cost(&Price, &Map<String, Value>) -> Option<Spend>`.
+  - `config::PATHS`, `config::parse_paths(text: &str) -> Result<Vec<String>>` (a non-empty subset of `PATHS`) and `config::parse_limit(key: &str, text: &str) -> Result<u64>` (a whole number above zero).
+  - `budget::Spend { tokens, pico_usd: u64 }`, `budget::RESERVE_SLACK`, `budget::IMAGE_TOKENS`, `budget::reservation(&Price, body_len: usize, images: u64, max_tokens: u64) -> Spend`, `budget::cost(&Price, &Map<String, Value>) -> Option<Spend>`.
   - `budget::Ledger::new(Budget)`, `reserve(&mut self, Spend) -> bool`, `release(&mut self, Spend)`, `settle(&mut self, reserved: Spend, actual: Option<Spend>) -> bool` (false once the run is halted), `halt`, `halted() -> bool`, `spent() -> Spend`.
 
 The config files follow kod-policy's `config.rs`: exact keys (an unexpected or missing key is an error), names with no spaces at the ends, whole numbers only, and messages that name the file and the key.
@@ -108,7 +116,7 @@ The config files follow kod-policy's `config.rs`: exact keys (an unexpected or m
 Create `crates/kod-llm-proxy/tests/config.rs`:
 
 ````rust
-use kod_llm_proxy::config::{Budget, Price, parse_prices, parse_runs};
+use kod_llm_proxy::config::{Budget, Price, parse_limit, parse_paths, parse_prices, parse_runs};
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 
@@ -254,13 +262,43 @@ fn refuses_bad_runs() {
         assert!(e.contains(want), "{text}: {e}");
     }
 }
+
+#[test]
+fn allowed_paths_are_a_subset_of_the_priced_ones() {
+    assert_eq!(
+        parse_paths(" /v1/messages, /v1/messages/count_tokens ").unwrap(),
+        ["/v1/messages", "/v1/messages/count_tokens"]
+    );
+    for (text, want) in [
+        ("", "KOD_ALLOWED_PATHS is empty"),
+        (" , ", "KOD_ALLOWED_PATHS is empty"),
+        (
+            "/v1/messages,/v1/messages/batches",
+            "/v1/messages/batches is not one of",
+        ),
+        ("/v1/files", "/v1/files is not one of"),
+        ("/v1/messages/", "/v1/messages/ is not one of"),
+    ] {
+        let e = err(parse_paths(text));
+        assert!(e.contains(want), "{text}: {e}");
+    }
+}
+
+#[test]
+fn limits_are_whole_numbers_above_zero() {
+    assert_eq!(parse_limit("KOD_MAX_CONCURRENT", "2").unwrap(), 2);
+    for text in ["0", "-1", "1.5", "", "two"] {
+        let e = err(parse_limit("KOD_MAX_CONCURRENT", text));
+        assert_eq!(e, "KOD_MAX_CONCURRENT must be a whole number above zero");
+    }
+}
 ````
 
 Create `crates/kod-llm-proxy/tests/budget.rs`:
 
 ````rust
 use kod_llm_proxy::{
-    budget::{Ledger, RESERVE_SLACK, Spend, cost, reservation},
+    budget::{IMAGE_TOKENS, Ledger, RESERVE_SLACK, Spend, cost, reservation},
     config::{Budget, Price},
 };
 use serde_json::{Map, Value, json};
@@ -278,9 +316,19 @@ fn usage(v: Value) -> Map<String, Value> {
 
 #[test]
 fn a_reservation_covers_the_body_at_the_dearest_input_rate_and_max_tokens() {
-    let r = reservation(&PRICE, 1000, 50);
+    let r = reservation(&PRICE, 1000, 0, 50);
     assert_eq!(r.tokens, 1000 + RESERVE_SLACK + 50);
     assert_eq!(r.pico_usd, (1000 + RESERVE_SLACK) * 4 + 50 * 15);
+}
+
+#[test]
+fn each_image_reserves_its_largest_cost_whatever_its_bytes() {
+    let r = reservation(&PRICE, 1000, 2, 50);
+    assert_eq!(r.tokens, 1000 + RESERVE_SLACK + 2 * IMAGE_TOKENS + 50);
+    assert_eq!(
+        r.pico_usd,
+        (1000 + RESERVE_SLACK + 2 * IMAGE_TOKENS) * 4 + 50 * 15
+    );
 }
 
 #[test]
@@ -553,6 +601,37 @@ pub fn parse_runs(text: &str) -> Result<HashMap<String, RunSpec>> {
     }
     Ok(runs)
 }
+
+/// The only paths the gateway can forward. Both are priced or free:
+/// /v1/messages reserves its worst case and count_tokens costs nothing. Any
+/// other path (batches, files) could spend outside the budget.
+pub const PATHS: [&str; 2] = ["/v1/messages", "/v1/messages/count_tokens"];
+
+/// KOD_ALLOWED_PATHS: a comma-separated, non-empty subset of PATHS.
+pub fn parse_paths(text: &str) -> Result<Vec<String>> {
+    let paths: Vec<String> = text
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if paths.is_empty() {
+        bail!("KOD_ALLOWED_PATHS is empty");
+    }
+    if let Some(p) = paths.iter().find(|p| !PATHS.contains(&p.as_str())) {
+        bail!("KOD_ALLOWED_PATHS: {p} is not one of {}", PATHS.join(", "));
+    }
+    Ok(paths)
+}
+
+/// A KOD_MAX_* limit: a whole number above zero. Zero would refuse every
+/// request, or with KOD_MAX_CONCURRENT make every request wait forever.
+pub fn parse_limit(key: &str, text: &str) -> Result<u64> {
+    match text.parse::<u64>() {
+        Ok(n) if n > 0 => Ok(n),
+        _ => bail!("{key} must be a whole number above zero"),
+    }
+}
 ````
 
 Create `crates/kod-llm-proxy/src/budget.rs`:
@@ -604,11 +683,20 @@ fn pico(tokens: u64, rate: u64) -> u64 {
     tokens.saturating_mul(rate)
 }
 
+/// Input tokens reserved per image block. An image's tokens follow its pixel
+/// size, not its bytes: a small PNG can be large and cost far more than its
+/// length.
+// ponytail: the largest image the newest models accept costs about 4800
+// tokens; raise this if a model takes bigger ones.
+pub const IMAGE_TOKENS: u64 = 5000;
+
 /// The most a /v1/messages request with this body can cost: every body byte
-/// a token (plus RESERVE_SLACK) at the dearest input rate, and `max_tokens`
-/// of output.
-pub fn reservation(price: &Price, body_len: usize, max_tokens: u64) -> Spend {
-    let input = (body_len as u64).saturating_add(RESERVE_SLACK);
+/// a token (plus RESERVE_SLACK and IMAGE_TOKENS per image) at the dearest
+/// input rate, and `max_tokens` of output.
+pub fn reservation(price: &Price, body_len: usize, images: u64, max_tokens: u64) -> Spend {
+    let input = (body_len as u64)
+        .saturating_add(RESERVE_SLACK)
+        .saturating_add(images.saturating_mul(IMAGE_TOKENS));
     let rate = price.input.max(price.cache_write).max(price.cache_read);
     Spend {
         tokens: input.saturating_add(max_tokens),
@@ -674,7 +762,8 @@ impl Ledger {
 
     /// Replaces reservation `r` with what the response cost, or with `r`
     /// itself when the cost is unknown. A cost above `r` is still charged and
-    /// halts the run. Returns false when it halted the run.
+    /// halts the run. Returns false when the run is halted, whether by this
+    /// call or before it.
     pub fn settle(&mut self, r: Spend, actual: Option<Spend>) -> bool {
         self.release(r);
         let charged = actual.unwrap_or(r);
@@ -722,7 +811,7 @@ index e3e633e..9e9d4c1 100644
 - [ ] **Step 4: Run the tests to see them pass**
 
 Run: `cargo test -p kod-llm-proxy`
-Expected: PASS (config 3, budget 8, and the 12 phase 0 proxy tests unchanged).
+Expected: PASS (config 5, budget 9, and the 12 phase 0 proxy tests unchanged).
 
 - [ ] **Step 5: Commit**
 
@@ -734,7 +823,7 @@ git commit -m "kod-llm-proxy: validated price and run files, and spend arithmeti
 ### Task 2: The gateway
 
 **Files:**
-- Modify: `crates/kod-llm-proxy/Cargo.toml`, `crates/kod-llm-proxy/tests/proxy.rs`, `crates/kod-llm-proxy/tests/config.rs` (append), `crates/kod-loop/Cargo.toml`
+- Modify: `crates/kod-llm-proxy/Cargo.toml`, `crates/kod-llm-proxy/tests/proxy.rs`, `crates/kod-llm-proxy/tests/config.rs` (append), `crates/kod-loop/Cargo.toml`, `crates/kod-loop/src/api.rs`
 - Replace: `crates/kod-llm-proxy/src/lib.rs`, `crates/kod-llm-proxy/src/main.rs`, `crates/kod-loop/tests/proxy.rs`
 - Create: `crates/kod-llm-proxy/tests/common/mod.rs`, `crates/kod-llm-proxy/tests/gateway.rs`
 
@@ -742,12 +831,14 @@ git commit -m "kod-llm-proxy: validated price and run files, and spend arithmeti
 - Consumes: Task 1's `config` and `budget`; `kod_policy::Policy::{load, decide}` and `Decision`; `kod_audit::AuditLog::{open, append, record_decision}`.
 - Produces:
   - `Endpoint { name, upstream: String, api_key: HeaderValue }`, `Limits` (unchanged fields), `Config { endpoint, allowed_paths, limits, prices: Prices, runs: HashMap<String, RunSpec>, policy: Arc<Policy>, audit: Arc<AuditLog> }`, `app(Config) -> Router`.
-  - `route_input(&RunSpec, endpoint: &str) -> Value` (the `model_request` input), `capture(head: &[u8], bytes: usize, sha256: &str) -> Value`.
-  - Consts `DEFAULT_ENDPOINT = "placeholder"`, `PROMPTS = "prompts"`, `MODEL_OUTPUTS = "model_outputs"`, `CAPTURE_MAX`.
-  - Log events (JSON on stdout, each with `run`): `ready`, `allow`, `usage` (with `run_tokens`, `run_cost_pico_usd`, `run_halted`), `deny`, `deny_model`, `deny_route` (with `reasons`), `too_large`, `bad_request`, `over_budget`, `over_spend`, `halted`, `audit_error`, `upstream_error`.
-  - Settings: `KOD_PRICES`, `KOD_RUNS`, `KOD_POLICY_DIR`, `KOD_AUDIT_DB` (all required), `KOD_ENDPOINT` (default `placeholder`), and the phase 0 ones unchanged.
+  - `route_input(&RunSpec, endpoint: &str) -> Value` (the `model_request` input), `capture(text: &str, complete: bool, bytes: u64, sha256: String) -> Value` (redacts, then cuts).
+  - `Usage::take_content(&mut self) -> (String, bool)`: a stream's assembled content and whether it is all there.
+  - Consts `PROMPTS = "prompts"`, `MODEL_OUTPUTS = "model_outputs"`, `CAPTURE_MAX`, `ASSEMBLE_MAX`, `MAX_IMAGES`.
+  - Log events (JSON on stdout, each with `run`): `ready`, `allow`, `usage` (with `run_tokens`, `run_cost_pico_usd`, `run_halted`), and the refusals, each with a `reason`: `deny`, `deny_shape`, `deny_model`, `deny_route` (with `reasons`), `too_large`, `bad_request`, `over_budget`, `over_spend`, `halted`, `audit_error`, `upstream_error`.
+  - `run_audit` records with `kind` `gateway_refusal` and `gateway_halt` (D13).
+  - Settings: `KOD_PRICES`, `KOD_RUNS`, `KOD_POLICY_DIR`, `KOD_AUDIT_DB`, `KOD_ENDPOINT`, `KOD_UPSTREAM` (all required), and the other phase 0 ones, now checked by `parse_paths` and `parse_limit`.
 
-The phase 0 proxy tests keep their meaning; they only gain a run (`/r/<TOKEN>` in the URL) and the `ready` line. kod-loop's gateway test builds the new `Config`, so it moves in the same task to keep `cargo test --all` green.
+The phase 0 proxy tests keep their meaning; they only gain a run (`/r/<TOKEN>` in the URL) and the `ready` line. kod-loop's gateway test builds the new `Config`, so it moves in the same task to keep `cargo test --all` green, and gains `a_failed_request_does_not_leak_the_run_token`, which fails until `api.rs` drops the URL from its error.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -937,8 +1028,16 @@ Create `crates/kod-llm-proxy/tests/gateway.rs`:
 mod common;
 
 use axum::{Router, body::Bytes, routing::post};
-use common::{CLASS, Gateway, MODEL, Setup, budget, entries, gateway, msg, post_msg, run, serve};
-use kod_llm_proxy::{budget::reservation, config::Budget};
+use common::{
+    CLASS, Gateway, MODEL, Setup, budget, entries, gateway, limits, msg, post_msg, run, serve,
+};
+use kod_llm_proxy::{
+    CAPTURE_MAX, Limits, MAX_IMAGES,
+    budget::{IMAGE_TOKENS, reservation},
+    capture,
+    config::Budget,
+};
+use serde_json::{Value, json};
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -1032,7 +1131,7 @@ async fn a_disallowed_endpoint_is_refused() {
 async fn spend_stops_at_the_budget() {
     let (up, calls) = upstream(SMALL).await;
     let body = msg(MODEL, 10);
-    let r = reservation(&common::PRICE, body.len(), 10);
+    let r = reservation(&common::PRICE, body.len(), 0, 10);
     // Room for one reservation plus 30 settled tokens: each call settles at 20.
     let g = gateway(
         &up,
@@ -1095,7 +1194,7 @@ async fn concurrent_requests_cannot_overspend_together() {
     );
     let up = serve(slow).await;
     let body = msg(MODEL, 10);
-    let r = reservation(&common::PRICE, body.len(), 10);
+    let r = reservation(&common::PRICE, body.len(), 0, 10);
     let g = gateway(
         &up,
         Setup {
@@ -1133,6 +1232,13 @@ async fn a_response_costing_more_than_its_reservation_halts_the_run() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(status(&g, msg(MODEL, 10)).await, 403);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let e = entries(&g.db);
+    assert!(
+        e.iter().any(|(t, p)| t == "run_audit"
+            && p["kind"] == "gateway_halt"
+            && p["reason"] == "a response cost more than its reservation"),
+        "{e:?}"
+    );
 }
 
 #[tokio::test]
@@ -1162,14 +1268,285 @@ async fn prompts_and_outputs_are_captured_redacted() {
 
 #[tokio::test]
 async fn a_long_body_is_captured_cut_with_its_length_and_hash() {
-    let head = vec![b'a'; kod_llm_proxy::CAPTURE_MAX + 10];
-    let c = kod_llm_proxy::capture(&head, head.len() as u64, "h".into());
-    assert_eq!(
-        c["text"].as_str().unwrap().len(),
-        kod_llm_proxy::CAPTURE_MAX
-    );
-    assert_eq!(c["bytes"], kod_llm_proxy::CAPTURE_MAX + 10);
+    let text = "a".repeat(CAPTURE_MAX + 10);
+    let c = capture(&text, true, text.len() as u64, "h".into());
+    assert_eq!(c["text"].as_str().unwrap().len(), CAPTURE_MAX);
+    assert_eq!(c["bytes"], CAPTURE_MAX + 10);
     assert_eq!(c["truncated"], true);
+    let c = capture("short", false, 5, "h".into());
+    assert_eq!(c["truncated"], true);
+}
+
+#[test]
+fn a_secret_on_the_capture_cut_is_redacted_not_cut() {
+    let secret = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789";
+    let text = format!("{} {secret}", "a".repeat(CAPTURE_MAX - 21));
+    let c = capture(&text, true, text.len() as u64, "h".into());
+    let kept = c["text"].as_str().unwrap();
+    assert!(!kept.contains("sk-ant"), "{}", &kept[kept.len() - 40..]);
+    assert!(kept.ends_with("[REDACTED]"));
+}
+
+/// An upstream that streams `pieces` as text deltas of one content block.
+async fn streaming(pieces: &'static [&'static str]) -> String {
+    let router = Router::new().route(
+        "/v1/messages",
+        post(move || async move {
+            let mut events = vec![
+                json!({"type": "message_start",
+                    "message": {"usage": {"input_tokens": 5, "output_tokens": 1}}}),
+                json!({"type": "content_block_start", "index": 0,
+                    "content_block": {"type": "text", "text": ""}}),
+            ];
+            for p in pieces {
+                events.push(json!({"type": "content_block_delta", "index": 0,
+                    "delta": {"type": "text_delta", "text": p}}));
+            }
+            events.push(json!({"type": "message_delta", "usage": {"output_tokens": 9}}));
+            events.push(json!({"type": "message_stop"}));
+            let body: String = events
+                .iter()
+                .map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap()))
+                .collect();
+            ([("content-type", "text/event-stream")], body)
+        }),
+    );
+    serve(router).await
+}
+
+#[tokio::test]
+async fn a_secret_split_across_stream_deltas_is_redacted() {
+    let up = streaming(&[
+        "the key is sk-ant-api0",
+        "3-abcdefghijklmnop",
+        "qrstuvwxyz0123456789 ok",
+    ])
+    .await;
+    let g = gateway(&up, Setup::default()).await;
+    let res = post_msg(&g.url, msg(MODEL, 10)).await;
+    assert_eq!(res.status(), 200);
+    res.text().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let e = entries(&g.db);
+    let out = &e.iter().find(|(t, _)| t == "model_outputs").unwrap().1;
+    assert_eq!(out["response"]["text"], "the key is [REDACTED] ok", "{out}");
+    for piece in ["sk-ant-api0", "abcdefghijklmnop", "qrstuvwxyz"] {
+        assert!(!out.to_string().contains(piece), "{out}");
+    }
+}
+
+/// `msg` with extra top-level fields and one user message of `content`.
+fn body_with(extra: &str, content: Value) -> String {
+    format!(
+        r#"{{"model":"{MODEL}","max_tokens":10{extra},"messages":[{{"role":"user","content":{content}}}]}}"#
+    )
+}
+
+fn image(source: Value) -> Value {
+    json!({"type": "image", "source": source})
+}
+
+#[tokio::test]
+async fn refuses_every_body_shape_it_cannot_price_or_see() {
+    let (up, calls) = upstream(SMALL).await;
+    // Room for MAX_IMAGES + 1 small images.
+    let limits = Limits {
+        max_body: 64 << 10,
+        ..limits()
+    };
+    let g = gateway(
+        &up,
+        Setup {
+            limits,
+            ..Setup::default()
+        },
+    )
+    .await;
+    let b64 = json!({"type": "base64", "media_type": "image/png", "data": "iVBO"});
+    let url = json!({"type": "url", "url": "https://attacker.example/x.png"});
+    let file = json!({"type": "file", "file_id": "file_1"});
+    let cases = [
+        (
+            "an unknown field",
+            body_with(r#","service_tier":"priority""#, json!("hi")),
+        ),
+        (
+            "mcp_servers",
+            body_with(
+                r#","mcp_servers":[{"type":"url","url":"https://attacker.example","name":"x"}]"#,
+                json!("hi"),
+            ),
+        ),
+        ("container", body_with(r#","container":"c1""#, json!("hi"))),
+        (
+            "a server tool",
+            body_with(
+                r#","tools":[{"type":"web_search_20250305","name":"web_search"}]"#,
+                json!("hi"),
+            ),
+        ),
+        (
+            "a web fetch tool",
+            body_with(
+                r#","tools":[{"type":"web_fetch_20250910","name":"web_fetch"}]"#,
+                json!("hi"),
+            ),
+        ),
+        (
+            "an image from a URL",
+            body_with("", json!([image(url.clone())])),
+        ),
+        (
+            "an image from a file",
+            body_with("", json!([image(file.clone())])),
+        ),
+        (
+            "a document from a URL",
+            body_with("", json!([{"type": "document", "source": url.clone()}])),
+        ),
+        (
+            "a PDF",
+            body_with(
+                "",
+                json!([{"type": "document", "source":
+                    {"type": "base64", "media_type": "application/pdf", "data": "JVBE"}}]),
+            ),
+        ),
+        (
+            "a document from a file",
+            body_with("", json!([{"type": "document", "source": file}])),
+        ),
+        (
+            "a URL image inside a tool result",
+            body_with(
+                "",
+                json!([{"type": "tool_result", "tool_use_id": "t1", "content": [image(url)]}]),
+            ),
+        ),
+        (
+            "a server tool block",
+            body_with(
+                "",
+                json!([{"type": "server_tool_use", "id": "s1", "name": "web_search"}]),
+            ),
+        ),
+        (
+            "a one-hour cache write",
+            body_with(
+                "",
+                json!([{"type": "text", "text": "hi",
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"}}]),
+            ),
+        ),
+        (
+            "too many images",
+            body_with("", Value::Array(vec![image(b64); MAX_IMAGES as usize + 1])),
+        ),
+        (
+            "content that is neither text nor blocks",
+            body_with("", json!(7)),
+        ),
+        (
+            "no messages",
+            format!(r#"{{"model":"{MODEL}","max_tokens":10}}"#),
+        ),
+    ];
+    for (what, body) in cases {
+        assert_eq!(status(&g, body).await, 400, "{what}");
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn a_beta_header_is_refused() {
+    let (up, calls) = upstream(SMALL).await;
+    let g = gateway(&up, Setup::default()).await;
+    let res = reqwest::Client::new()
+        .post(format!("{}/v1/messages", g.url))
+        .header("anthropic-beta", "web-fetch-2025-09-10")
+        .body(msg(MODEL, 10))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 400);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn the_shapes_runners_send_are_forwarded() {
+    let (up, calls) = upstream(SMALL).await;
+    let g = gateway(&up, Setup::default()).await;
+    let body = json!({
+        "model": MODEL,
+        "max_tokens": 10,
+        "stream": false,
+        "system": [{"type": "text", "text": "be brief", "cache_control": {"type": "ephemeral"}}],
+        "tools": [{"name": "bash", "description": "run", "input_schema": {"type": "object"},
+            "cache_control": {"type": "ephemeral", "ttl": "5m"}}],
+        "tool_choice": {"type": "auto"},
+        "thinking": {"type": "enabled", "budget_tokens": 5},
+        "metadata": {"user_id": "u"},
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "look"},
+                image(json!({"type": "base64", "media_type": "image/png", "data": "iVBO"})),
+                {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "notes"}},
+            ]},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "hm", "signature": "s"},
+                {"type": "tool_use", "id": "t1", "name": "bash", "input": {"cmd": "ls"}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": [{"type": "text", "text": "a"}]},
+            ]},
+        ],
+    });
+    assert_eq!(status(&g, body.to_string()).await, 200);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn an_image_reserves_its_largest_cost() {
+    let (up, calls) = upstream(SMALL).await;
+    let one = image(json!({"type": "base64", "media_type": "image/png", "data": "iVBO"}));
+    let body = body_with("", json!([one]));
+    let r = reservation(&common::PRICE, body.len(), 0, 10);
+    // Room for the body's bytes, not for the image's pixels.
+    let g = gateway(
+        &up,
+        Setup {
+            run: run(
+                &[CLASS],
+                Budget {
+                    max_tokens: r.tokens + IMAGE_TOKENS - 1,
+                    max_cost_micro_usd: 1_000_000,
+                },
+            ),
+            ..Setup::default()
+        },
+    )
+    .await;
+    assert_eq!(status(&g, body).await, 403);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn refusals_are_audit_records() {
+    let (up, _) = upstream(SMALL).await;
+    let g = gateway(&up, Setup::default()).await;
+    assert_eq!(status(&g, msg("other-model", 10)).await, 403);
+    assert_eq!(
+        status(&g, body_with(r#","container":"c1""#, json!("hi"))).await,
+        400
+    );
+    let e = entries(&g.db);
+    let refusals: Vec<_> = e
+        .iter()
+        .filter(|(t, p)| t == "run_audit" && p["kind"] == "gateway_refusal")
+        .map(|(_, p)| (p["event"].as_str().unwrap(), p["run"].as_str().unwrap()))
+        .collect();
+    assert_eq!(refusals, [("deny_model", "r1"), ("deny_shape", "r1")]);
+    assert!(e[1].1["reason"].as_str().unwrap().contains("container"));
 }
 
 #[tokio::test]
@@ -1190,7 +1567,7 @@ Apply to `crates/kod-llm-proxy/tests/proxy.rs` with `git apply`:
 
 ````diff
 diff --git a/crates/kod-llm-proxy/tests/proxy.rs b/crates/kod-llm-proxy/tests/proxy.rs
-index 46d88a9..a2d588c 100644
+index 46d88a9..9216733 100644
 --- a/crates/kod-llm-proxy/tests/proxy.rs
 +++ b/crates/kod-llm-proxy/tests/proxy.rs
 @@ -1,3 +1,5 @@
@@ -1421,7 +1798,7 @@ index 46d88a9..a2d588c 100644
  async fn spawn_proxy(
      upstream: &str,
      env: &[(&str, &str)],
-@@ -320,7 +298,12 @@ async fn spawn_proxy(
+@@ -320,17 +298,27 @@ async fn spawn_proxy(
      String,
      tokio::process::Child,
      tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
@@ -1434,7 +1811,11 @@ index 46d88a9..a2d588c 100644
      let port = std::net::TcpListener::bind("127.0.0.1:0")
          .unwrap()
          .local_addr()
-@@ -331,6 +314,10 @@ async fn spawn_proxy(
+         .unwrap()
+         .port();
+     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_kod-llm-proxy"))
++        .env("KOD_ENDPOINT", common::ENDPOINT)
+         .env("KOD_UPSTREAM", upstream)
          .env("KOD_API_KEY", "real-key")
          .env("KOD_ALLOWED_MODELS", MODEL)
          .env("KOD_LISTEN", format!("127.0.0.1:{port}"))
@@ -1445,7 +1826,7 @@ index 46d88a9..a2d588c 100644
          .envs(env.iter().copied())
          .stdout(std::process::Stdio::piped())
          .kill_on_drop(true)
-@@ -343,7 +330,8 @@ async fn spawn_proxy(
+@@ -343,7 +331,8 @@ async fn spawn_proxy(
          tokio::time::sleep(Duration::from_millis(50)).await;
      }
      let lines = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
@@ -1455,7 +1836,7 @@ index 46d88a9..a2d588c 100644
  }
  
  /// Log lines until the proxy has been quiet for half a second.
-@@ -382,7 +370,7 @@ fn sse_upstream() -> Router {
+@@ -382,7 +371,7 @@ fn sse_upstream() -> Router {
  #[tokio::test]
  async fn logs_usage_after_a_stream_and_passes_it_through_unchanged() {
      let upstream = serve(sse_upstream()).await;
@@ -1464,7 +1845,7 @@ index 46d88a9..a2d588c 100644
      let body = reqwest::Client::new()
          .post(format!("{p}/v1/messages"))
          .body(msg(MODEL, 10))
-@@ -395,8 +383,8 @@ async fn logs_usage_after_a_stream_and_passes_it_through_unchanged() {
+@@ -395,8 +384,8 @@ async fn logs_usage_after_a_stream_and_passes_it_through_unchanged() {
      assert_eq!(body, SSE);
      let events = drain(&mut lines).await;
      let names: Vec<_> = events.iter().map(|v| v["event"].clone()).collect();
@@ -1475,7 +1856,7 @@ index 46d88a9..a2d588c 100644
      assert_eq!(
          (v["input_tokens"].clone(), v["output_tokens"].clone()),
          (12.into(), 34.into())
-@@ -410,7 +398,7 @@ async fn logs_usage_after_a_stream_and_passes_it_through_unchanged() {
+@@ -410,7 +399,7 @@ async fn logs_usage_after_a_stream_and_passes_it_through_unchanged() {
  #[tokio::test]
  async fn log_lines_are_bounded_by_the_request_budget() {
      let upstream = serve(sse_upstream()).await;
@@ -1484,7 +1865,18 @@ index 46d88a9..a2d588c 100644
      let c = reqwest::Client::new();
      let long = format!("{p}/v1/{}", "x".repeat(10_000));
      assert_eq!(c.post(&long).send().await.unwrap().status(), 403);
-@@ -441,7 +429,7 @@ async fn log_lines_are_bounded_by_the_request_budget() {
+@@ -422,7 +411,9 @@ async fn log_lines_are_bounded_by_the_request_budget() {
+         .unwrap();
+     assert_eq!(ok.status(), 200);
+     ok.text().await.unwrap();
+-    let fail = format!(r#"{{"model":"{MODEL}","max_tokens":10,"fail":1}}"#);
++    let fail = format!(
++        r#"{{"model":"{MODEL}","max_tokens":10,"messages":[{{"role":"user","content":"fail"}}]}}"#
++    );
+     let res = c
+         .post(format!("{p}/v1/messages"))
+         .body(fail)
+@@ -441,7 +432,7 @@ async fn log_lines_are_bounded_by_the_request_budget() {
          .collect();
      assert_eq!(
          names,
@@ -1513,10 +1905,12 @@ fn the_gateway_does_not_start_on_bad_config() {
     std::fs::write(path("runs.json"), run(GOOD_RUN)).unwrap();
     std::fs::write(path("bad-runs.json"), r#"{"abc":{}}"#).unwrap();
     let policy = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../policy");
-    let start = |runs: &str, skip: &str| {
+    let start = |runs: &str, skip: &str, set: (&str, &str)| {
         let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_kod-llm-proxy"));
         c.env_clear()
             .env("KOD_API_KEY", "k")
+            .env("KOD_ENDPOINT", "placeholder")
+            .env("KOD_UPSTREAM", "http://127.0.0.1:9")
             .env("KOD_ALLOWED_MODELS", "claude-test-1")
             .env("KOD_PRICES", path("prices.json"))
             .env("KOD_RUNS", path(runs))
@@ -1524,20 +1918,64 @@ fn the_gateway_does_not_start_on_bad_config() {
             .env("KOD_AUDIT_DB", path("audit.db"))
             .env("KOD_LISTEN", "127.0.0.1:0")
             .env_remove(skip);
+        if !set.0.is_empty() {
+            c.env(set.0, set.1);
+        }
         c.output().unwrap()
     };
-    for (runs, skip, want) in [
-        ("bad-runs.json", "", "at least 32 lower-case hex"),
-        ("runs.json", "KOD_PRICES", "KOD_PRICES is required"),
-        ("runs.json", "KOD_RUNS", "KOD_RUNS is required"),
-        ("runs.json", "KOD_POLICY_DIR", "KOD_POLICY_DIR is required"),
-        ("runs.json", "KOD_AUDIT_DB", "KOD_AUDIT_DB is required"),
-        ("missing.json", "", "KOD_RUNS: reading"),
+    let none = ("", "");
+    for (runs, skip, set, want) in [
+        ("bad-runs.json", "", none, "at least 32 lower-case hex"),
+        ("runs.json", "KOD_PRICES", none, "KOD_PRICES is required"),
+        ("runs.json", "KOD_RUNS", none, "KOD_RUNS is required"),
+        (
+            "runs.json",
+            "KOD_POLICY_DIR",
+            none,
+            "KOD_POLICY_DIR is required",
+        ),
+        (
+            "runs.json",
+            "KOD_AUDIT_DB",
+            none,
+            "KOD_AUDIT_DB is required",
+        ),
+        (
+            "runs.json",
+            "KOD_ENDPOINT",
+            none,
+            "KOD_ENDPOINT is required",
+        ),
+        (
+            "runs.json",
+            "KOD_UPSTREAM",
+            none,
+            "KOD_UPSTREAM is required",
+        ),
+        ("missing.json", "", none, "KOD_RUNS: reading"),
+        (
+            "runs.json",
+            "",
+            ("KOD_MAX_CONCURRENT", "0"),
+            "KOD_MAX_CONCURRENT must be a whole number above zero",
+        ),
+        (
+            "runs.json",
+            "",
+            ("KOD_ALLOWED_PATHS", "/v1/messages/batches"),
+            "/v1/messages/batches is not one of",
+        ),
+        (
+            "runs.json",
+            "",
+            ("KOD_ENDPOINT", " "),
+            "KOD_ENDPOINT must be",
+        ),
     ] {
-        let out = start(runs, skip);
+        let out = start(runs, skip, set);
         let err = String::from_utf8_lossy(&out.stderr);
-        assert!(!out.status.success(), "{runs} {skip}");
-        assert!(err.contains(want), "{runs} {skip}: {err}");
+        assert!(!out.status.success(), "{runs} {skip} {set:?}");
+        assert!(err.contains(want), "{runs} {skip} {set:?}: {err}");
         assert!(!String::from_utf8_lossy(&out.stdout).contains("ready"));
     }
 }
@@ -1684,6 +2122,22 @@ fn a_request_over_the_spend_budget_never_reaches_the_model() {
     assert!(o.error.unwrap().contains("403"));
     assert!(m.lock().unwrap().seen.is_empty());
 }
+
+/// The run token in the base URL is a credential: a failed request does not
+/// put it in the outcome or the trace.
+#[test]
+fn a_failed_request_does_not_leak_the_run_token() {
+    let ws = tempfile::tempdir().unwrap();
+    let url = format!("http://127.0.0.1:9/r/{TOKEN}");
+    let (o, trace) = go(&config(&url, ws.path()), "t");
+    assert_eq!(o.end_state, EndState::NeedsHuman);
+    let error = o.error.unwrap();
+    assert!(error.contains("request failed"), "{error}");
+    assert!(!error.contains(TOKEN), "{error}");
+    for line in trace {
+        assert!(!line.to_string().contains(TOKEN), "{line}");
+    }
+}
 ````
 
 - [ ] **Step 2: Run them to see them fail**
@@ -1704,12 +2158,15 @@ Replace `crates/kod-llm-proxy/src/lib.rs`:
 //! reach other endpoints.
 //!
 //! Each allowed request is checked in this order, and the first refusal
-//! wins: request count, halted run, path, body size, model and max_tokens,
-//! routing (kod-policy `model_request`, recorded in the audit log), budget
-//! reservation, then the redacted prompt capture in the audit log. A failed
-//! audit write refuses the request. The response is streamed back; when it
-//! ends, its cost settles the reservation and the output capture is written
-//! to the audit log. A failed output write halts the run.
+//! wins: request count, halted run, path, anthropic-beta header, body size,
+//! body shape (an allowlist of the fields, content blocks and sources the
+//! gateway can price and see), model and max_tokens, routing (kod-policy
+//! `model_request`, recorded in the audit log), budget reservation, then the
+//! redacted prompt capture in the audit log. A failed audit write refuses the
+//! request. Every refusal is also a `run_audit` record. The response is
+//! streamed back; when it ends, its cost settles the reservation and the
+//! output capture is written to the audit log. A failed output write halts
+//! the run, and a halt is a `run_audit` record too.
 //!
 //! Log lines are JSON on stdout and carry the run id. Each request within a
 //! run's request budget gets one line when it is allowed or refused, and the
@@ -1733,7 +2190,7 @@ use axum::{
 use budget::{Ledger, Spend};
 use config::{Price, Prices, RunSpec};
 use futures_util::StreamExt;
-use kod_audit::AuditLog;
+use kod_audit::{AuditLog, RUN_AUDIT};
 use kod_policy::Policy;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -1763,8 +2220,49 @@ pub const DEFAULT_MAX_BODY: u64 = 4 << 20;
 pub const DEFAULT_MAX_REQUESTS: u64 = 200;
 pub const DEFAULT_MAX_CONCURRENT: u64 = 2;
 
-/// The endpoint name kod-policy's placeholder routing allows.
-pub const DEFAULT_ENDPOINT: &str = "placeholder";
+/// Top-level request fields the gateway can price and bound. Anything else
+/// is refused: `mcp_servers` and `container` reach systems the gateway can't
+/// see, and fields like `service_tier` change the price.
+const BODY_FIELDS: [&str; 13] = [
+    "model",
+    "max_tokens",
+    "messages",
+    "system",
+    "metadata",
+    "stop_sequences",
+    "stream",
+    "temperature",
+    "top_k",
+    "top_p",
+    "tools",
+    "tool_choice",
+    "thinking",
+];
+
+/// Content block types the gateway forwards. Server tool blocks, search
+/// results and anything newer are refused.
+const BLOCK_TYPES: [&str; 7] = [
+    "text",
+    "image",
+    "document",
+    "tool_use",
+    "tool_result",
+    "thinking",
+    "redacted_thinking",
+];
+
+/// Keys of a tool definition. A tool with a `type` is a server tool (web
+/// search, web fetch, code execution), billed outside `usage` or fetching
+/// content the gateway never sees, so it is refused.
+const TOOL_FIELDS: [&str; 4] = ["name", "description", "input_schema", "cache_control"];
+
+/// anthropic-beta values the gateway forwards. A beta can unlock features it
+/// can't price or see, so each one is added only after checking that.
+const ALLOWED_BETAS: [&str; 0] = [];
+
+/// Image blocks per request, the API's own limit. Each reserves
+/// `budget::IMAGE_TOKENS`.
+pub const MAX_IMAGES: u64 = 100;
 
 /// Audit record types, keys of the compliance profile's retention_days.
 pub const PROMPTS: &str = "prompts";
@@ -1775,6 +2273,13 @@ pub const MODEL_OUTPUTS: &str = "model_outputs";
 // ponytail: kod-audit caps a payload at 1 MiB and escaping can grow text up
 // to 6x, so captures are cut; full capture needs a blob store (open question).
 pub const CAPTURE_MAX: usize = 128 << 10;
+
+/// Bytes of a response (or of a stream's assembled text) held for capture.
+/// Redaction runs on all of it before the cut to CAPTURE_MAX.
+// ponytail: a secret straddling this cut could survive only if redaction
+// shrank the first ASSEMBLE_MAX bytes below CAPTURE_MAX, i.e. an output that
+// is almost all secrets.
+pub const ASSEMBLE_MAX: usize = 8 * CAPTURE_MAX;
 
 /// Logged paths are cut to this many bytes; the agent chooses them.
 const LOG_PATH_MAX: usize = 256;
@@ -1840,7 +2345,9 @@ pub fn app(cfg: Config) -> Router {
                 in_flight: Arc::new(Semaphore::new(cfg.limits.max_concurrent)),
                 ledger: Mutex::new(Ledger::new(spec.budget)),
             };
-            (token.clone(), Arc::new(run))
+            // Keyed by the token's hash, so lookups take no time that depends
+            // on how much of a guessed token is right.
+            (hex(Sha256::digest(token)), Arc::new(run))
         })
         .collect();
     let state = Arc::new(AppState {
@@ -1860,31 +2367,157 @@ pub fn app(cfg: Config) -> Router {
     Router::new().fallback(forward).with_state(state)
 }
 
-fn refuse(event: &str, run: &str, path: &str, status: StatusCode) -> Response {
-    log(event, run, path, status.as_u16());
+/// A refusal: the log event, the status, and the reason kept in the audit log.
+type Refusal = (&'static str, StatusCode, String);
+
+fn shape(why: impl Into<String>) -> Refusal {
+    ("deny_shape", StatusCode::BAD_REQUEST, why.into())
+}
+
+/// Logs a refusal and records it in the audit log. The request is refused
+/// whether or not the record is written.
+async fn refuse(
+    st: &AppState,
+    run: &str,
+    path: &str,
+    (event, status, reason): Refusal,
+) -> Response {
+    let extra = Map::from_iter([("reason".into(), json!(reason))]);
+    log_with(event, run, path, status.as_u16(), extra);
+    let record = json!({
+        "kind": "gateway_refusal",
+        "run": run,
+        "event": event,
+        "path": cut(path),
+        "status": status.as_u16(),
+        "reason": reason,
+    });
+    if audit(&st.cfg.audit, move |a| a.append(RUN_AUDIT, &record))
+        .await
+        .is_err()
+    {
+        eprintln!("audit: a refusal for run {run} was not recorded");
+    }
     status.into_response()
 }
 
-/// Checks the request body against the model and token limits, and returns
-/// the model and max_tokens (0 for count_tokens).
-fn check_body(
-    lim: &Limits,
-    path: &str,
-    body: &[u8],
-) -> Result<(String, u64), (&'static str, StatusCode)> {
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return Err(("bad_request", StatusCode::BAD_REQUEST));
+/// Records that a run was halted. Called off the async threads.
+fn record_halt(log: &AuditLog, run: &str, reason: &str) {
+    let record = json!({"kind": "gateway_halt", "run": run, "reason": reason});
+    if log.append(RUN_AUDIT, &record).is_err() {
+        eprintln!("audit: the halt of run {run} was not recorded");
+    }
+}
+
+/// What an allowed body asks for.
+struct Checked {
+    model: String,
+    /// 0 for count_tokens.
+    max_tokens: u64,
+    images: u64,
+}
+
+/// Checks the request body against the model and token limits and the shape
+/// allowlist: only fields, content blocks, sources and tools whose cost is
+/// bounded by the reservation, and that send nothing where the gateway can't
+/// see it, are forwarded.
+fn check_body(lim: &Limits, path: &str, body: &[u8]) -> Result<Checked, Refusal> {
+    let Ok(Value::Object(v)) = serde_json::from_slice::<Value>(body) else {
+        let why = "the body is not a JSON object".into();
+        return Err(("bad_request", StatusCode::BAD_REQUEST, why));
     };
-    let model = v.get("model").and_then(|m| m.as_str()).unwrap_or("");
+    let model = v.get("model").and_then(Value::as_str).unwrap_or("");
     if !lim.allowed_models.iter().any(|m| m == model) {
-        return Err(("deny_model", StatusCode::FORBIDDEN));
+        let why = format!("model {model:?} is not allowed");
+        return Err(("deny_model", StatusCode::FORBIDDEN, why));
     }
+    if let Some(k) = v.keys().find(|k| !BODY_FIELDS.contains(&k.as_str())) {
+        return Err(shape(format!("field {k} is not allowed")));
+    }
+    let mut images = 0;
+    let Some(messages) = v.get("messages").and_then(Value::as_array) else {
+        return Err(shape("messages must be a list"));
+    };
+    for m in messages {
+        check_content(&m["content"], &mut images)?;
+    }
+    if let Some(system) = v.get("system") {
+        check_content(system, &mut images)?;
+    }
+    if let Some(tools) = v.get("tools") {
+        let Some(tools) = tools.as_array() else {
+            return Err(shape("tools must be a list"));
+        };
+        for t in tools {
+            let Some(o) = t.as_object() else {
+                return Err(shape("a tool must be an object"));
+            };
+            if let Some(k) = o.keys().find(|k| !TOOL_FIELDS.contains(&k.as_str())) {
+                return Err(shape(format!("tool key {k} is not allowed")));
+            }
+            check_cache(t)?;
+        }
+    }
+    if images > MAX_IMAGES {
+        return Err(shape(format!("more than {MAX_IMAGES} images")));
+    }
+    let model = model.to_owned();
     if path != "/v1/messages" {
-        return Ok((model.to_owned(), 0));
+        return Ok(Checked {
+            model,
+            max_tokens: 0,
+            images,
+        });
     }
-    match v.get("max_tokens").and_then(|t| t.as_u64()) {
-        Some(t) if t <= lim.max_tokens => Ok((model.to_owned(), t)),
-        _ => Err(("bad_request", StatusCode::BAD_REQUEST)),
+    match v.get("max_tokens").and_then(Value::as_u64) {
+        Some(max_tokens) if max_tokens <= lim.max_tokens => Ok(Checked {
+            model,
+            max_tokens,
+            images,
+        }),
+        _ => {
+            let why = format!("max_tokens must be a whole number up to {}", lim.max_tokens);
+            Err(("bad_request", StatusCode::BAD_REQUEST, why))
+        }
+    }
+}
+
+/// Message or system content: text, or a list of allowed blocks. Images and
+/// documents must be inline (no URL or file sources, which the gateway can't
+/// size), and documents plain text (a PDF page costs far more than its bytes).
+fn check_content(v: &Value, images: &mut u64) -> Result<(), Refusal> {
+    let blocks = match v {
+        Value::String(_) => return Ok(()),
+        Value::Array(b) => b,
+        _ => return Err(shape("content must be text or a list of blocks")),
+    };
+    for b in blocks {
+        let t = b["type"].as_str().unwrap_or_default();
+        if !BLOCK_TYPES.contains(&t) {
+            return Err(shape(format!("content block type {t:?} is not allowed")));
+        }
+        check_cache(b)?;
+        let source = b["source"]["type"].as_str().unwrap_or_default();
+        match t {
+            "image" if source != "base64" => return Err(shape("image sources must be base64")),
+            "image" => *images = images.saturating_add(1),
+            "document" if source != "text" => {
+                return Err(shape("document sources must be plain text"));
+            }
+            "tool_result" if b.get("content").is_some() => check_content(&b["content"], images)?,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Only the 5-minute prompt cache is priced (`cache_write`); a 1-hour write
+/// costs more.
+fn check_cache(b: &Value) -> Result<(), Refusal> {
+    match b.get("cache_control").map(|c| &c["ttl"]) {
+        None | Some(Value::Null) => Ok(()),
+        Some(t) if t == "5m" => Ok(()),
+        _ => Err(shape("only the 5-minute prompt cache is allowed")),
     }
 }
 
@@ -1914,15 +2547,18 @@ async fn audit<T: Send + 'static>(
     tokio::task::spawn_blocking(move || f(&log)).await?
 }
 
-/// A body as kept in the audit log: its first CAPTURE_MAX bytes as text,
-/// with its full length and sha256.
-pub fn capture(head: &[u8], bytes: u64, sha256: String) -> Value {
-    let text = String::from_utf8_lossy(&head[..head.len().min(CAPTURE_MAX)]);
+/// A body as kept in the audit log. Secrets are redacted from the whole text
+/// before it is cut to CAPTURE_MAX bytes, so a cut can't leave part of one
+/// behind. `complete` is false when `text` is already only part of the body;
+/// `bytes` and `sha256` describe the full body.
+pub fn capture(text: &str, complete: bool, bytes: u64, sha256: String) -> Value {
+    let red = kod_audit::redact::redact(text);
+    let kept = &red[..red.floor_char_boundary(CAPTURE_MAX)];
     json!({
-        "text": text,
+        "text": kept,
         "bytes": bytes,
         "sha256": sha256,
-        "truncated": bytes > CAPTURE_MAX as u64,
+        "truncated": !complete || kept.len() < red.len(),
     })
 }
 
@@ -1937,7 +2573,10 @@ async fn forward(State(st): State<Arc<AppState>>, req: Request) -> Response {
         .path()
         .strip_prefix("/r/")
         .and_then(|r| r.split_once('/'))
-        .and_then(|(token, rest)| Some((st.runs.get(token)?.clone(), format!("/{rest}"))))
+        .and_then(|(token, rest)| {
+            let run = st.runs.get(&hex(Sha256::digest(token)))?;
+            Some((run.clone(), format!("/{rest}")))
+        })
     else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
@@ -1950,13 +2589,31 @@ async fn forward(State(st): State<Arc<AppState>>, req: Request) -> Response {
         return StatusCode::TOO_MANY_REQUESTS.into_response();
     }
     if n == lim.max_requests {
-        return refuse("over_budget", id, &path, StatusCode::TOO_MANY_REQUESTS);
+        let why = format!("more than {} requests", lim.max_requests);
+        return refuse(
+            &st,
+            id,
+            &path,
+            ("over_budget", StatusCode::TOO_MANY_REQUESTS, why),
+        )
+        .await;
     }
     if run.ledger.lock().map_or(true, |l| l.halted()) {
-        return refuse("halted", id, &path, StatusCode::FORBIDDEN);
+        let why = "the run is halted".into();
+        return refuse(&st, id, &path, ("halted", StatusCode::FORBIDDEN, why)).await;
     }
     if !st.cfg.allowed_paths.contains(&path) {
-        return refuse("deny", id, &path, StatusCode::FORBIDDEN);
+        let why = "the path is not allowed".into();
+        return refuse(&st, id, &path, ("deny", StatusCode::FORBIDDEN, why)).await;
+    }
+    let betas = req.headers().get_all("anthropic-beta");
+    let mut betas = betas
+        .iter()
+        .flat_map(|v| v.to_str().unwrap_or("?").split(','))
+        .map(str::trim);
+    if let Some(b) = betas.find(|b| !ALLOWED_BETAS.contains(b)) {
+        let why = format!("anthropic-beta {b:?} is not allowed");
+        return refuse(&st, id, &path, shape(why)).await;
     }
     let ep = &st.cfg.endpoint;
     let url = match req.uri().query() {
@@ -1970,11 +2627,22 @@ async fn forward(State(st): State<Arc<AppState>>, req: Request) -> Response {
     }
     headers.insert("x-api-key", ep.api_key.clone());
     let Ok(body) = to_bytes(req.into_body(), lim.max_body).await else {
-        return refuse("too_large", id, &path, StatusCode::PAYLOAD_TOO_LARGE);
+        let why = format!("the body is over {} bytes", lim.max_body);
+        return refuse(
+            &st,
+            id,
+            &path,
+            ("too_large", StatusCode::PAYLOAD_TOO_LARGE, why),
+        )
+        .await;
     };
-    let (model, max_tokens) = match check_body(lim, &path, &body) {
-        Ok(m) => m,
-        Err((event, status)) => return refuse(event, id, &path, status),
+    let Checked {
+        model,
+        max_tokens,
+        images,
+    } = match check_body(lim, &path, &body) {
+        Ok(c) => c,
+        Err(r) => return refuse(&st, id, &path, r).await,
     };
     // Routing: the policy decides whether this endpoint may serve the run's
     // data classes, and the decision is recorded before anything else.
@@ -1985,7 +2653,14 @@ async fn forward(State(st): State<Arc<AppState>>, req: Request) -> Response {
         .await
         .is_err()
     {
-        return refuse("audit_error", id, &path, StatusCode::SERVICE_UNAVAILABLE);
+        let why = "the routing decision was not recorded".into();
+        return refuse(
+            &st,
+            id,
+            &path,
+            ("audit_error", StatusCode::SERVICE_UNAVAILABLE, why),
+        )
+        .await;
     }
     if !allow {
         log_with(
@@ -1999,15 +2674,17 @@ async fn forward(State(st): State<Arc<AppState>>, req: Request) -> Response {
     }
     // count_tokens is free, so it reserves nothing.
     let Some(price) = st.cfg.prices.get(&model).copied() else {
-        return refuse("deny_model", id, &path, StatusCode::FORBIDDEN);
+        let why = format!("model {model:?} has no price");
+        return refuse(&st, id, &path, ("deny_model", StatusCode::FORBIDDEN, why)).await;
     };
     let reserved = if path == "/v1/messages" {
-        budget::reservation(&price, body.len(), max_tokens)
+        budget::reservation(&price, body.len(), images, max_tokens)
     } else {
         Spend::default()
     };
     if !run.ledger.lock().is_ok_and(|mut l| l.reserve(reserved)) {
-        return refuse("over_spend", id, &path, StatusCode::FORBIDDEN);
+        let why = "the request could pass the run's budget".into();
+        return refuse(&st, id, &path, ("over_spend", StatusCode::FORBIDDEN, why)).await;
     }
     let release = |run: &Run| {
         if let Ok(mut l) = run.ledger.lock() {
@@ -2019,19 +2696,38 @@ async fn forward(State(st): State<Arc<AppState>>, req: Request) -> Response {
         "endpoint": ep.name,
         "model": model,
         "path": path,
-        "request": capture(&body, body.len() as u64, hex(Sha256::digest(&body))),
+        "request": capture(
+            &String::from_utf8_lossy(&body),
+            true,
+            body.len() as u64,
+            hex(Sha256::digest(&body)),
+        ),
     });
     if audit(&st.cfg.audit, move |a| a.append(PROMPTS, &prompt))
         .await
         .is_err()
     {
         release(&run);
-        return refuse("audit_error", id, &path, StatusCode::SERVICE_UNAVAILABLE);
+        let why = "the prompt was not recorded".into();
+        return refuse(
+            &st,
+            id,
+            &path,
+            ("audit_error", StatusCode::SERVICE_UNAVAILABLE, why),
+        )
+        .await;
     }
     // Held until the response body has been fully streamed.
     let Ok(permit) = run.in_flight.clone().acquire_owned().await else {
         release(&run);
-        return refuse("upstream_error", id, &path, StatusCode::SERVICE_UNAVAILABLE);
+        let why = "the run's request limit was closed".into();
+        return refuse(
+            &st,
+            id,
+            &path,
+            ("upstream_error", StatusCode::SERVICE_UNAVAILABLE, why),
+        )
+        .await;
     };
     match st
         .client
@@ -2055,6 +2751,7 @@ async fn forward(State(st): State<Arc<AppState>>, req: Request) -> Response {
                 .and_then(|v| v.to_str().ok())
                 .is_some_and(|v| v.starts_with("text/event-stream"));
             let mut meter = Meter {
+                sse,
                 usage: Usage::new(sse),
                 head: vec![],
                 bytes: 0,
@@ -2080,10 +2777,22 @@ async fn forward(State(st): State<Arc<AppState>>, req: Request) -> Response {
         Err(e) => {
             release(&run);
             // Without the URL, which carries a query string the agent chose.
-            eprintln!("upstream: {}", e.without_url());
-            refuse("upstream_error", id, &path, StatusCode::BAD_GATEWAY)
+            let why = e.without_url().to_string();
+            eprintln!("upstream: {why}");
+            refuse(
+                &st,
+                id,
+                &path,
+                ("upstream_error", StatusCode::BAD_GATEWAY, why),
+            )
+            .await
         }
     }
+}
+
+/// A path cut to LOG_PATH_MAX bytes; the agent chooses it.
+fn cut(path: &str) -> &str {
+    &path[..path.floor_char_boundary(LOG_PATH_MAX)]
 }
 
 fn log(event: &str, run: &str, path: &str, status: u16) {
@@ -2098,10 +2807,7 @@ fn log_with(event: &str, run: &str, path: &str, status: u16, mut extra: Map<Stri
         ("ts", json!(ts)),
         ("event", json!(event)),
         ("run", json!(run)),
-        (
-            "path",
-            json!(path.get(..path.floor_char_boundary(LOG_PATH_MAX))),
-        ),
+        ("path", json!(cut(path))),
         ("status", json!(status)),
     ] {
         extra.insert(k.into(), v);
@@ -2113,6 +2819,7 @@ fn log_with(event: &str, run: &str, path: &str, status: u16, mut extra: Map<Stri
 /// (after its last byte, or when the client went away) it settles the run's
 /// reservation, logs the usage line and writes the output capture.
 struct Meter {
+    sse: bool,
     usage: Usage,
     head: Vec<u8>,
     bytes: u64,
@@ -2130,7 +2837,7 @@ impl Meter {
         if self.path == "/v1/messages" {
             self.usage.feed(c);
         }
-        let room = CAPTURE_MAX.saturating_sub(self.head.len());
+        let room = ASSEMBLE_MAX.saturating_sub(self.head.len());
         self.head.extend_from_slice(&c[..c.len().min(room)]);
         self.bytes += c.len() as u64;
         self.sha.update(c);
@@ -2139,6 +2846,14 @@ impl Meter {
 
 impl Drop for Meter {
     fn drop(&mut self) {
+        // A stream's capture is its assembled text, so a secret split across
+        // deltas is whole when it is redacted.
+        let (text, complete) = if self.sse {
+            self.usage.take_content()
+        } else {
+            let whole = self.bytes <= self.head.len() as u64;
+            (String::from_utf8_lossy(&self.head).into_owned(), whole)
+        };
         let usage = std::mem::replace(&mut self.usage, Usage::new(false)).finish();
         let ok = (200..300).contains(&self.status);
         // Error responses are not billed. A success with unknown usage is
@@ -2149,12 +2864,13 @@ impl Drop for Meter {
             Some(Spend::default())
         };
         let id = self.run.spec.id.clone();
-        let (spent, halted) = match self.run.ledger.lock() {
+        let (spent, halted, newly_halted) = match self.run.ledger.lock() {
             Ok(mut l) => {
+                let was = l.halted();
                 l.settle(self.reserved, actual);
-                (l.spent(), l.halted())
+                (l.spent(), l.halted(), !was && l.halted())
             }
-            Err(_) => (Spend::default(), true),
+            Err(_) => (Spend::default(), true, false),
         };
         if ok && self.path == "/v1/messages" {
             let mut extra = usage.clone();
@@ -2169,15 +2885,20 @@ impl Drop for Meter {
             "path": self.path,
             "status": self.status,
             "usage": usage,
-            "response": capture(&self.head, self.bytes, sha),
+            "response": capture(&text, complete, self.bytes, sha),
         });
         let (run, log, path) = (self.run.clone(), self.audit.clone(), self.path.clone());
         tokio::task::spawn_blocking(move || {
+            let id = &run.spec.id;
+            if newly_halted {
+                record_halt(&log, id, "a response cost more than its reservation");
+            }
             if log.append(MODEL_OUTPUTS, &output).is_err() {
                 if let Ok(mut l) = run.ledger.lock() {
                     l.halt();
                 }
-                self::log("audit_error", &run.spec.id, &path, 503);
+                self::log("audit_error", id, &path, 503);
+                record_halt(&log, id, "the output capture was not written");
             }
         });
     }
@@ -2205,6 +2926,9 @@ pub struct Usage {
     /// message_stop arrived, so the last output count is final.
     stopped: bool,
     seen: Map<String, Value>,
+    /// The stream's content blocks as text, up to ASSEMBLE_MAX bytes.
+    content: String,
+    content_cut: bool,
 }
 
 impl Usage {
@@ -2215,6 +2939,8 @@ impl Usage {
             overflow: false,
             stopped: false,
             seen: Map::new(),
+            content: String::new(),
+            content_cut: false,
         }
     }
 
@@ -2233,6 +2959,22 @@ impl Usage {
             self.buf = vec![];
             self.overflow = !self.sse;
         }
+    }
+
+    /// A stream's assembled content: the text, tool input JSON and thinking
+    /// of each content block, blocks separated by a newline; and whether it
+    /// is all there (false when it passed ASSEMBLE_MAX). Empty for JSON.
+    pub fn take_content(&mut self) -> (String, bool) {
+        (std::mem::take(&mut self.content), !self.content_cut)
+    }
+
+    fn push_content(&mut self, text: &str) {
+        let room = ASSEMBLE_MAX.saturating_sub(self.content.len());
+        if text.len() > room {
+            self.content_cut = true;
+        }
+        self.content
+            .push_str(&text[..text.floor_char_boundary(room)]);
     }
 
     /// The usage fields, each a number or null when the response had none.
@@ -2271,6 +3013,21 @@ impl Usage {
                 Some("message_start") => self.take(&v["message"]["usage"]),
                 Some("message_delta") => self.take(&v["usage"]),
                 Some("message_stop") => self.stopped = true,
+                Some("content_block_start") => {
+                    if !self.content.is_empty() {
+                        self.push_content("\n");
+                    }
+                    if let Some(t) = v["content_block"]["text"].as_str() {
+                        self.push_content(t);
+                    }
+                }
+                Some("content_block_delta") => {
+                    for k in ["text", "partial_json", "thinking"] {
+                        if let Some(t) = v["delta"][k].as_str() {
+                            self.push_content(t);
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -2292,8 +3049,8 @@ Replace `crates/kod-llm-proxy/src/main.rs`:
 use anyhow::{Context, Result, bail};
 use kod_audit::AuditLog;
 use kod_llm_proxy::{
-    Config, DEFAULT_ALLOWED_PATHS, DEFAULT_ENDPOINT, DEFAULT_MAX_BODY, DEFAULT_MAX_CONCURRENT,
-    DEFAULT_MAX_REQUESTS, DEFAULT_MAX_TOKENS, Endpoint, Limits, app, config,
+    Config, DEFAULT_ALLOWED_PATHS, DEFAULT_MAX_BODY, DEFAULT_MAX_CONCURRENT, DEFAULT_MAX_REQUESTS,
+    DEFAULT_MAX_TOKENS, Endpoint, Limits, app, config,
 };
 use kod_policy::Policy;
 use std::{path::PathBuf, sync::Arc};
@@ -2303,9 +3060,7 @@ async fn main() -> Result<()> {
     let env = |k: &str, default: &str| std::env::var(k).unwrap_or_else(|_| default.to_owned());
     let required = |k: &str| std::env::var(k).with_context(|| format!("{k} is required"));
     let num = |k: &str, default: u64| -> Result<u64> {
-        std::env::var(k).map_or(Ok(default), |v| {
-            v.parse().with_context(|| format!("{k} must be a number"))
-        })
+        std::env::var(k).map_or(Ok(default), |v| config::parse_limit(k, &v))
     };
     let list = |s: String| -> Vec<String> {
         s.split(',')
@@ -2328,17 +3083,21 @@ async fn main() -> Result<()> {
         Policy::load(&PathBuf::from(required("KOD_POLICY_DIR")?)).context("loading the policy")?;
     let audit = AuditLog::open(&PathBuf::from(required("KOD_AUDIT_DB")?))
         .context("opening the audit log")?;
+    // No defaults: the endpoint name the policy allows and the URL it stands
+    // for are set together, by whoever starts the gateway.
+    let name = required("KOD_ENDPOINT")?;
+    if name.is_empty() || name != name.trim() {
+        bail!("KOD_ENDPOINT must be a non-empty name with no spaces at the ends");
+    }
     let cfg = Config {
         endpoint: Endpoint {
-            name: env("KOD_ENDPOINT", DEFAULT_ENDPOINT),
-            upstream: env("KOD_UPSTREAM", "https://api.anthropic.com")
-                .trim_end_matches('/')
-                .to_owned(),
+            name,
+            upstream: required("KOD_UPSTREAM")?.trim_end_matches('/').to_owned(),
             api_key: required("KOD_API_KEY")?
                 .parse()
                 .context("KOD_API_KEY is not a valid header value")?,
         },
-        allowed_paths: list(env("KOD_ALLOWED_PATHS", DEFAULT_ALLOWED_PATHS)),
+        allowed_paths: config::parse_paths(&env("KOD_ALLOWED_PATHS", DEFAULT_ALLOWED_PATHS))?,
         limits: Limits {
             allowed_models,
             max_tokens: num("KOD_MAX_TOKENS", DEFAULT_MAX_TOKENS)?,
@@ -2365,10 +3124,31 @@ async fn main() -> Result<()> {
 }
 ````
 
+Apply to `crates/kod-loop/src/api.rs` with `git apply`:
+
+````diff
+diff --git a/crates/kod-loop/src/api.rs b/crates/kod-loop/src/api.rs
+index 2044505..dcdbb27 100644
+--- a/crates/kod-loop/src/api.rs
++++ b/crates/kod-loop/src/api.rs
+@@ -43,7 +43,10 @@ impl Client {
+             .header("content-type", "application/json")
+             .body(body.to_string())
+             .send()
+-            .map_err(|e| ApiError::Transient(format!("request failed: {e}"), None))?;
++            // The URL holds the run's gateway token, a credential.
++            .map_err(|e| {
++                ApiError::Transient(format!("request failed: {}", e.without_url()), None)
++            })?;
+         let status = r.status();
+         let retry_after = r
+             .headers()
+````
+
 - [ ] **Step 4: Run the tests to see them pass**
 
 Run: `cargo test -p kod-llm-proxy -p kod-loop && cargo clippy --all-targets -- -D warnings`
-Expected: PASS (kod-llm-proxy: budget 8, config 4, gateway 10, proxy 12; kod-loop proxy 3), clippy clean.
+Expected: PASS (kod-llm-proxy: budget 9, config 6, gateway 17, proxy 12; kod-loop proxy 4), clippy clean.
 
 - [ ] **Step 5: Commit**
 
@@ -2380,26 +3160,94 @@ git commit -m "kod-llm-proxy: one gateway for many runs, with routing, budgets a
 ### Task 3: kod-eval on one gateway
 
 **Files:**
-- Modify: `crates/kod-eval/src/run.rs`, `crates/kod-eval/src/runner.rs`, `crates/kod-eval/src/main.rs`, `README.md`
-- Test: `crates/kod-eval/tests/run.rs`, `crates/kod-eval/tests/runner.rs`, `crates/kod-eval/tests/sandbox.rs`, `crates/kod-eval/tests/report.rs`, `crates/kod-eval/tests/e2e/mod.rs`, `crates/kod-eval/tests/docker.rs`
+- Modify: `crates/kod-eval/src/run.rs`, `crates/kod-eval/src/runner.rs`, `crates/kod-eval/src/main.rs`, `README.md`, `.github/workflows/ci.yml`
+- Test: `crates/kod-eval/tests/run.rs`, `crates/kod-eval/tests/runner.rs`, `crates/kod-eval/tests/sandbox.rs`, `crates/kod-eval/tests/report.rs`, `crates/kod-eval/tests/e2e/mod.rs`, `crates/kod-eval/tests/docker.rs`, `crates/kod-eval/tests/gateway_down.rs` (create)
 
 **Interfaces:**
 - Consumes: the gateway's settings and `ready` line from Task 2.
 - Produces:
   - `run::SpendBudget { max_tokens, max_cost_micro_usd: u64, prices: Value }`, `Manifest.spend: Option<SpendBudget>` (`None` in phase 0 manifests).
   - `Settings` gains `policy_dir: PathBuf`, `prices: PathBuf`, `run_max_tokens: u64`, `run_max_cost_micro_usd: u64`.
-  - `run::EVAL_DATA_CLASS = "placeholder"`, `run::runs_json(tokens: &[(String, String)], &SpendBudget) -> Value`, `run::token() -> Result<String>`, `run::case_log(log: &str, case: &str) -> String`, `run::GatewayMounts<'a> { dir, policy: &Path, user: (u32, u32) }`, `run::gateway_args(name, run_id, &ProxyLimits, &GatewayMounts, image) -> Vec<String>` (replaces `proxy_args`).
-  - `Runner::env(&self, base_url: &str)`: every runner, the script included, gets `ANTHROPIC_BASE_URL` set to its case's `http://kod-llm-proxy:8080/r/<token>`.
+  - `run::EVAL_ENDPOINT = "placeholder"` (passed as `KOD_ENDPOINT`), `run::EVAL_DATA_CLASS = "placeholder"`, `run::runs_json(tokens: &[(String, String)], &SpendBudget) -> Value`, `run::token() -> Result<String>`, `run::case_log(log: &str, case: &str) -> String`, `run::GatewayMounts<'a> { dir, policy: &Path, user: (u32, u32) }`, `run::gateway_args(name, run_id, &ProxyLimits, &GatewayMounts, image) -> Vec<String>` (replaces `proxy_args`).
+  - `Runner::env(&self, base_url: &str)`: every runner, the script included, gets `ANTHROPIC_BASE_URL` set to its case's `http://kod-llm-proxy:8080/r/<token>`; claude-code also gets `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1`.
 
-The gateway keeps the network alias `kod-llm-proxy`, so the sandbox side is unchanged except for the `/r/<token>` suffix. `run_all` waits for the gateway's `ready` line (up to 10 s) before the first case; if the gateway does not start, every case is cancelled with the gateway's stderr as the reason. A case's `proxy.log` is the gateway's lines whose `run` is the case id, so `report.rs` reads it as before.
+The gateway keeps the network alias `kod-llm-proxy`, so the sandbox side is unchanged except for the `/r/<token>` suffix. `run_all` waits for the gateway's `ready` line (up to 10 s) before the first case; if the gateway does not start, every case is cancelled with the gateway's stderr as the reason. A case's `proxy.log` is the gateway's lines whose `run` is the case id, so `report.rs` reads it as before. Before each case `run_all` checks the gateway is still running (D15); `gateway_down.rs` kills it during the first case and expects the second cancelled and the run failed. It is its own test binary because run ids are per second and process, so two runs in one binary can collide.
 
 - [ ] **Step 1: Write the failing tests**
+
+Create `crates/kod-eval/tests/gateway_down.rs`:
+
+````rust
+//! A gateway that dies mid-run. Its own test binary: run ids are per second
+//! and process, so two runs in one test binary can collide, and Cargo runs
+//! test binaries one at a time. Same setup as tests/docker.rs.
+mod e2e;
+use e2e::*;
+
+/// The gateway holds every case's budget in memory and is not restarted: if
+/// it dies, the cases after it are cancelled and the run fails, rather than
+/// running against nothing.
+#[test]
+fn a_gateway_that_dies_cancels_the_remaining_cases_and_fails_the_run() {
+    if !enabled() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let s = settings(tmp.path());
+    let runner = Runner::Script {
+        command: SCRIPT.into(),
+    };
+    let cases = load_cases(&fixture(
+        tmp.path(),
+        &[
+            ("a-gwdown", "SLEEP", "over_budget", 3),
+            ("b-gwdown", "ANSWER", "done", 120),
+        ],
+    ))
+    .unwrap();
+    // Kills the gateway while the first case's agent runs.
+    let killer = std::thread::spawn(|| {
+        for _ in 0..600 {
+            let ps = ["ps", "--filter", "name=-a-gwdown", "--format", "{{.Names}}"];
+            let names = docker(&ps.map(String::from)).unwrap();
+            if let Some(run_id) = names
+                .lines()
+                .find_map(|n| n.strip_prefix("kod-")?.strip_suffix("-a-gwdown"))
+            {
+                docker(&["kill".into(), format!("kod-llm-proxy-{run_id}")]).unwrap();
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("the first case's agent never started");
+    });
+    let err = run_all(&cases, &runner, &s).unwrap_err();
+    killer.join().unwrap();
+    assert!(err.to_string().contains("the gateway stopped"), "{err:#}");
+    let dir = fs::read_dir(&s.out_root)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let second = result(&dir, "b-gwdown");
+    assert!(
+        second.cancelled
+            && second
+                .notes
+                .iter()
+                .any(|n| n.contains("the gateway stopped")),
+        "{second:?}"
+    );
+    assert!(!dir.join("b-gwdown/out").exists());
+}
+````
 
 Apply to `crates/kod-eval/tests/run.rs` with `git apply`:
 
 ````diff
 diff --git a/crates/kod-eval/tests/run.rs b/crates/kod-eval/tests/run.rs
-index 0facea1..ca1deb6 100644
+index 0facea1..1133796 100644
 --- a/crates/kod-eval/tests/run.rs
 +++ b/crates/kod-eval/tests/run.rs
 @@ -1,6 +1,8 @@
@@ -2437,7 +3285,7 @@ index 0facea1..ca1deb6 100644
      assert!(a.contains("-e KOD_API_KEY "), "{a}");
      for kv in [
          "KOD_ALLOWED_PATHS=/v1/messages,/v1/messages/count_tokens",
-@@ -28,17 +39,63 @@ fn proxy_gets_the_key_by_name_and_the_recorded_limits() {
+@@ -28,17 +39,64 @@ fn proxy_gets_the_key_by_name_and_the_recorded_limits() {
          "KOD_MAX_BODY=4194304",
          "KOD_MAX_REQUESTS=200",
          "KOD_MAX_CONCURRENT=2",
@@ -2445,6 +3293,7 @@ index 0facea1..ca1deb6 100644
 +        "KOD_RUNS=/gateway/runs.json",
 +        "KOD_POLICY_DIR=/policy",
 +        "KOD_AUDIT_DB=/gateway/audit.db",
++        "KOD_ENDPOINT=placeholder",
      ] {
          assert!(a.contains(&format!("-e {kv} ")), "missing {kv} in {a}");
      }
@@ -2501,7 +3350,7 @@ index 0facea1..ca1deb6 100644
  #[test]
  fn proxy_limits_come_from_the_environment() {
      let env = |k: &str| match k {
-@@ -103,7 +160,7 @@ fn proxy_upstream_defaults_to_anthropic_and_is_passed_and_recorded() {
+@@ -103,7 +161,7 @@ fn proxy_upstream_defaults_to_anthropic_and_is_passed_and_recorded() {
          "m".into(),
      )
      .unwrap();
@@ -2516,10 +3365,10 @@ Apply to `crates/kod-eval/tests/runner.rs` with `git apply`:
 
 ````diff
 diff --git a/crates/kod-eval/tests/runner.rs b/crates/kod-eval/tests/runner.rs
-index 6b0f0a4..ba160ef 100644
+index 6b0f0a4..a80e32c 100644
 --- a/crates/kod-eval/tests/runner.rs
 +++ b/crates/kod-eval/tests/runner.rs
-@@ -58,10 +58,11 @@ fn claude_command_pins_model_and_turns() {
+@@ -58,11 +58,13 @@ fn claude_command_pins_model_and_turns() {
  }
  
  #[test]
@@ -2532,9 +3381,11 @@ index 6b0f0a4..ba160ef 100644
 -    assert_eq!(get("ANTHROPIC_BASE_URL"), Some(PROXY_URL));
 +    assert_eq!(get("ANTHROPIC_BASE_URL"), Some(base.as_str()));
      assert_eq!(get("ANTHROPIC_API_KEY"), Some("sk-kod-dummy"));
++    assert_eq!(get("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"), Some("1"));
  }
  
-@@ -88,11 +89,18 @@ fn kod_loop_command_and_env() {
+ fn kod_loop() -> Runner {
+@@ -88,11 +90,18 @@ fn kod_loop_command_and_env() {
              "4096"
          ]
      );
@@ -2692,7 +3543,7 @@ Apply to `crates/kod-eval/src/run.rs` with `git apply`:
 
 ````diff
 diff --git a/crates/kod-eval/src/run.rs b/crates/kod-eval/src/run.rs
-index 853c222..22a81a5 100644
+index 853c222..939b13b 100644
 --- a/crates/kod-eval/src/run.rs
 +++ b/crates/kod-eval/src/run.rs
 @@ -3,7 +3,7 @@ use crate::{
@@ -2727,7 +3578,7 @@ index 853c222..22a81a5 100644
      /// Image ID per language.
      pub sandbox_image_ids: BTreeMap<String, String>,
      /// Each case's base commit as resolved in its mirror.
-@@ -92,6 +101,50 @@ impl ProxyLimits {
+@@ -92,6 +101,54 @@ impl ProxyLimits {
      }
  }
  
@@ -2739,6 +3590,10 @@ index 853c222..22a81a5 100644
 +    /// The price table as loaded, so two runs' costs mean the same thing.
 +    pub prices: serde_json::Value,
 +}
++
++/// The endpoint name the gateway's one upstream is routed as. kod-policy's
++/// placeholder routing allows only this one.
++pub const EVAL_ENDPOINT: &str = "placeholder";
 +
 +/// The one data class eval runs carry: the placeholder routing's only class.
 +pub const EVAL_DATA_CLASS: &str = "placeholder";
@@ -2778,7 +3633,7 @@ index 853c222..22a81a5 100644
  fn image_id(image: &str) -> Result<String> {
      Ok(
          docker(&sv(&["image", "inspect", "--format", "{{.Id}}", image]))?
-@@ -231,6 +284,17 @@ pub fn run_all(cases: &[EvalCase], runner: &Runner, s: &Settings) -> Result<Path
+@@ -231,6 +288,17 @@ pub fn run_all(cases: &[EvalCase], runner: &Runner, s: &Settings) -> Result<Path
              limits.upstream
          );
      }
@@ -2796,7 +3651,7 @@ index 853c222..22a81a5 100644
      let mut sandbox_image_ids = BTreeMap::new();
      let mut base_commits = BTreeMap::new();
      for c in cases {
-@@ -253,6 +317,7 @@ pub fn run_all(cases: &[EvalCase], runner: &Runner, s: &Settings) -> Result<Path
+@@ -253,6 +321,7 @@ pub fn run_all(cases: &[EvalCase], runner: &Runner, s: &Settings) -> Result<Path
          kod_eval_git_sha: GIT_SHA.into(),
          proxy: limits.clone(),
          proxy_image_id: image_id(&s.proxy_image)?,
@@ -2804,13 +3659,14 @@ index 853c222..22a81a5 100644
          sandbox_image_ids,
          base_commits,
      };
-@@ -271,13 +336,42 @@ pub fn run_all(cases: &[EvalCase], runner: &Runner, s: &Settings) -> Result<Path
+@@ -271,13 +340,50 @@ pub fn run_all(cases: &[EvalCase], runner: &Runner, s: &Settings) -> Result<Path
      let net = format!("kod-{id}");
      docker(&sv(&["network", "create", "--internal", &net]))?;
      let _env = RunEnv { id: id.clone() };
 -    for case in cases {
 +    // One gateway serves every case; each case has its own token, budget,
-+    // request count and log lines.
++    // request count and log lines. Never mount gw_dir into a case: runs.json
++    // holds every case's token, and audit.db every case's prompts.
 +    let gw_dir = dir.join("gateway");
 +    fs::create_dir(&gw_dir)?;
 +    let tokens = cases
@@ -2834,12 +3690,19 @@ index 853c222..22a81a5 100644
 +        &gateway_args(&gw, &id, &limits, &mounts, &s.proxy_image),
 +        s,
 +    )?;
++    // ponytail: the gateway keeps budgets in memory and is not restarted, so
++    // a gateway that dies ends the run; restart needs a persisted ledger.
++    let mut gateway_down = false;
 +    for (case, (token, _)) in cases.iter().zip(&tokens) {
          let case_dir = dir.join(&case.id);
          fs::create_dir_all(&case_dir)?;
 -        let r = if stopped(s) {
++        // The kill switch stops the gateway too, so it is checked first.
 +        let r = if !up || stopped(s) {
              cancelled(case, "the kill switch was on before it started")
++        } else if gateway_down || !running(&gw) {
++            gateway_down = true;
++            cancelled(case, "the gateway stopped before it started")
          } else {
 -            run_case(case, runner, s, &limits, &id, &net, &case_dir)?
 +            let gateway = CaseGateway {
@@ -2850,7 +3713,28 @@ index 853c222..22a81a5 100644
          };
          fs::write(
              case_dir.join("result.json"),
-@@ -308,10 +402,26 @@ fn cancelled(case: &EvalCase, why: &str) -> CaseResult {
+@@ -291,9 +397,20 @@ pub fn run_all(cases: &[EvalCase], runner: &Runner, s: &Settings) -> Result<Path
+             r.passed()
+         );
+     }
++    if gateway_down {
++        bail!(
++            "the gateway stopped during run {}; the cases after it were cancelled",
++            dir.display()
++        );
++    }
+     Ok(dir)
+ }
+ 
++/// Whether the container is running.
++fn running(name: &str) -> bool {
++    docker(&sv(&["inspect", "-f", "{{.State.Running}}", name])).is_ok_and(|o| o.trim() == "true")
++}
++
+ fn cancelled(case: &EvalCase, why: &str) -> CaseResult {
+     CaseResult {
+         case_id: case.id.clone(),
+@@ -308,10 +425,26 @@ fn cancelled(case: &EvalCase, why: &str) -> CaseResult {
      }
  }
  
@@ -2881,7 +3765,7 @@ index 853c222..22a81a5 100644
      let mut args = sv(&[
          "run",
          "-d",
-@@ -319,9 +429,19 @@ pub fn proxy_args(name: &str, run_id: &str, lim: &ProxyLimits, image: &str) -> V
+@@ -319,9 +452,20 @@ pub fn proxy_args(name: &str, run_id: &str, lim: &ProxyLimits, image: &str) -> V
          name,
          "--label",
          &format!("kod.run={run_id}"),
@@ -2898,10 +3782,11 @@ index 853c222..22a81a5 100644
 +        "KOD_RUNS=/gateway/runs.json".to_owned(),
 +        "KOD_POLICY_DIR=/policy".to_owned(),
 +        "KOD_AUDIT_DB=/gateway/audit.db".to_owned(),
++        format!("KOD_ENDPOINT={EVAL_ENDPOINT}"),
          format!("KOD_UPSTREAM={}", lim.upstream),
          format!("KOD_ALLOWED_PATHS={}", lim.allowed_paths),
          format!("KOD_MAX_TOKENS={}", lim.max_tokens),
-@@ -336,23 +456,16 @@ pub fn proxy_args(name: &str, run_id: &str, lim: &ProxyLimits, image: &str) -> V
+@@ -336,23 +480,16 @@ pub fn proxy_args(name: &str, run_id: &str, lim: &ProxyLimits, image: &str) -> V
      args
  }
  
@@ -2931,7 +3816,7 @@ index 853c222..22a81a5 100644
      docker(&sv(&[
          "network",
          "connect",
-@@ -361,14 +474,47 @@ fn start_proxy(
+@@ -361,14 +498,47 @@ fn start_proxy(
          net,
          name,
      ]))?;
@@ -2951,7 +3836,7 @@ index 853c222..22a81a5 100644
 +        if ready {
 +            return Ok(());
 +        }
-+        if docker(&sv(&["inspect", "-f", "{{.State.Running}}", name]))?.trim() != "true" {
++        if !running(name) {
 +            break;
 +        }
 +        std::thread::sleep(Duration::from_millis(100));
@@ -2980,7 +3865,7 @@ index 853c222..22a81a5 100644
      run_id: &str,
      net: &str,
      dir: &Path,
-@@ -380,10 +526,6 @@ fn run_case(
+@@ -380,10 +550,6 @@ fn run_case(
      fs::write(input.join("prompt.txt"), prompt::render(case))?;
  
      let image = sandbox::image(case, &s.image_prefix);
@@ -2991,7 +3876,7 @@ index 853c222..22a81a5 100644
      let name = format!("kod-{run_id}-{}", case.id);
      let mounts = Mounts {
          read_only: &[(&work, "/seed"), (&input, "/in")],
-@@ -397,7 +539,7 @@ fn run_case(
+@@ -397,7 +563,7 @@ fn run_case(
          net,
          &mounts,
          host_ids(dir)?,
@@ -3000,7 +3885,7 @@ index 853c222..22a81a5 100644
      );
      args.push(image.clone());
      args.push("agent".into());
-@@ -412,8 +554,9 @@ fn run_case(
+@@ -412,8 +578,9 @@ fn run_case(
      let agent_wall_ms = started.elapsed().as_millis() as u64;
      // The agent only ever had a copy; collect reads out/work.tar.
      let _ = fs::remove_dir_all(&work);
@@ -3018,7 +3903,7 @@ Apply to `crates/kod-eval/src/runner.rs` with `git apply`:
 
 ````diff
 diff --git a/crates/kod-eval/src/runner.rs b/crates/kod-eval/src/runner.rs
-index 0d26a67..18cdce5 100644
+index 0d26a67..c1ab933 100644
 --- a/crates/kod-eval/src/runner.rs
 +++ b/crates/kod-eval/src/runner.rs
 @@ -2,7 +2,8 @@
@@ -3031,7 +3916,7 @@ index 0d26a67..18cdce5 100644
  pub const PROXY_URL: &str = "http://kod-llm-proxy:8080";
  
  pub enum Runner {
-@@ -64,19 +65,22 @@ impl Runner {
+@@ -64,19 +65,25 @@ impl Runner {
          }
      }
  
@@ -3046,6 +3931,9 @@ index 0d26a67..18cdce5 100644
                  // The real key lives only in kod-llm-proxy.
                  ("ANTHROPIC_API_KEY", "sk-kod-dummy"),
                  ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
++                // The gateway forwards no anthropic-beta value it has not
++                // been told it can price and see.
++                ("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", "1"),
              ]
              .map(|(k, v)| (k.to_owned(), v.to_owned()))
              .to_vec(),
@@ -3133,6 +4021,21 @@ index d57c7cc..740dc37 100644
  # Kill switch, from any shell: stops everything and refuses new runs
 ````
 
+Apply to `.github/workflows/ci.yml` with `git apply`:
+
+````diff
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index b3a3441..c807a33 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -23,4 +23,4 @@ jobs:
+       - run: rustup show
+       - run: docker build -t kod-llm-proxy --build-arg RUST_VERSION=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml) -f images/proxy/Dockerfile .
+       - run: docker build -t kod-sandbox-test --build-arg RUST_VERSION=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml) --build-arg EXTRA_PACKAGES=curl -f images/sandbox/Dockerfile .
+-      - run: cargo test -p kod-eval --test docker --test kill_switch --test kod_loop
++      - run: cargo test -p kod-eval --test docker --test gateway_down --test kill_switch --test kod_loop
+````
+
 - [ ] **Step 4: Run the tests to see them pass**
 
 Run: `cargo test -p kod-eval && cargo clippy --all-targets -- -D warnings`
@@ -3140,13 +4043,13 @@ Expected: PASS, clippy clean.
 
 Then the docker tests, which build the real images and run every runner through one gateway:
 
-Run: `docker build -t kod-llm-proxy --build-arg RUST_VERSION=1.99.0 -f images/proxy/Dockerfile . && KOD_DOCKER_TESTS=1 KOD_API_KEY=dummy cargo test -p kod-eval --test docker --test kill_switch --test kod_loop`
-Expected: PASS (docker 2, kill_switch 1, kod_loop 2). Each run dir has `gateway/audit.db`, and the script case's call to `$ANTHROPIC_BASE_URL/v1/files` gets 403.
+Run: `docker build -t kod-llm-proxy --build-arg RUST_VERSION=1.99.0 -f images/proxy/Dockerfile . && KOD_DOCKER_TESTS=1 KOD_API_KEY=dummy cargo test -p kod-eval --test docker --test gateway_down --test kill_switch --test kod_loop`
+Expected: PASS (docker 2, gateway_down 1, kill_switch 1, kod_loop 2). Each run dir has `gateway/audit.db`, and the script case's call to `$ANTHROPIC_BASE_URL/v1/files` gets 403.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/kod-eval README.md
+git add crates/kod-eval README.md .github/workflows/ci.yml
 git commit -m "kod-eval: run every case through one gateway with a per-case budget"
 ```
 
@@ -3345,13 +4248,14 @@ git commit -m "kod-eval: compare checks spend budgets"
 
 One fresh reviewer on the most capable model reads the whole branch against the design doc and this plan, with these questions:
 - Is anything forwarded before its routing decision and prompt are in the audit log?
+- Can any request body the allowlist accepts cost more than its reservation, or send content somewhere the gateway can't see? Check the shapes against the current Messages API.
 - Can any path through `forward` reach the upstream without a reservation, or leave a reservation unsettled?
 - Does every config fault stop the gateway before `ready`?
 - Do phase 0 runs still compare, and only when the comparison is fair?
 
 ## Self-review
 
-- **Spec coverage.** Long-running service in place of one per case: Tasks 2 and 3. Per-run budgets in tokens and cost from a price table: Tasks 1 and 2. Routing per data class, unknown class refused, disallowed endpoint refused: Task 2 (`an_unknown_data_class_is_refused_and_recorded`, `a_disallowed_endpoint_is_refused`). Redacted capture to the audit log, failing closed: Task 2. Spend can't exceed the budget whether the loop or a script calls it: Task 2 (kod-loop's `a_request_over_the_spend_budget_never_reaches_the_model`, and the gateway tests use plain HTTP clients, as a script would) and Task 3 (the script runner gets the same base URL). Eval rerun with no regression: Task 4, Step 4. OpenAI route: not built (D11). Structured-log tracing: every line is JSON with the run id.
+- **Spec coverage.** Long-running service in place of one per case: Tasks 2 and 3. Per-run budgets in tokens and cost from a price table: Tasks 1 and 2. Routing per data class, unknown class refused, disallowed endpoint refused: Task 2 (`an_unknown_data_class_is_refused_and_recorded`, `a_disallowed_endpoint_is_refused`). Redacted capture to the audit log, failing closed: Task 2 (`prompts_and_outputs_are_captured_redacted`, `a_secret_split_across_stream_deltas_is_redacted`, `a_failed_audit_write_refuses_the_request`). Anything the gateway can't price refused before upstream: Task 2 (`refuses_every_body_shape_it_cannot_price_or_see`, `a_beta_header_is_refused`). Spend can't exceed the budget whether the loop or a script calls it: Task 2 (kod-loop's `a_request_over_the_spend_budget_never_reaches_the_model`, and the gateway tests use plain HTTP clients, as a script would) and Task 3 (the script runner gets the same base URL). Eval rerun with no regression: Task 4, Step 4. OpenAI route: not built (D11). Structured-log tracing: every line is JSON with the run id.
 - **Placeholders.** None. Routing values are the policy repo's placeholders, by design.
 - **Type consistency.** `Budget`, `RunSpec`, `Price`, `Spend`, `Ledger`, `Config`, `Endpoint`, `SpendBudget`, `GatewayMounts` are spelled the same in every task; all code was compiled and tested in this order.
 - **Review Focus.** Each of the five lines names its test and task above.
@@ -3363,3 +4267,5 @@ One fresh reviewer on the most capable model reads the whole branch against the 
 - **Budget size** (owner): the per-case token and cost budget for the phase 1 eval rerun; the flags are required, so each run states it.
 - **Halting on a failed output write**: the run stops rather than continue with a missing record. Say if a warning is preferred.
 - **Live run registration**: runs are fixed at start (D2). Sub-plan 5 adds them when the loop needs it.
+- **claude-code's request shapes** (owner, at the eval rerun): the body allowlist and the empty beta list are checked against kod-loop's requests; the rerun must confirm claude-code sends no beta header and no field outside D12. If it does, add the value to `ALLOWED_BETAS` or `BODY_FIELDS` only after checking it can't change the price or reach outside.
+- **Gateway restart**: a gateway that dies ends the eval run (D15), because budgets are in memory. A persisted ledger is the upgrade if long runs need restarts.
