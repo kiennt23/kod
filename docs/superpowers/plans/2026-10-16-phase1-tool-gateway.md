@@ -735,7 +735,6 @@ struct Live {
     run: Run,
     /// Rework requests this run created; it may read and comment on them.
     created: Vec<String>,
-    classes: Vec<String>,
 }
 
 impl Live {
@@ -872,13 +871,11 @@ impl Gateway {
         if runs.values().any(|l| l.run.id == run.id) || runs.contains_key(&key(token)) {
             bail!("run {} is already started", run.id);
         }
-        let classes = run.data_classes.clone();
         runs.insert(
             key(token),
             Live {
                 run,
                 created: vec![],
-                classes,
             },
         );
         Ok(())
@@ -1979,6 +1976,7 @@ Apply to `crates/kod-tool-gateway/src/lib.rs` with `git apply`:
 
 ````diff
 diff --git a/crates/kod-tool-gateway/src/lib.rs b/crates/kod-tool-gateway/src/lib.rs
+index 2d27bd8..397fbad 100644
 --- a/crates/kod-tool-gateway/src/lib.rs
 +++ b/crates/kod-tool-gateway/src/lib.rs
 @@ -2,23 +2,37 @@
@@ -2019,7 +2017,7 @@ diff --git a/crates/kod-tool-gateway/src/lib.rs b/crates/kod-tool-gateway/src/li
  /// The moves the agent may make on its own ticket. Review and done are the
  /// dispatcher's, on publish.
  pub const AGENT_TRANSITIONS: [(State, State); 2] = [
-@@ -71,16 +85,28 @@ pub struct Adapters {
+@@ -70,16 +84,28 @@ pub struct Adapters {
      pub tracker: Arc<dyn Tracker>,
      pub docs: Arc<dyn Docs>,
      pub stopped: Stopped,
@@ -2048,7 +2046,7 @@ diff --git a/crates/kod-tool-gateway/src/lib.rs b/crates/kod-tool-gateway/src/li
  fn hex(bytes: &[u8]) -> String {
      bytes.iter().map(|b| format!("{b:02x}")).collect()
  }
-@@ -138,16 +164,45 @@ fn issue_json(i: &Issue) -> Value {
+@@ -137,16 +163,45 @@ fn issue_json(i: &Issue) -> Value {
      })
  }
  
@@ -2094,7 +2092,7 @@ diff --git a/crates/kod-tool-gateway/src/lib.rs b/crates/kod-tool-gateway/src/li
              runs: Mutex::default(),
          })
      }
-@@ -198,16 +253,20 @@ impl Gateway {
+@@ -195,16 +250,20 @@ impl Gateway {
          Ok(())
      }
  
@@ -2118,7 +2116,7 @@ diff --git a/crates/kod-tool-gateway/src/lib.rs b/crates/kod-tool-gateway/src/li
          Ok(())
      }
  
-@@ -409,4 +468,143 @@ impl Gateway {
+@@ -406,4 +465,143 @@ impl Gateway {
          self.update(&run.id, |l| l.created.push(key.clone()));
          Ok(json!({"key": key}))
      }
@@ -2164,7 +2162,7 @@ diff --git a/crates/kod-tool-gateway/src/lib.rs b/crates/kod-tool-gateway/src/li
 +                "ticket": run.ticket,
 +                "repo": run.repo,
 +                "canceled": false,
-+                "data_classes": live.classes,
++                "data_classes": live.run.data_classes,
 +            },
 +            "target": {"repo": run.repo, "branch": branch, "draft": true},
 +            "changed_paths": paths,
@@ -2622,7 +2620,7 @@ Apply to `crates/kod-tool-gateway/src/lib.rs` with `git apply`:
 
 ````diff
 diff --git a/crates/kod-tool-gateway/src/lib.rs b/crates/kod-tool-gateway/src/lib.rs
-index cfa5ab4..80cd859 100644
+index 397fbad..f420208 100644
 --- a/crates/kod-tool-gateway/src/lib.rs
 +++ b/crates/kod-tool-gateway/src/lib.rs
 @@ -25,6 +25,9 @@ use std::{
