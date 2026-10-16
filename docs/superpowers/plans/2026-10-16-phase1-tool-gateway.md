@@ -30,7 +30,7 @@
 | D10 | `trait Broker { mint(run, repo), revoke(run), revoke_all() }`. `mint` is called inside the publish operation only. `revoke(run)` is called when publish returns, whatever the outcome, and on `end_run`; `revoke_all` on `end_all` (the kill switch). `Secret` has a redacted `Debug` and no `Serialize`. Tracker and docs adapters hold their own credentials outside the sandbox. | The design's "git token exists only inside the publish op", made true even when a drop is skipped or a token leaks. The real broker (a GitHub App installation token scoped to one repo) is 6b's. |
 | D11 | Idempotent publish. The commit pins its author and committer date to `run.started_at`, so it is a pure function of the change, the base, the message, the committer and that date, and a retry makes the same commit. `set_branch` moves `agent/<ticket>-<run>` to it. `find_pr` runs before `open_draft_pr`. `link_pr` runs on every publish. `forge::check` is the contract every forge adapter must pass: a retry after a crash after the push gives the same SHA, and `find_pr` finds a PR whose response was lost. | A publish that died anywhere completes on retry with one branch and one PR. The real adapter must meet this, not just the fake. |
 | D12 | Errors that leave the gateway (replies, audit records) go through `scrub`: kod-audit's `redact`, plus any `/r/<hex>` run token, plus the exact minted secret. | A forge or broker error can carry a token or a URL with one. |
-| D13 | The data class is per call. A run starts with the ticket's classes, every `read_doc` adds the document's class, and publish is checked against all of them. | A run that read a restricted document can't publish what it learned through a channel cleared only for the ticket's class. |
+| D13 | The admitted data classes are fixed for both the tool and LLM gateways. `read_doc` refuses a document outside them before returning its text. Reading it requires a newly classified run; publish checks that same admitted set. | Updating only the publisher's classes would still let restricted text reach a model token admitted for the old classes. |
 | D14 | The agent may move only its own ticket, and only `in_progress` to `blocked` or back (`AGENT_TRANSITIONS`). Review and done are the dispatcher's. | The policy allows writes on own or linked tickets. Moving a ticket to done or review is a human-visible claim the agent must not make. |
 | D15 | The commit message ends with `Kod-Ticket: <tracker>:<key>`, `Kod-Run: <id>` and `Co-Authored-By: <agent>`; the committer is the agent identity, validated at `Gateway::new`. The PR title is `<key>: <title>` and its body carries the ticket, requirement, run ID, pinned inputs, changed files and test evidence. | The design's PR package. |
 
@@ -67,7 +67,8 @@ The plan ends with one whole-branch review.
 - A failure between the decision and the intent record must refuse publish with nothing minted or pushed: `publish_is_refused_when_the_intent_cannot_be_recorded` (Task 2).
 - A real-looking token in a forge or broker error must not reach the reply or the audit log, and every minted credential must be revoked: `credentials_never_reach_the_reply_or_the_audit_log`, `every_publish_credential_is_revoked_when_it_returns`, `ending_runs_revokes_their_credentials` (Task 2); `an_unreachable_gateway_does_not_leak_the_run_token`, `an_error_page_that_echoes_the_path_does_not_leak_the_run_token` (Task 4).
 - Idempotency must be a property of the forge contract: `the_fake_forge_meets_the_contract`, `the_contract_catches_a_forge_that_dates_commits_by_the_clock`, `a_retry_after_a_lost_pr_response_finds_the_pr` (Task 2).
-- A run that read a restricted document must not publish: `a_run_that_read_a_restricted_doc_cannot_publish` (Task 2).
+- A document outside the model token's admitted classes must not be returned: `a_doc_outside_the_runs_admitted_classes_is_not_returned` (Task 1). A run admitted for restricted documents must not publish to an uncleared repo: `a_run_admitted_for_restricted_docs_cannot_publish_to_an_uncleared_repo` (Task 2).
+- Canceling and revoking the push token together must still delete the branch: `cancel_revocation_does_not_prevent_branch_cleanup` (Task 2). Cleanup mints a fresh credential inside publish and the final revoke covers it too.
 - The agent must not move its ticket to review or done, or move another ticket: `the_agent_moves_only_its_own_ticket_between_in_progress_and_blocked` (Task 1).
 
 ## File Structure
@@ -579,6 +580,15 @@ fn start_run_validates_the_run() {
     assert_eq!(again.to_string(), "run run-1 is already started");
     h.gw.start_run(&"1".repeat(64), r).unwrap();
 }
+
+#[test]
+fn a_doc_outside_the_runs_admitted_classes_is_not_returned() {
+    let h = harness();
+    h.docs
+        .add_classed(LINKED_DOC, "restricted contents", "customer_pii");
+    let result = h.gw.call(TOKEN, "read_doc", &json!({"id": LINKED_DOC}));
+    assert!(result.is_err(), "{result:?}");
+}
 ````
 
 - [ ] **Step 2: Run the tests to see them fail**
@@ -709,7 +719,7 @@ pub struct Run {
     pub ticket: String,
     pub repo: String,
     pub base: String,
-    /// The classes the run starts with; each doc it reads adds its own.
+    /// The fixed classes admitted for both model routing and document reads.
     pub data_classes: Vec<String>,
     /// The rework requests Kod itself linked to the ticket before this run,
     /// from the dispatcher's records: a snapshot taken at start, never the
@@ -725,7 +735,6 @@ struct Live {
     run: Run,
     /// Rework requests this run created; it may read and comment on them.
     created: Vec<String>,
-    /// `run.data_classes` plus the class of every doc read since.
     classes: Vec<String>,
 }
 
@@ -1004,13 +1013,13 @@ impl Gateway {
             "target": target,
         }))?;
         let docs = &self.adapters.docs;
-        let doc = self.act(run, "read_doc", target, || docs.read(id))?;
-        // What the run has read, it may only publish under that doc's class.
-        self.update(&run.id, |l| {
-            if !l.classes.contains(&doc.class) {
-                l.classes.push(doc.class.clone());
+        let doc = self.act(run, "read_doc", target, || {
+            let doc = docs.read(id)?;
+            if !run.data_classes.contains(&doc.class) {
+                bail!("document is outside the run's admitted data classes; start a newly classified run");
             }
-        });
+            Ok(doc)
+        })?;
         Ok(json!({"id": id, "text": doc.text}))
     }
 
@@ -1092,7 +1101,7 @@ impl Gateway {
 - [ ] **Step 4: Run the tests to see them pass**
 
 Run: `cargo test -p kod-policy -p kod-tool-gateway && cargo clippy -p kod-policy -p kod-tool-gateway --all-targets -- -D warnings && cargo fmt --all --check`
-Expected: PASS (kod-tool-gateway tools 12; kod-policy agent_ops 17), clean.
+Expected: PASS (kod-tool-gateway tools 13; kod-policy agent_ops 17), clean.
 
 - [ ] **Step 5: Commit**
 
@@ -1319,8 +1328,12 @@ fn publish_is_refused_for_paths_the_policy_protects() {
 }
 
 #[test]
-fn a_run_that_read_a_restricted_doc_cannot_publish() {
+fn a_run_admitted_for_restricted_docs_cannot_publish_to_an_uncleared_repo() {
     let h = harness();
+    h.gw.end_run("run-1").unwrap();
+    let mut r = run();
+    r.data_classes.push("customer-pii".into());
+    h.gw.start_run(TOKEN, r).unwrap();
     h.docs
         .add_classed(LINKED_DOC, "a payroll export", "customer-pii");
     h.gw.call(TOKEN, "read_doc", &json!({"id": LINKED_DOC}))
@@ -1517,6 +1530,19 @@ fn the_contract_catches_a_forge_that_dates_commits_by_the_clock() {
     f.0.add_repo("acme/app", BASE);
     let e = forge::check(&f, &f, "acme/app", BASE).unwrap_err();
     assert!(format!("{e:#}").contains("got a new SHA"), "{e:#}");
+}
+
+#[test]
+fn cancel_revocation_does_not_prevent_branch_cleanup() {
+    let h = harness();
+    let runs = h.runs.clone();
+    let gw = h.gw.clone();
+    h.github.on_set_branch(move || {
+        runs.stopped.lock().unwrap().insert("run-1".into());
+        gw.end_run("run-1").unwrap();
+    });
+    assert!(h.gw.publish("run-1").is_err());
+    assert_eq!(h.github.branch("acme/app", "agent/FAKE-1-run-1"), None);
 }
 ````
 
@@ -1953,7 +1979,6 @@ Apply to `crates/kod-tool-gateway/src/lib.rs` with `git apply`:
 
 ````diff
 diff --git a/crates/kod-tool-gateway/src/lib.rs b/crates/kod-tool-gateway/src/lib.rs
-index f022144..cfa5ab4 100644
 --- a/crates/kod-tool-gateway/src/lib.rs
 +++ b/crates/kod-tool-gateway/src/lib.rs
 @@ -2,23 +2,37 @@
@@ -1994,7 +2019,7 @@ index f022144..cfa5ab4 100644
  /// The moves the agent may make on its own ticket. Review and done are the
  /// dispatcher's, on publish.
  pub const AGENT_TRANSITIONS: [(State, State); 2] = [
-@@ -72,16 +86,28 @@ pub struct Adapters {
+@@ -71,16 +85,28 @@ pub struct Adapters {
      pub tracker: Arc<dyn Tracker>,
      pub docs: Arc<dyn Docs>,
      pub stopped: Stopped,
@@ -2023,7 +2048,7 @@ index f022144..cfa5ab4 100644
  fn hex(bytes: &[u8]) -> String {
      bytes.iter().map(|b| format!("{b:02x}")).collect()
  }
-@@ -139,16 +165,45 @@ fn issue_json(i: &Issue) -> Value {
+@@ -138,16 +164,45 @@ fn issue_json(i: &Issue) -> Value {
      })
  }
  
@@ -2069,7 +2094,7 @@ index f022144..cfa5ab4 100644
              runs: Mutex::default(),
          })
      }
-@@ -199,16 +254,20 @@ impl Gateway {
+@@ -198,16 +253,20 @@ impl Gateway {
          Ok(())
      }
  
@@ -2093,7 +2118,7 @@ index f022144..cfa5ab4 100644
          Ok(())
      }
  
-@@ -410,4 +469,138 @@ impl Gateway {
+@@ -409,4 +468,143 @@ impl Gateway {
          self.update(&run.id, |l| l.created.push(key.clone()));
          Ok(json!({"key": key}))
      }
@@ -2188,7 +2213,12 @@ index f022144..cfa5ab4 100644
 +                }
 +                f.set_branch(&token, &run.repo, &branch, &sha)?;
 +                if canceled() {
-+                    f.delete_branch(&token, &run.repo, &branch)
++                    // Cancellation may already have revoked the push token.
++                    let cleanup = self.adapters.broker.mint(&run.id, &run.repo)?;
++                    f.delete_branch(&cleanup, &run.repo, &branch)
++                        .map_err(|e| {
++                            anyhow!("{}", format!("{e:#}").replace(cleanup.expose(), REDACTED))
++                        })
 +                        .context("the run was canceled during publish; deleting its branch")?;
 +                    bail!("the run was canceled during publish");
 +                }
@@ -2237,7 +2267,7 @@ index f022144..cfa5ab4 100644
 - [ ] **Step 4: Run the tests to see them pass**
 
 Run: `cargo test -p kod-tool-gateway && cargo clippy -p kod-tool-gateway --all-targets -- -D warnings && cargo fmt --all --check`
-Expected: PASS (publish 16, tools 12), clean.
+Expected: PASS (publish 17, tools 13), clean.
 
 - [ ] **Step 5: Commit**
 
@@ -2610,7 +2640,7 @@ index cfa5ab4..80cd859 100644
 - [ ] **Step 4: Run the tests to see them pass**
 
 Run: `cargo test -p kod-tool-gateway && cargo clippy -p kod-tool-gateway --all-targets -- -D warnings && cargo fmt --all --check`
-Expected: PASS (mcp 4, publish 16, tools 12), clean.
+Expected: PASS (mcp 4, publish 17, tools 13), clean.
 
 - [ ] **Step 5: Commit**
 
@@ -3112,7 +3142,7 @@ index b5fd2f2..a1fa4ff 100644
 - [ ] **Step 4: Run the tests to see them pass**
 
 Run: `cargo test --all && cargo clippy --all-targets -- -D warnings && cargo fmt --all --check`
-Expected: PASS (kod-loop mcp 4 and its existing tests unchanged; kod-tool-gateway 32), clean.
+Expected: PASS (kod-loop mcp 4 and its existing tests unchanged; kod-tool-gateway 34), clean.
 
 - [ ] **Step 5: Commit**
 
