@@ -37,8 +37,10 @@ WHEN (CASE NEW.state WHEN 'queued' THEN 0 WHEN 'running' THEN 1
   <= (CASE OLD.state WHEN 'queued' THEN 0 WHEN 'running' THEN 1
         WHEN 'publishing' THEN 2 ELSE 3 END)
 BEGIN SELECT RAISE(ABORT, 'run states only move forward'); END;
-CREATE TRIGGER IF NOT EXISTS run_key_is_fixed BEFORE UPDATE OF ticket, revision ON runs
+CREATE TRIGGER IF NOT EXISTS run_key_is_fixed BEFORE UPDATE OF seq, ticket, revision ON runs
 BEGIN SELECT RAISE(ABORT, 'a run keeps its ticket and revision'); END;
+CREATE TRIGGER IF NOT EXISTS runs_are_kept BEFORE DELETE ON runs
+BEGIN SELECT RAISE(ABORT, 'runs are never deleted'); END;
 CREATE TABLE IF NOT EXISTS followups (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     kind TEXT NOT NULL CHECK (kind IN ('revoke', 'stop', 'stop_all', 'transition', 'comment', 'check_publish')),
@@ -65,6 +67,8 @@ pub fn open(path: &Path) -> Result<Connection> {
     let c = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
     c.busy_timeout(BUSY_TIMEOUT)?;
     c.pragma_update(None, "synchronous", "FULL")?;
+    // So the delete inside INSERT OR REPLACE fires `runs_are_kept`.
+    c.pragma_update(None, "recursive_triggers", true)?;
     c.execute_batch(SCHEMA)
         .with_context(|| format!("creating the schema in {}", path.display()))?;
     Ok(c)
@@ -76,6 +80,7 @@ pub fn stopped(c: &Connection, run_id: &str) -> Result<bool> {
     let Some(seq) = run_id
         .strip_prefix("run-")
         .and_then(|n| n.parse::<i64>().ok())
+        .filter(|seq| format!("run-{seq}") == run_id)
     else {
         return Ok(true);
     };
