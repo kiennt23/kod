@@ -687,10 +687,17 @@ async fn a_failed_prompt_audit_write_releases_its_reservation() {
     };
     let (body, setup) = one_reservation();
     let g = gateway(&up, setup).await;
-    let lock = rusqlite::Connection::open(&g.db).unwrap();
-    lock.execute_batch("BEGIN EXCLUSIVE").unwrap();
+    // Only the prompt append fails: the decision row is written and the
+    // reservation taken before it, so this reaches the release on that path.
+    let db = rusqlite::Connection::open(&g.db).unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER no_prompts BEFORE INSERT ON audit WHEN NEW.record_type = 'prompts' \
+         BEGIN SELECT RAISE(ABORT, 'no prompts'); END",
+    )
+    .unwrap();
     assert_eq!(status(&g, body.clone()).await, 503);
-    lock.execute_batch("COMMIT").unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    db.execute_batch("DROP TRIGGER no_prompts").unwrap();
     assert_eq!(status(&g, body).await, 200);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
