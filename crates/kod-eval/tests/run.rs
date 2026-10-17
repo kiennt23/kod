@@ -1,6 +1,8 @@
 use kod_eval::{
     case::EndState,
-    run::{ProxyLimits, decide, proxy_args},
+    run::{
+        GatewayMounts, ProxyLimits, SpendBudget, case_log, decide, gateway_args, runs_json, token,
+    },
     runner::Runner,
 };
 
@@ -15,12 +17,21 @@ fn timeouts_kills_and_missing_output_map_to_end_states() {
     assert_eq!(decide(&r, false, Some(0), "").0, EndState::Done);
 }
 
+fn mounts() -> GatewayMounts<'static> {
+    GatewayMounts {
+        dir: std::path::Path::new("/res/run-1/gateway"),
+        policy: std::path::Path::new("/repo/policy"),
+        user: (501, 20),
+    }
+}
+
 /// The key is passed by name, so it never appears on a command line. The
-/// limits are passed as the values recorded in the manifest.
+/// limits are passed as the values recorded in the manifest, and the
+/// gateway's files are mounted where its settings point.
 #[test]
-fn proxy_gets_the_key_by_name_and_the_recorded_limits() {
+fn gateway_gets_the_key_by_name_the_recorded_limits_and_its_files() {
     let lim = ProxyLimits::from_env(|_| None, "m1,m2".into()).unwrap();
-    let a = proxy_args("p", "run-1", &lim, "kod-llm-proxy").join(" ");
+    let a = gateway_args("p", "run-1", &lim, &mounts(), "kod-llm-proxy").join(" ");
     assert!(a.contains("-e KOD_API_KEY "), "{a}");
     for kv in [
         "KOD_ALLOWED_PATHS=/v1/messages,/v1/messages/count_tokens",
@@ -28,15 +39,62 @@ fn proxy_gets_the_key_by_name_and_the_recorded_limits() {
         "KOD_MAX_BODY=4194304",
         "KOD_MAX_REQUESTS=200",
         "KOD_MAX_CONCURRENT=2",
+        "KOD_PRICES=/gateway/prices.json",
+        "KOD_RUNS=/gateway/runs.json",
+        "KOD_POLICY_DIR=/policy",
+        "KOD_AUDIT_DB=/gateway/audit.db",
+        "KOD_ENDPOINT=placeholder",
     ] {
         assert!(a.contains(&format!("-e {kv} ")), "missing {kv} in {a}");
     }
     assert!(!a.contains("KOD_API_KEY="), "{a}");
     assert!(a.contains("--label kod.run=run-1"), "{a}");
+    assert!(a.contains("--user 501:20 "), "{a}");
+    assert!(a.contains("-v /res/run-1/gateway:/gateway "), "{a}");
+    assert!(a.contains("-v /repo/policy:/policy:ro "), "{a}");
     assert!(
         a.ends_with("-e KOD_ALLOWED_MODELS=m1,m2 kod-llm-proxy"),
         "{a}"
     );
+}
+
+#[test]
+fn each_case_is_a_gateway_run_with_its_own_token_and_the_budget() {
+    let b = SpendBudget {
+        max_tokens: 100,
+        max_cost_micro_usd: 7,
+        prices: serde_json::json!({}),
+    };
+    let (t1, t2) = (token().unwrap(), token().unwrap());
+    assert_ne!(t1, t2);
+    for t in [&t1, &t2] {
+        assert_eq!(t.len(), 32);
+        assert!(
+            t.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f')),
+            "{t}"
+        );
+    }
+    let runs = runs_json(&[(t1.clone(), "a".into()), (t2.clone(), "b".into())], &b);
+    assert_eq!(
+        runs[&t1],
+        serde_json::json!({"id": "a", "ticket": "a", "repo": "kod-eval",
+            "data_classes": ["placeholder"], "max_tokens": 100, "max_cost_micro_usd": 7})
+    );
+    assert_eq!(runs[&t2]["id"], "b");
+}
+
+#[test]
+fn a_case_log_keeps_only_that_cases_lines() {
+    let log = "{\"event\":\"ready\"}\n\
+{\"event\":\"allow\",\"run\":\"a\"}\n\
+not json\n\
+{\"event\":\"allow\",\"run\":\"b\"}\n\
+{\"event\":\"usage\",\"run\":\"a\"}\n";
+    assert_eq!(
+        case_log(log, "a"),
+        "{\"event\":\"allow\",\"run\":\"a\"}\n{\"event\":\"usage\",\"run\":\"a\"}\n"
+    );
+    assert_eq!(case_log(log, "c"), "");
 }
 
 #[test]
@@ -103,7 +161,7 @@ fn proxy_upstream_defaults_to_anthropic_and_is_passed_and_recorded() {
         "m".into(),
     )
     .unwrap();
-    let a = proxy_args("p", "r", &lim, "img").join(" ");
+    let a = gateway_args("p", "r", &lim, &mounts(), "img").join(" ");
     assert!(a.contains("-e KOD_UPSTREAM=http://10.0.0.1:9 "), "{a}");
     // Manifests from before this field still load.
     let old: ProxyLimits = serde_json::from_str(

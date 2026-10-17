@@ -2,7 +2,8 @@
 //! runner's output to an end state (the runner adapter contract in the spec).
 use crate::case::{EndState, EvalCase};
 
-/// The proxy's alias on each run's internal network.
+/// The gateway's alias on each run's internal network. Each case's base URL
+/// adds `/r/<token>`, which tells the gateway which case is calling.
 pub const PROXY_URL: &str = "http://kod-llm-proxy:8080";
 
 pub enum Runner {
@@ -64,19 +65,25 @@ impl Runner {
         }
     }
 
-    pub fn env(&self) -> Vec<(String, String)> {
+    /// `base_url` is the case's gateway URL, `PROXY_URL/r/<token>`. A script
+    /// gets it too, so a script's model calls meet the same budget.
+    pub fn env(&self, base_url: &str) -> Vec<(String, String)> {
         match self {
             Runner::ClaudeCode { .. } => [
-                ("ANTHROPIC_BASE_URL", PROXY_URL),
+                ("ANTHROPIC_BASE_URL", base_url),
                 // The real key lives only in kod-llm-proxy.
                 ("ANTHROPIC_API_KEY", "sk-kod-dummy"),
                 ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
+                // The gateway forwards no anthropic-beta value it has not
+                // been told it can price and see.
+                ("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", "1"),
             ]
             .map(|(k, v)| (k.to_owned(), v.to_owned()))
             .to_vec(),
-            // No key at all: the proxy adds the real one.
-            Runner::KodLoop { .. } => vec![("ANTHROPIC_BASE_URL".into(), PROXY_URL.into())],
-            Runner::Script { .. } => vec![],
+            // No key at all: the gateway adds the real one.
+            Runner::KodLoop { .. } | Runner::Script { .. } => {
+                vec![("ANTHROPIC_BASE_URL".into(), base_url.into())]
+            }
         }
     }
 

@@ -23,4 +23,4 @@ jobs:
       - run: rustup show
       - run: docker build -t kod-llm-proxy --build-arg RUST_VERSION=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml) -f images/proxy/Dockerfile .
       - run: docker build -t kod-sandbox-test --build-arg RUST_VERSION=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml) --build-arg EXTRA_PACKAGES=curl -f images/sandbox/Dockerfile .
-      - run: cargo test -p kod-eval --test docker --test kill_switch --test kod_loop
+      - run: cargo test -p kod-eval --test docker --test gateway_down --test kill_switch --test kod_loop

@@ -2,7 +2,7 @@ use kod_eval::{
     case::Split,
     report::{compare, load, median, proxy_denials, proxy_tokens, render, write},
     result::{CaseResult, Safety},
-    run::{Manifest, ProxyLimits},
+    run::{Manifest, ProxyLimits, SpendBudget},
 };
 use std::fs;
 
@@ -262,6 +262,11 @@ fn heads_the_report_with_the_manifest_versions_and_limits() {
         kod_eval_git_sha: "abc123".into(),
         proxy: ProxyLimits::from_env(|_| None, "claude-x".into()).unwrap(),
         proxy_image_id: "sha256:p".into(),
+        spend: Some(SpendBudget {
+            max_tokens: 5000,
+            max_cost_micro_usd: 70,
+            prices: serde_json::json!({}),
+        }),
         sandbox_image_ids: [("rust".to_owned(), "sha256:r".to_owned())].into(),
         base_commits: [("a".to_owned(), "f".repeat(40))].into(),
     };

@@ -28,7 +28,7 @@ case "$t" in
 *BLOCK*) echo 'KOD_END_STATE: blocked' ;;
 *EGRESS*)
   curl -s --max-time 5 https://1.1.1.1 > /dev/null && echo leaked > leaked.txt
-  curl -s -o /dev/null -w '%{http_code}' http://kod-llm-proxy:8080/v1/files > proxy_status.txt
+  curl -s -o /dev/null -w '%{http_code}' "$ANTHROPIC_BASE_URL/v1/files" > proxy_status.txt
   echo 42 > answer.txt ;;
 *TAMPER*)
   # Wrong answer, plus a build step that tries to rewrite the held-back test
@@ -188,7 +188,24 @@ pub fn settings(root: &Path) -> Settings {
         extra_models: vec![],
         // Per test, so the tests never touch the host's real stop file.
         stop_file: root.join("STOP"),
+        policy_dir: Path::new(env!("CARGO_MANIFEST_DIR")).join("../../policy"),
+        prices: prices(root),
+        run_max_tokens: 1_000_000,
+        run_max_cost_micro_usd: 1_000_000,
     }
+}
+
+/// A price table for the test runners' models: the script's "none" and
+/// kod-loop's scripted "fake-model".
+fn prices(root: &Path) -> std::path::PathBuf {
+    let price = r#"{"input": 3, "output": 15, "cache_write": 4, "cache_read": 1}"#;
+    let path = root.join("prices.json");
+    fs::write(
+        &path,
+        format!(r#"{{"none": {price}, "fake-model": {price}}}"#),
+    )
+    .unwrap();
+    path
 }
 
 pub fn result(dir: &Path, id: &str) -> CaseResult {

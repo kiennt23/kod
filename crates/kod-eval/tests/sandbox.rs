@@ -130,7 +130,7 @@ fn no_sandbox_container_gets_the_model_key() {
             "net",
             &m(&agent_ro, &["/work", "/tmp"]),
             (1, 1),
-            &runner.env(),
+            &runner.env("http://kod-llm-proxy:8080/r/t"),
         ),
         runner.command(&c),
     ]
@@ -160,7 +160,7 @@ fn no_sandbox_container_gets_the_model_key() {
     }
     assert!(
         runner
-            .env()
+            .env("http://kod-llm-proxy:8080/r/t")
             .contains(&("ANTHROPIC_API_KEY".into(), "sk-kod-dummy".into())),
         "the agent gets a dummy key"
     );
