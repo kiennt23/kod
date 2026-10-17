@@ -145,7 +145,8 @@ deny contains sprintf("data class %v is not allowed in subscription mode", [c]) 
 	not sub_class_ok(c)
 }
 
-# read: the run's own ticket and the docs it links.
+# read: the run's own ticket, the rework requests Kod linked to it (the
+# run's linked_tickets), and the docs the ticket links.
 
 grant if {
 	input.action == "read"
@@ -153,6 +154,15 @@ grant if {
 	input.target.kind == "ticket"
 	named(input.run.ticket)
 	input.target.id == input.run.ticket
+}
+
+grant if {
+	input.action == "read"
+	is_agent
+	input.target.kind == "ticket"
+	named(input.target.id)
+	is_array(input.run.linked_tickets)
+	input.target.id in input.run.linked_tickets
 }
 
 grant if {

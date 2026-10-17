@@ -191,6 +191,20 @@ fn reads_are_limited_to_the_ticket_and_its_linked_docs() {
 }
 
 #[test]
+fn reads_reach_the_rework_requests_kod_linked_to_the_run() {
+    allowed(req(
+        "read",
+        json!({"target": {"kind": "ticket", "id": "KOD-2"}}),
+    ));
+    let none = set(
+        req("read", json!({"target": {"kind": "ticket", "id": "KOD-2"}})),
+        "/run/linked_tickets",
+        json!([]),
+    );
+    denied(none, "does not meet the rule");
+}
+
+#[test]
 fn null_ids_never_match() {
     let read = set(
         req("read", json!({"target": {"kind": "ticket", "id": null}})),

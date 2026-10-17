@@ -810,6 +810,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "kod-tool-gateway"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "kod-audit",
+ "kod-policy",
+ "kod-tracker",
+ "rusqlite",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "kod-tracker"
 version = "0.1.0"
 dependencies = [
