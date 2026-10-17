@@ -1,11 +1,11 @@
 use anyhow::Result;
 use kod_tracker::{
-    Delivery, Issue, Rework, ReworkKind, State, Tracker, Webhook,
+    Delivery, Issue, Rework, ReworkKind, State, TaskEvent, Tracker, Webhook,
     contract::check,
     fake::{FakeTracker, SIGNATURE, sandbox},
 };
 use std::{
-    collections::HashMap,
+    collections::HashSet,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::Mutex,
 };
@@ -24,15 +24,21 @@ fn the_fake_passes_the_contract() {
 }
 
 /// One way an adapter can be wrong.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Flaw {
     IgnoresSignatures,
     /// Accepts any request that has a signature header, whatever its value.
     ChecksPresenceOnly,
     /// Accepts a request with no signature header, but rejects a bad one.
     AcceptsUnsigned,
-    /// Keeps no delivery IDs, so a recorded webhook can be sent again.
-    AcceptsReplays,
+    /// Refuses a delivery ID it has seen, before the dispatcher stored it.
+    SpendsIds,
+    /// Reports the removal of any label, not only the trigger.
+    UnlabelsAnyLabel,
+    /// Reads no edit events.
+    IgnoresEdits,
+    /// Loses who removed the label.
+    DropsUnlabeledBy,
     EveryoneIsAMember,
     TransitionDoesNothing,
     MissingIssueIsOk,
@@ -41,8 +47,8 @@ enum Flaw {
 }
 
 /// The fake with one flaw, to show the contract catches it. `seen` holds
-/// what AcceptsReplays answered, by body.
-struct Broken(FakeTracker, Flaw, Mutex<HashMap<Vec<u8>, Option<Delivery>>>);
+/// the bodies SpendsIds has parsed.
+struct Broken(FakeTracker, Flaw, Mutex<HashSet<Vec<u8>>>);
 
 impl Tracker for Broken {
     fn name(&self) -> &str {
@@ -94,18 +100,37 @@ impl Tracker for Broken {
             Flaw::AcceptsUnsigned if request.header(SIGNATURE).is_none() => {
                 request.headers = vec![(SIGNATURE.into(), self.0.sign(&request.body))];
             }
-            Flaw::AcceptsReplays => {
-                let mut seen = self.2.lock().unwrap();
-                if let Some(d) = seen.get(&request.body) {
-                    return Ok(d.clone());
+            Flaw::UnlabelsAnyLabel => {
+                let mut v: serde_json::Value = serde_json::from_slice(&request.body)?;
+                if v["type"] == "label_removed" {
+                    v["label"] = "kod".into();
+                    request = self.0.webhook(&v);
                 }
-                let d = self.0.parse_webhook(&request)?;
-                seen.insert(request.body.clone(), d.clone());
-                return Ok(d);
             }
             _ => {}
         }
-        self.0.parse_webhook(&request)
+        let d = self.0.parse_webhook(&request)?;
+        // Only a body that parsed can be spent, as a forged one never is.
+        if self.1 == Flaw::SpendsIds && d.is_some() && !self.2.lock().unwrap().insert(request.body)
+        {
+            anyhow::bail!("a replay");
+        }
+        Ok(match (self.1, d) {
+            (
+                Flaw::IgnoresEdits,
+                Some(Delivery {
+                    event: TaskEvent::Edited { .. },
+                    ..
+                }),
+            ) => None,
+            (Flaw::DropsUnlabeledBy, Some(mut d)) => {
+                if let TaskEvent::Unlabeled { by, .. } = &mut d.event {
+                    by.clear();
+                }
+                Some(d)
+            }
+            (_, d) => d,
+        })
     }
 }
 
@@ -115,7 +140,10 @@ fn the_contract_fails_an_adapter_with_any_one_flaw() {
         (Flaw::IgnoresSignatures, "a changed body passed"),
         (Flaw::ChecksPresenceOnly, "a changed body passed"),
         (Flaw::AcceptsUnsigned, "an unsigned webhook was accepted"),
-        (Flaw::AcceptsReplays, "a replayed trigger was accepted"),
+        (Flaw::SpendsIds, "redelivered trigger"),
+        (Flaw::UnlabelsAnyLabel, "other than the trigger"),
+        (Flaw::IgnoresEdits, "an edit was not reported"),
+        (Flaw::DropsUnlabeledBy, "who removed it"),
         (Flaw::EveryoneIsAMember, "outsider"),
         (Flaw::TransitionDoesNothing, "transition to"),
         (Flaw::MissingIssueIsOk, "comment on a missing issue"),

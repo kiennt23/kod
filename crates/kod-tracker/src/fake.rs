@@ -75,8 +75,6 @@ struct Inner {
     prs: Vec<(String, String)>,
     members: HashSet<String>,
     created: u64,
-    /// Delivery IDs of the webhooks accepted so far.
-    deliveries: HashSet<String>,
 }
 
 pub struct FakeTracker {
@@ -246,11 +244,6 @@ impl Tracker for FakeTracker {
                 .with_context(|| format!("fake: the webhook has no {k}"))
         };
         let id = text("delivery").context("fake: the webhook has no delivery ID")?;
-        // Spent only now, after the signature: a forged request can't use up
-        // the ID of the real one.
-        if !self.lock().deliveries.insert(id.clone()) {
-            bail!("fake: delivery {id} was already accepted (a replay)");
-        }
         let event = match text("type")?.as_str() {
             "label_added" if text("label")? == self.mapping.trigger_label => {
                 Some(TaskEvent::Labeled {
@@ -258,6 +251,15 @@ impl Tracker for FakeTracker {
                     by: text("user")?,
                 })
             }
+            "label_removed" if text("label")? == self.mapping.trigger_label => {
+                Some(TaskEvent::Unlabeled {
+                    issue: text("issue")?,
+                    by: text("user")?,
+                })
+            }
+            "issue_edited" => Some(TaskEvent::Edited {
+                issue: text("issue")?,
+            }),
             "comment" => Some(TaskEvent::Commented {
                 issue: text("issue")?,
                 author: text("user")?,
@@ -352,6 +354,26 @@ pub fn sandbox() -> (FakeTracker, Sandbox) {
         ignored: t.webhook(
             &json!({"delivery": "d-3", "type": "label_added", "issue": "FAKE-1", "label": "frontend", "user": "dev"}),
         ),
+        untrigger: t.webhook(
+            &json!({"delivery": "d-4", "type": "label_removed", "issue": "FAKE-1", "label": "kod", "user": "po"}),
+        ),
+        untrigger_event: Delivery {
+            id: "d-4".into(),
+            event: TaskEvent::Unlabeled {
+                issue: "FAKE-1".into(),
+                by: "po".into(),
+            },
+        },
+        other_unlabel: t.webhook(
+            &json!({"delivery": "d-5", "type": "label_removed", "issue": "FAKE-1", "label": "frontend", "user": "dev"}),
+        ),
+        edited: t.webhook(&json!({"delivery": "d-6", "type": "issue_edited", "issue": "FAKE-1"})),
+        edited_event: Delivery {
+            id: "d-6".into(),
+            event: TaskEvent::Edited {
+                issue: "FAKE-1".into(),
+            },
+        },
     };
     (t, s)
 }
