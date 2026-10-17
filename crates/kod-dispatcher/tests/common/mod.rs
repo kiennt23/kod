@@ -223,6 +223,7 @@ pub fn dispatcher(
         gw,
     )
     .unwrap();
+    let d = d.with_cli_key("kiennt23", OWNER_KEY);
     Arc::new(d)
 }
 
@@ -272,6 +273,17 @@ pub fn unlabel(t: &FakeTracker, delivery: &str, issue: &str, user: &str) -> Webh
 
 pub fn edited(t: &FakeTracker, delivery: &str, issue: &str) -> Webhook {
     t.webhook(&json!({"delivery": delivery, "type": "issue_edited", "issue": issue}))
+}
+
+pub fn said(t: &FakeTracker, delivery: &str, issue: &str, user: &str, body: &str) -> Webhook {
+    t.webhook(&json!({"delivery": delivery, "type": "comment", "issue": issue, "user": user, "body": body}))
+}
+
+/// A signed CLI request and its signature.
+pub fn cli(command: &str, by: &str, at: i64, key: &[u8]) -> (Vec<u8>, String) {
+    let body = json!({"command": command, "by": by, "at": at}).to_string();
+    let sig = kod_dispatcher::command::sign(key, body.as_bytes());
+    (body.into_bytes(), sig)
 }
 
 impl Harness {
@@ -334,6 +346,11 @@ impl Harness {
             self.gw.clone(),
             Policy::load(&policy_dir()),
         )
+    }
+
+    /// Delivers a signed comment from `user` on FAKE-1.
+    pub fn say(&self, delivery: &str, user: &str, body: &str) {
+        self.deliver(&said(&self.tracker, delivery, "FAKE-1", user, body));
     }
 }
 

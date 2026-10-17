@@ -21,6 +21,7 @@ use kod_tracker::{Issue, State, TaskEvent, Tracker, Webhook};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::{
     path::Path,
     sync::{Arc, Mutex, MutexGuard},
@@ -28,6 +29,7 @@ use std::{
 };
 use store::LIVE;
 
+pub mod command;
 pub mod config;
 pub mod store;
 
@@ -201,9 +203,32 @@ pub fn revision(i: &Issue) -> String {
 /// A queued event, as the store keeps it.
 #[derive(Clone, Debug, PartialEq)]
 enum Event {
-    Labeled { issue: String, by: String },
-    Unlabeled { issue: String, by: String },
-    Edited { issue: String },
+    Labeled {
+        issue: String,
+        by: String,
+    },
+    Unlabeled {
+        issue: String,
+        by: String,
+    },
+    Edited {
+        issue: String,
+    },
+    /// `/kod kill`, `/kod resume` or `/kod cancel` in a signed comment.
+    Command {
+        issue: String,
+        by: String,
+        command: String,
+    },
+}
+
+/// The commands a signed tracker comment can give.
+pub const COMMANDS: [&str; 3] = ["kill", "resume", "cancel"];
+
+fn command_in(body: &str) -> Option<String> {
+    let line = body.lines().next()?.trim();
+    let word = line.strip_prefix("/kod ")?.trim();
+    COMMANDS.contains(&word).then(|| word.to_owned())
 }
 
 impl Event {
@@ -220,8 +245,17 @@ impl Event {
             TaskEvent::Edited { issue } => Event::Edited {
                 issue: issue.clone(),
             },
-            // Comments are instructions for a live run: sub-plan 8.
-            TaskEvent::Commented { .. } => return None,
+            // The author is the tracker's, from the signed payload. Other
+            // comments are instructions for a live run: sub-plan 8.
+            TaskEvent::Commented {
+                issue,
+                author,
+                body,
+            } => Event::Command {
+                issue: issue.clone(),
+                by: author.trim().to_ascii_lowercase(),
+                command: command_in(body)?,
+            },
         })
     }
 
@@ -229,6 +263,7 @@ impl Event {
         match self {
             Event::Labeled { issue, .. } | Event::Unlabeled { issue, .. } => issue,
             Event::Edited { issue } => issue,
+            Event::Command { issue, .. } => issue,
         }
     }
 
@@ -245,6 +280,9 @@ impl Event {
             Event::Labeled { issue, by } => json!({"type": "labeled", "issue": issue, "by": by}),
             Event::Unlabeled { issue, by } => {
                 json!({"type": "unlabeled", "issue": issue, "by": by})
+            }
+            Event::Command { issue, by, command } => {
+                json!({"type": "command", "issue": issue, "by": by, "command": command})
             }
             Event::Edited { issue } => json!({"type": "edited", "issue": issue}),
         }
@@ -267,6 +305,11 @@ impl Event {
             },
             Some("edited") => Event::Edited {
                 issue: text("issue")?,
+            },
+            Some("command") => Event::Command {
+                issue: text("issue")?,
+                by: text("by")?,
+                command: text("command")?,
             },
             _ => bail!("unknown queued event {v}"),
         })
@@ -314,6 +357,8 @@ pub struct Dispatcher {
     gateway: Arc<dyn Gateway>,
     db: Mutex<Connection>,
     global_stop: Mutex<()>,
+    /// The signed CLI's keys, by login.
+    cli_keys: HashMap<String, Vec<u8>>,
 }
 
 impl Dispatcher {
@@ -336,6 +381,7 @@ impl Dispatcher {
             gateway,
             db: Mutex::new(store::open(db)?),
             global_stop: Mutex::new(()),
+            cli_keys: HashMap::new(),
         };
         d.recover()?;
         Ok(d)
@@ -389,6 +435,13 @@ impl Dispatcher {
         )?;
         self.follow_up(now())?;
         self.follow_up(now())
+    }
+
+    /// Adds a key for the signed CLI: `login` may send signed commands.
+    pub fn with_cli_key(mut self, login: &str, key: &[u8]) -> Dispatcher {
+        self.cli_keys
+            .insert(login.trim().to_ascii_lowercase(), key.to_vec());
+        self
     }
 
     /// Checks the webhook and queues its event. Errors are store errors only;
@@ -482,7 +535,9 @@ impl Dispatcher {
     fn handle(&self, id: &str, event: &str) -> Result<()> {
         match Event::decode(&serde_json::from_str(event)?)? {
             Event::Labeled { issue, by } => self.admit(id, &issue, &by),
-            Event::Unlabeled { .. } | Event::Edited { .. } => self.done(id),
+            Event::Unlabeled { issue, by } => self.unlabeled(id, &issue, &by),
+            Event::Edited { issue } => self.edited(id, &issue),
+            Event::Command { issue, by, command } => self.command(id, &issue, &by, &command),
         }
     }
 
@@ -944,6 +999,314 @@ impl Dispatcher {
         store::stopped(&self.db(), run_id)
     }
 
+    /// Cancels the ticket's live run, if any, and marks the delivery done, in
+    /// one transaction; the stop and the tracker calls follow it. Needs no
+    /// policy and no audit log: stopping is always safe. Returns the run.
+    fn cancel(
+        &self,
+        delivery: &str,
+        ticket: &str,
+        reason: &str,
+        by: &str,
+    ) -> Result<Option<String>> {
+        let ended = {
+            let mut c = self.db();
+            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let live = [RunState::Queued, RunState::Running, RunState::Publishing];
+            let ended = match live_run(&tx, ticket)? {
+                Some((seq, _)) if Self::end(&tx, seq, RunState::Canceled, reason, &live)? => {
+                    Some(run_id(seq))
+                }
+                _ => None,
+            };
+            tx.execute("UPDATE deliveries SET done = 1 WHERE id = ?1", [delivery])?;
+            // An older trigger must not restart work after this cancellation.
+            tx.execute(
+                "UPDATE deliveries SET done = 1 WHERE ticket = ?1 AND priority = 1 AND done = 0
+                 AND rowid < (SELECT rowid FROM deliveries WHERE id = ?2)",
+                params![ticket, delivery],
+            )?;
+            tx.commit()?;
+            ended
+        };
+        self.follow_up(now())?;
+        if let Some(run) = &ended {
+            // Recorded if the log takes it; the cancel never waits on it.
+            let _ = self.audit.append(
+                RUN_AUDIT,
+                &json!({"kind": "cancel", "run": run, "by": by, "reason": reason}),
+            );
+        }
+        Ok(ended)
+    }
+
+    fn unlabeled(&self, delivery: &str, ticket: &str, by: &str) -> Result<()> {
+        let reason = format!("the trigger label was removed by {by}");
+        self.cancel(delivery, ticket, &reason, by)?;
+        Ok(())
+    }
+
+    fn edited(&self, delivery: &str, ticket: &str) -> Result<()> {
+        let live = live_run(&self.db(), ticket)?;
+        let Some((_, old)) = live else {
+            return self.done(delivery);
+        };
+        let new = revision(&self.tracker.get_issue(ticket)?);
+        if new == old {
+            return self.done(delivery);
+        }
+        self.cancel(
+            delivery,
+            ticket,
+            &format!("the ticket changed (revision {old} to {new}); it is back in ready at the new revision"),
+            "a ticket edit",
+        )?;
+        Ok(())
+    }
+
+    /// Asks the policy whether a human may act, and records the decision.
+    fn human_may(&self, input: &Value) -> Result<()> {
+        let policy = self
+            .policy
+            .as_ref()
+            .map_err(|e| anyhow!("the policy is unavailable: {e}"))?;
+        let decision = policy.decide(input);
+        self.audit
+            .record_decision(input, &decision)
+            .context("the decision could not be recorded")?;
+        if !decision.allow {
+            bail!("{}", decision.reasons.join("; "));
+        }
+        Ok(())
+    }
+
+    /// A command from a signed comment. A refusal is commented on the ticket;
+    /// the delivery is done either way.
+    fn command(&self, delivery: &str, ticket: &str, by: &str, command: &str) -> Result<()> {
+        let r = match command {
+            "kill" => self.kill(by),
+            "resume" => Err(anyhow!("resume is accepted only as a signed CLI request")),
+            _ => self.cancel_by(delivery, ticket, by),
+        };
+        let mut c = self.db();
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Err(e) = r {
+            follow(
+                &tx,
+                "comment",
+                ticket,
+                &format!("Kod did not {command} for {by}: {}.", scrub(&e)),
+            )?;
+        }
+        tx.execute("UPDATE deliveries SET done = 1 WHERE id = ?1", [delivery])?;
+        tx.commit()?;
+        drop(c);
+        self.follow_up(now())
+    }
+
+    /// `/kod cancel`: the owner or backup always; anyone else, such as a
+    /// tech lead, through the policy.
+    fn cancel_by(&self, delivery: &str, ticket: &str, by: &str) -> Result<()> {
+        let Some((seq, _)) = live_run(&self.db(), ticket)? else {
+            bail!("{ticket} has no live run");
+        };
+        if !self.config.may_always_stop(by) {
+            let run = run_id(seq);
+            self.human_may(&json!({
+                "action": "cancel",
+                "scope": "run",
+                "actor": {"kind": "human", "login": by},
+                "run": {"id": run},
+                "target": {"run": run},
+            }))?;
+        }
+        self.cancel(delivery, ticket, &format!("canceled by {by}"), by)?;
+        Ok(())
+    }
+
+    /// The kill switch: cancel every live run, stop every sandbox, and refuse
+    /// new runs until `resume`. `by` is an authenticated identity: the
+    /// author of a signed comment, or the signer of a CLI request. The
+    /// owner's or backup's works without the policy or the audit log;
+    /// anyone else's goes through both. The gateway's `stop_all` is called
+    /// even if the store fails.
+    fn kill(&self, by: &str) -> Result<()> {
+        if !self.config.may_always_stop(by) {
+            self.human_may(&json!({
+                "action": "cancel",
+                "scope": "all",
+                "actor": {"kind": "human", "login": by},
+            }))
+            .with_context(|| format!("{by} may not use the kill switch"))?;
+        }
+        let stop = self.global_stop.lock().unwrap_or_else(|e| e.into_inner());
+        let ended = (|| -> Result<(i64, Vec<String>)> {
+            let mut c = self.db();
+            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute(
+                "INSERT INTO control (id, halted, by) VALUES (1, 1, ?1)
+                 ON CONFLICT (id) DO UPDATE SET halted = 1, by = ?1",
+                [by],
+            )?;
+            let ended: Vec<(i64, String)> = tx
+                .prepare(&format!(
+                    "UPDATE runs SET state = 'canceled', reason = ?1 WHERE state IN {LIVE} RETURNING seq, ticket"
+                ))?
+                .query_map([format!("the kill switch, by {by}")], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            let runs: Vec<String> = ended.iter().map(|(seq, _)| run_id(*seq)).collect();
+            for (seq, ticket) in ended {
+                follow(&tx, "revoke", &run_id(seq), "")?;
+                follow(&tx, "stop", &run_id(seq), "")?;
+                follow(&tx, "transition", &ticket, State::Ready.name())?;
+                follow(
+                    &tx,
+                    "comment",
+                    &ticket,
+                    &format!(
+                        "Kod {} ended canceled: the kill switch, by {by}.",
+                        run_id(seq)
+                    ),
+                )?;
+            }
+            let epoch = Self::epoch(&tx)?;
+            tx.commit()?;
+            Ok((epoch, runs))
+        })();
+        let mut errors = vec![];
+        let epoch = match &ended {
+            Ok((epoch, _)) => Some(*epoch),
+            Err(_) => match Self::epoch(&self.db()) {
+                Ok(epoch) => Some(epoch),
+                Err(e) => {
+                    errors.push(format!("the kill epoch could not be read: {}", scrub(&e)));
+                    None
+                }
+            },
+        };
+        if let Ok((_, runs)) = &ended {
+            for run in runs {
+                if let Err(e) = self.gateway.revoke(run) {
+                    errors.push(format!(
+                        "the credential revoke for {run} failed: {}",
+                        scrub(&e)
+                    ));
+                }
+            }
+        }
+        let stopped = self.gateway.stop_all();
+        if self.config.may_always_stop(by) {
+            let _ = self
+                .audit
+                .append(RUN_AUDIT, &json!({"kind": "kill_switch", "by": by}));
+        }
+        if stopped.is_err()
+            && let Some(epoch) = epoch
+            && let Err(e) = follow(&self.db(), "stop_all", "", &epoch.to_string())
+        {
+            errors.push(format!(
+                "the global stop retry could not be queued: {}",
+                scrub(&e)
+            ));
+        }
+        drop(stop);
+        let _ = self.follow_up(now());
+        if let Err(e) = ended {
+            errors.push(format!("the store did not take it: {}", scrub(&e)));
+        }
+        if let Err(e) = stopped {
+            errors.push(format!(
+                "the gateway did not confirm it stopped the runs: {}",
+                scrub(&e)
+            ));
+        }
+        if !errors.is_empty() {
+            bail!("the kill switch is not complete: {}", errors.join("; "));
+        }
+        Ok(())
+    }
+
+    /// Lifts the kill switch: the owner or backup only, from a signed CLI
+    /// request (never a tracker comment), and through the policy. A stop of
+    /// every sandbox still waiting for a retry is dropped; the kill's runs
+    /// keep their own stops.
+    fn resume(&self, by: &str) -> Result<()> {
+        if !self.config.may_always_stop(by) {
+            bail!("only the owner or backup may resume");
+        }
+        let _stop = match self.global_stop.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                bail!("a global stop is still in flight; retry resume after it returns")
+            }
+        };
+        self.human_may(&json!({
+            "action": "resume",
+            "scope": "all",
+            "actor": {"kind": "human", "login": by},
+        }))
+        .with_context(|| format!("{by} may not resume"))?;
+        self.db().execute(
+            "INSERT INTO control (id, halted, by) VALUES (1, 0, ?1)
+             ON CONFLICT (id) DO UPDATE SET halted = 0, by = ?1, epoch = epoch + 1",
+            [by],
+        )?;
+        Ok(())
+    }
+
+    /// A request from the signed CLI: a JSON body
+    /// `{"command": "kill" | "resume", "by": login, "at": unix seconds}`
+    /// signed with `by`'s key (`command::sign`). Refused unless the
+    /// signature matches, `at` is within `command::WINDOW` of `now`, and
+    /// the same body was never seen before.
+    pub fn signed_command(&self, body: &[u8], signature: &str, now: i64) -> Result<String> {
+        let v: Value = serde_json::from_slice(body).context("the request is not JSON")?;
+        let by = v["by"]
+            .as_str()
+            .context("the request has no by")?
+            .trim()
+            .to_ascii_lowercase();
+        let key = self
+            .cli_keys
+            .get(&by)
+            .with_context(|| format!("{by} has no CLI key"))?;
+        if !command::verify(key, body, signature) {
+            bail!("the signature does not match");
+        }
+        let at = v["at"].as_i64().context("the request has no at")?;
+        if now.abs_diff(at) > command::WINDOW as u64 {
+            bail!("the request is more than {} s old", command::WINDOW);
+        }
+        let fresh = self.db().execute(
+            "INSERT OR IGNORE INTO deliveries (id, delivery, ticket, event, priority, done)
+             VALUES (?1, 'cli', '', ?2, 0, 1)",
+            params![hex(&Sha256::digest(body)), v.to_string()],
+        );
+        let fresh = match fresh {
+            Ok(fresh) => fresh,
+            Err(e) if v["command"] == "kill" && self.config.may_always_stop(&by) => {
+                let stopped = self.kill(&by);
+                bail!(
+                    "the command could not be recorded: {}; emergency stop: {}",
+                    scrub(&e.into()),
+                    stopped.map_or_else(|e| scrub(&e), |()| "completed".to_owned())
+                );
+            }
+            Err(e) => return Err(e.into()),
+        };
+        if fresh == 0 {
+            bail!("the request was already used");
+        }
+        match v["command"].as_str() {
+            Some("kill") => self.kill(&by).map(|()| "killed".to_owned()),
+            Some("resume") => self.resume(&by).map(|()| "resumed".to_owned()),
+            _ => bail!("unknown command {}", v["command"]),
+        }
+    }
+
     pub fn is_halted(&self) -> Result<bool> {
         Self::halted(&self.db())
     }
@@ -979,9 +1342,12 @@ impl Dispatcher {
 
 /// The routes: `POST /webhook` answers 202 queued, 200 duplicate or
 /// ignored, 401 refused, 500 when the store fails (the tracker retries).
+/// `POST /command` takes a signed CLI request, its signature in
+/// `x-kod-signature`: 200 done, 403 refused or failed, with the reason.
 pub fn router(dispatcher: Arc<Dispatcher>) -> Router {
     Router::new()
         .route("/webhook", post(webhook))
+        .route("/command", post(cli))
         .with_state(dispatcher)
 }
 
@@ -1003,5 +1369,22 @@ async fn webhook(
         Ok(Ok(Received::Ignored)) => (StatusCode::OK, "ignored".into()),
         Ok(Ok(Received::Refused(_))) => (StatusCode::UNAUTHORIZED, "refused".into()),
         Ok(Err(_)) | Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "error".into()),
+    }
+}
+
+async fn cli(
+    Shared(d): Shared<Arc<Dispatcher>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> (StatusCode, String) {
+    let signature = headers
+        .get(command::SIGNATURE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    match tokio::task::spawn_blocking(move || d.signed_command(&body, &signature, now())).await {
+        Ok(Ok(done)) => (StatusCode::OK, done),
+        Ok(Err(e)) => (StatusCode::FORBIDDEN, scrub(&e)),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "error".into()),
     }
 }
