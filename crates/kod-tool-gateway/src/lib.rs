@@ -2,23 +2,37 @@
 //! and docs tools. Every call is checked by kod-policy and recorded in the
 //! audit log before it acts; a call that can't be decided or recorded
 //! doesn't happen. A canceled run gets nothing.
+//!
+//! Publish is not a tool. The host calls `Gateway::publish` with a run ID
+//! once the run has ended; the change comes from the host's own collector
+//! (`Workspace`), never from the sandbox.
 use anyhow::bail;
+use anyhow::{Context, anyhow};
+use broker::Broker;
 use docs::Docs;
+use forge::{Change, Commit, Forge, Identity, Workspace};
 use kod_audit::{AuditLog, RUN_AUDIT, redact::REDACTED};
 use kod_policy::Policy;
 use kod_tracker::{Issue, Rework, ReworkKind, State, Tracker};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
 };
 
+pub mod broker;
 pub mod docs;
+pub mod forge;
 
 /// A run token is at least this many lower-case hex characters, as in the
 /// LLM gateway.
 pub const MIN_TOKEN_LEN: usize = 32;
+/// At most this many files in one publish.
+pub const MAX_FILES: usize = 1000;
+/// At most this many bytes of file text in one publish.
+pub const MAX_PUBLISH_BYTES: usize = 8 << 20;
 /// The moves the agent may make on its own ticket. Review and done are the
 /// dispatcher's, on publish.
 pub const AGENT_TRANSITIONS: [(State, State); 2] = [
@@ -70,14 +84,26 @@ pub struct Adapters {
     pub tracker: Arc<dyn Tracker>,
     pub docs: Arc<dyn Docs>,
     pub stopped: Stopped,
+    pub broker: Arc<dyn Broker>,
+    pub forge: Arc<dyn Forge>,
+    pub workspace: Arc<dyn Workspace>,
 }
 
 pub struct Gateway {
     policy: Arc<Policy>,
     audit: Arc<AuditLog>,
     adapters: Adapters,
+    agent: Identity,
     /// Keyed by the token's SHA-256, as in the LLM gateway.
     runs: Mutex<HashMap<String, Live>>,
+}
+
+/// What a publish made.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Published {
+    pub branch: String,
+    pub commit: String,
+    pub pr: String,
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -137,16 +163,45 @@ fn issue_json(i: &Issue) -> Value {
     })
 }
 
+/// The collected change, checked for shape and size. Path rules are the
+/// policy's.
+fn check_changes(changes: &[Change]) -> Result<(), String> {
+    if changes.is_empty() || changes.len() > MAX_FILES {
+        return Err(format!(
+            "the change must have 1 to {MAX_FILES} files, it has {}",
+            changes.len()
+        ));
+    }
+    let mut seen = HashSet::new();
+    if let Some(c) = changes.iter().find(|c| !seen.insert(&c.path)) {
+        return Err(format!("{} is in the change twice", c.path));
+    }
+    let bytes: usize = changes
+        .iter()
+        .map(|c| c.content.as_ref().map_or(0, String::len))
+        .sum();
+    if bytes > MAX_PUBLISH_BYTES {
+        return Err(format!("the change is over {MAX_PUBLISH_BYTES} bytes"));
+    }
+    Ok(())
+}
+
 impl Gateway {
+    /// Fails if the agent identity is not a usable committer.
     pub fn new(
         policy: Arc<Policy>,
         audit: Arc<AuditLog>,
         adapters: Adapters,
+        agent: Identity,
     ) -> anyhow::Result<Gateway> {
+        if !named(&agent.name) || !named(&agent.email) || !agent.email.contains('@') {
+            bail!("the agent identity needs a name and an email address, each on one line");
+        }
         Ok(Gateway {
             policy,
             audit,
             adapters,
+            agent,
             runs: Mutex::default(),
         })
     }
@@ -195,16 +250,20 @@ impl Gateway {
         Ok(())
     }
 
-    /// Stops serving a run: its token stops working. Safe to repeat. The
-    /// dispatcher calls it when the run ends, however it ends.
+    /// Stops serving a run: its token stops working and every credential
+    /// minted for it is revoked. Safe to repeat. The dispatcher calls it
+    /// when the run ends, however it ends.
     pub fn end_run(&self, run_id: &str) -> anyhow::Result<()> {
         self.lock().retain(|_, l| l.run.id != run_id);
+        self.adapters.broker.revoke(run_id)?;
         Ok(())
     }
 
-    /// The kill switch: stop serving every run.
+    /// The kill switch: stop serving every run and revoke every agent
+    /// credential.
     pub fn end_all(&self) -> anyhow::Result<()> {
         self.lock().clear();
+        self.adapters.broker.revoke_all()?;
         Ok(())
     }
 
@@ -405,5 +464,144 @@ impl Gateway {
         })?;
         self.update(&run.id, |l| l.created.push(key.clone()));
         Ok(json!({"key": key}))
+    }
+
+    /// Publishes a run's collected change to `agent/<ticket>-<run>` and
+    /// opens a draft PR. Host only: the dispatcher calls it when the runner
+    /// reports the run done. Idempotent: a retry makes the same commit and
+    /// finds the same PR. The run's credential is revoked when it returns.
+    pub fn publish(&self, run_id: &str) -> Result<Published, String> {
+        let live = self
+            .lock()
+            .values()
+            .find(|l| l.run.id == run_id)
+            .cloned()
+            .ok_or("unknown run")?;
+        let r = self.publish_live(&live);
+        if let Err(e) = self.adapters.broker.revoke(run_id) {
+            let _ = self.audit.append(
+                RUN_AUDIT,
+                &json!({"kind": "revoke_failed", "run": run_id, "error": scrub(&format!("{e:#}"))}),
+            );
+        }
+        r.map_err(|e| scrub(&e))
+    }
+
+    fn publish_live(&self, live: &Live) -> Result<Published, String> {
+        let run = &live.run;
+        self.not_stopped(&run.id)?;
+        let collected = self
+            .adapters
+            .workspace
+            .collected(&run.id)
+            .map_err(|e| format!("reading the collected change failed: {e:#}"))?;
+        let files = collected.changes;
+        check_changes(&files)?;
+        let paths: Vec<&str> = files.iter().map(|c| c.path.as_str()).collect();
+        let branch = format!("agent/{}-{}", run.ticket, run.id);
+        self.allow(json!({
+            "action": "publish",
+            "actor": {"kind": "agent"},
+            "run": {
+                "id": run.id,
+                "ticket": run.ticket,
+                "repo": run.repo,
+                "canceled": false,
+                "data_classes": live.run.data_classes,
+            },
+            "target": {"repo": run.repo, "branch": branch, "draft": true},
+            "changed_paths": paths,
+        }))?;
+        let issue = self.own_issue(run)?;
+        let tracker = self.adapters.tracker.name();
+        let a = &self.agent;
+        let message = format!(
+            "{}\n\nKod-Ticket: {tracker}:{}\nKod-Run: {}\nCo-Authored-By: {} <{}>\n",
+            issue.title, run.ticket, run.id, a.name, a.email
+        );
+        let pinned: String = issue
+            .approved_versions
+            .iter()
+            .map(|v| format!("- {v}\n"))
+            .collect();
+        let changed: String = paths.iter().map(|p| format!("- {p}\n")).collect();
+        let body = format!(
+            "Ticket: {tracker}:{}\nRequirement: {}\nRun: {}\n\nPinned inputs:\n{pinned}\nChanged files:\n{changed}\nTest evidence:\n{}\n",
+            run.ticket,
+            issue.requirement_id.as_deref().unwrap_or("none"),
+            run.id,
+            collected.test_evidence,
+        );
+        let pr_title = format!("{}: {}", run.ticket, issue.title);
+        let target =
+            json!({"repo": run.repo, "branch": branch, "draft": true, "changed_paths": paths});
+        let (f, t) = (&self.adapters.forge, &self.adapters.tracker);
+        let (sha, pr) = self.act(run, "publish", target, || {
+            let token = self.adapters.broker.mint(&run.id, &run.repo)?;
+            let canceled = || self.not_stopped(&run.id).is_err();
+            let push = || -> anyhow::Result<(String, String)> {
+                let commit = Commit {
+                    repo: run.repo.clone(),
+                    base: run.base.clone(),
+                    changes: files,
+                    message,
+                    committer: a.clone(),
+                    date: run.started_at,
+                };
+                let sha = f.commit(&token, &commit)?;
+                // A cancel can land at any time; check right before each
+                // step anyone else can see.
+                if canceled() {
+                    bail!("the run was canceled during publish");
+                }
+                f.set_branch(&token, &run.repo, &branch, &sha)?;
+                if canceled() {
+                    // Cancellation may already have revoked the push token.
+                    let cleanup = self.adapters.broker.mint(&run.id, &run.repo)?;
+                    f.delete_branch(&cleanup, &run.repo, &branch)
+                        .map_err(|e| {
+                            anyhow!("{}", format!("{e:#}").replace(cleanup.expose(), REDACTED))
+                        })
+                        .context("the run was canceled during publish; deleting its branch")?;
+                    bail!("the run was canceled during publish");
+                }
+                let pr = match f.find_pr(&token, &run.repo, &branch)? {
+                    Some(url) => url,
+                    None => f.open_draft_pr(&token, &run.repo, &branch, &pr_title, &body)?,
+                };
+                t.link_pr(&run.ticket, &pr)
+                    .context("linking the PR to the ticket")?;
+                Ok((sha, pr))
+            };
+            // An adapter error can echo the credential; it never leaves here.
+            push().map_err(|e| anyhow!("{}", format!("{e:#}").replace(token.expose(), REDACTED)))
+        })?;
+        Ok(Published {
+            branch,
+            commit: sha,
+            pr,
+        })
+    }
+
+    /// The draft PR a publish of this run opened, if any: how the dispatcher
+    /// settles a run it found in `publishing` after a restart.
+    pub fn published(
+        &self,
+        repo: &str,
+        ticket: &str,
+        run_id: &str,
+    ) -> Result<Option<String>, String> {
+        let branch = format!("agent/{ticket}-{run_id}");
+        let b = &self.adapters.broker;
+        let found = b.mint(run_id, repo).and_then(|token| {
+            self.adapters
+                .forge
+                .find_pr(&token, repo, &branch)
+                .map_err(|e| anyhow!("{}", format!("{e:#}").replace(token.expose(), REDACTED)))
+        });
+        let revoked = b.revoke(run_id);
+        let found = found.map_err(|e| scrub(&format!("{e:#}")))?;
+        revoked.map_err(|e| scrub(&format!("{e:#}")))?;
+        Ok(found)
     }
 }

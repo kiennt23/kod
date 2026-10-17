@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 use kod_audit::AuditLog;
 use kod_policy::Policy;
+use kod_tool_gateway::forge::{Change, Collected, FakeGitHub, FakeWorkspace, Identity};
 use kod_tool_gateway::{Adapters, Gateway, Run, docs::FakeDocs};
 use kod_tracker::fake::{self, FakeIssue, FakeTracker};
 use std::{
@@ -35,6 +36,8 @@ pub struct Harness {
     pub gw: Arc<Gateway>,
     pub tracker: Arc<FakeTracker>,
     pub docs: Arc<FakeDocs>,
+    pub github: Arc<FakeGitHub>,
+    pub workspace: Arc<FakeWorkspace>,
     pub runs: Arc<Runs>,
     pub audit: PathBuf,
     _dir: tempfile::TempDir,
@@ -49,6 +52,24 @@ pub fn run() -> Run {
         data_classes: vec!["placeholder".into()],
         linked_tickets: vec![REWORK.into()],
         started_at: 1_700_000_000,
+    }
+}
+
+/// What the collector found for a run that changed `path` and deleted
+/// old.rs.
+pub fn collected(path: &str) -> Collected {
+    Collected {
+        changes: vec![
+            Change {
+                path: path.into(),
+                content: Some("fn hold() {}\n".into()),
+            },
+            Change {
+                path: "old.rs".into(),
+                content: None,
+            },
+        ],
+        test_evidence: "cargo test: 12 passed".into(),
     }
 }
 
@@ -92,17 +113,30 @@ pub fn harness() -> Harness {
         }
         Ok(r.stopped.lock().unwrap().contains(run))
     });
+    let github = Arc::new(FakeGitHub::default());
+    github.add_repo("acme/app", BASE);
+    let workspace = Arc::new(FakeWorkspace::default());
+    workspace.set("run-1", collected("src/refund.rs"));
     let adapters = Adapters {
         tracker: tracker.clone(),
         docs: docs.clone(),
         stopped,
+        broker: github.clone(),
+        forge: github.clone(),
+        workspace: workspace.clone(),
     };
-    let gw = Arc::new(Gateway::new(policy, log, adapters).unwrap());
+    let agent = Identity {
+        name: "kod-agent".into(),
+        email: "kod-agent@users.noreply.example".into(),
+    };
+    let gw = Arc::new(Gateway::new(policy, log, adapters, agent).unwrap());
     gw.start_run(TOKEN, run()).unwrap();
     Harness {
         gw,
         tracker,
         docs,
+        github,
+        workspace,
         runs,
         audit,
         _dir: dir,
