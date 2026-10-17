@@ -769,8 +769,13 @@ dependencies = [
  "anyhow",
  "axum",
  "futures-util",
+ "kod-audit",
+ "kod-policy",
  "reqwest",
+ "rusqlite",
  "serde_json",
+ "sha2",
+ "tempfile",
  "tokio",
 ]
 
@@ -781,7 +786,9 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "kod-audit",
  "kod-llm-proxy",
+ "kod-policy",
  "libc",
  "reqwest",
  "serde",

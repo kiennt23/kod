@@ -43,7 +43,10 @@ impl Client {
             .header("content-type", "application/json")
             .body(body.to_string())
             .send()
-            .map_err(|e| ApiError::Transient(format!("request failed: {e}"), None))?;
+            // The URL holds the run's gateway token, a credential.
+            .map_err(|e| {
+                ApiError::Transient(format!("request failed: {}", e.without_url()), None)
+            })?;
         let status = r.status();
         let retry_after = r
             .headers()

@@ -174,3 +174,92 @@ fn limits_are_whole_numbers_above_zero() {
         assert_eq!(e, "KOD_MAX_CONCURRENT must be a whole number above zero");
     }
 }
+
+/// The binary refuses to start, and never prints "ready", on a bad file or a
+/// missing setting.
+#[test]
+fn the_gateway_does_not_start_on_bad_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = |f: &str| dir.path().join(f);
+    std::fs::write(
+        path("prices.json"),
+        r#"{"claude-test-1":{"input":1,"output":1,"cache_write":1,"cache_read":1}}"#,
+    )
+    .unwrap();
+    std::fs::write(path("runs.json"), run(GOOD_RUN)).unwrap();
+    std::fs::write(path("bad-runs.json"), r#"{"abc":{}}"#).unwrap();
+    let policy = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../policy");
+    let start = |runs: &str, skip: &str, set: (&str, &str)| {
+        let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_kod-llm-proxy"));
+        c.env_clear()
+            .env("KOD_API_KEY", "k")
+            .env("KOD_ENDPOINT", "placeholder")
+            .env("KOD_UPSTREAM", "http://127.0.0.1:9")
+            .env("KOD_ALLOWED_MODELS", "claude-test-1")
+            .env("KOD_PRICES", path("prices.json"))
+            .env("KOD_RUNS", path(runs))
+            .env("KOD_POLICY_DIR", &policy)
+            .env("KOD_AUDIT_DB", path("audit.db"))
+            .env("KOD_LISTEN", "127.0.0.1:0")
+            .env_remove(skip);
+        if !set.0.is_empty() {
+            c.env(set.0, set.1);
+        }
+        c.output().unwrap()
+    };
+    let none = ("", "");
+    for (runs, skip, set, want) in [
+        ("bad-runs.json", "", none, "at least 32 lower-case hex"),
+        ("runs.json", "KOD_PRICES", none, "KOD_PRICES is required"),
+        ("runs.json", "KOD_RUNS", none, "KOD_RUNS is required"),
+        (
+            "runs.json",
+            "KOD_POLICY_DIR",
+            none,
+            "KOD_POLICY_DIR is required",
+        ),
+        (
+            "runs.json",
+            "KOD_AUDIT_DB",
+            none,
+            "KOD_AUDIT_DB is required",
+        ),
+        (
+            "runs.json",
+            "KOD_ENDPOINT",
+            none,
+            "KOD_ENDPOINT is required",
+        ),
+        (
+            "runs.json",
+            "KOD_UPSTREAM",
+            none,
+            "KOD_UPSTREAM is required",
+        ),
+        ("missing.json", "", none, "KOD_RUNS: reading"),
+        (
+            "runs.json",
+            "",
+            ("KOD_MAX_CONCURRENT", "0"),
+            "KOD_MAX_CONCURRENT must be a whole number above zero",
+        ),
+        (
+            "runs.json",
+            "",
+            ("KOD_ALLOWED_PATHS", "/v1/messages/batches"),
+            "/v1/messages/batches is not one of",
+        ),
+        (
+            "runs.json",
+            "",
+            ("KOD_ENDPOINT", " "),
+            "KOD_ENDPOINT must be",
+        ),
+    ] {
+        let out = start(runs, skip, set);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{runs} {skip} {set:?}");
+        assert!(err.contains(want), "{runs} {skip} {set:?}: {err}");
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("ready"));
+    }
+}
