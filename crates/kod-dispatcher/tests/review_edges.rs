@@ -423,6 +423,7 @@ fn a_kill_queues_its_stop_all_retry_before_the_audit_append() {
 #[test]
 fn a_resume_waiting_on_the_audit_log_does_not_delay_a_kill() {
     let h = harness();
+    h.gw.fail_stop_all.store(true, Ordering::SeqCst);
     let lock = hold_audit(&h);
     let d = h.d.clone();
     let resume = std::thread::spawn(move || {
@@ -435,11 +436,21 @@ fn a_resume_waiting_on_the_audit_log_does_not_delay_a_kill() {
         let (body, sig) = cli("kill", "kiennt23", NOW + 1, OWNER_KEY);
         d.signed_command(&body, &sig, NOW + 1)
     });
-    wait_for("the kill", || h.gw.calls().contains(&"stop_all".to_owned()));
+    wait_for("the kill", || {
+        h.count("SELECT count(*) FROM followups WHERE kind = 'stop_all'") == 1
+    });
     lock.execute_batch("ROLLBACK").unwrap();
-    // Whether the resume lands after the kill is not the point.
-    let _ = resume.join().unwrap();
-    kill.join().unwrap().unwrap();
+    // The kill landed while the resume was waiting: the resume must not
+    // undo it.
+    let e = format!("{:#}", resume.join().unwrap().unwrap_err());
+    assert!(e.contains("a kill landed during the resume"), "{e}");
+    assert!(kill.join().unwrap().is_err(), "stop_all was set to fail");
+    assert!(h.d.is_halted().unwrap());
+    assert_eq!(
+        h.count("SELECT count(*) FROM followups WHERE kind = 'stop_all' AND done = 0"),
+        1,
+        "the kill's retry is still pending"
+    );
 }
 
 #[test]

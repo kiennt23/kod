@@ -659,6 +659,15 @@ impl Dispatcher {
         )
     }
 
+    /// Counts the kills the store took; a resume compares it across its wait.
+    fn kills(c: &Connection) -> Result<i64> {
+        Ok(
+            c.query_row("SELECT kills FROM control WHERE id = 1", [], |r| r.get(0))
+                .optional()?
+                .unwrap_or(0),
+        )
+    }
+
     fn halted(c: &Connection) -> Result<bool> {
         Ok(
             c.query_row("SELECT halted FROM control WHERE id = 1", [], |r| {
@@ -1150,8 +1159,8 @@ impl Dispatcher {
             let mut c = self.db();
             let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
             tx.execute(
-                "INSERT INTO control (id, halted, by) VALUES (1, 1, ?1)
-                 ON CONFLICT (id) DO UPDATE SET halted = 1, by = ?1",
+                "INSERT INTO control (id, halted, by, kills) VALUES (1, 1, ?1, 1)
+                 ON CONFLICT (id) DO UPDATE SET halted = 1, by = ?1, kills = kills + 1",
                 [by],
             )?;
             let ended: Vec<(i64, String)> = tx
@@ -1245,6 +1254,7 @@ impl Dispatcher {
         }
         // The policy and the audit log are asked before the lock is taken, so
         // a slow one never holds up a kill.
+        let kills = Self::kills(&self.db())?;
         self.human_may(&json!({
             "action": "resume",
             "scope": "all",
@@ -1258,6 +1268,11 @@ impl Dispatcher {
                 bail!("a global stop is still in flight; retry resume after it returns")
             }
         };
+        // ponytail: a kill whose store write failed leaves no marker, so a
+        // resume can still pass it; its stop_all retry is then what is lost.
+        if Self::kills(&self.db())? != kills {
+            bail!("a kill landed during the resume; retry with a fresh signed request");
+        }
         self.db().execute(
             "INSERT INTO control (id, halted, by) VALUES (1, 0, ?1)
              ON CONFLICT (id) DO UPDATE SET halted = 0, by = ?1, epoch = epoch + 1",
