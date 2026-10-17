@@ -93,16 +93,57 @@ fn the_signature_is_hmac_sha256() {
     );
 }
 
-/// A request that fails the signature check doesn't use up its delivery ID,
-/// so a forger can't block the real delivery; the ID is spent once the real
-/// one is accepted, and a signed request with no ID is refused.
+/// The fake keeps no delivery IDs: a redelivery parses again, for the
+/// dispatcher to refuse after its own write. A signed request with no ID is
+/// refused.
 #[test]
-fn delivery_ids_are_spent_only_by_signed_requests() {
+fn the_fake_spends_no_delivery_ids() {
     let (t, s) = sandbox();
     assert!(t.parse_webhook(&s.tampered).is_err());
-    assert!(t.parse_webhook(&s.trigger).unwrap().is_some());
-    let e = t.parse_webhook(&s.trigger).unwrap_err().to_string();
-    assert!(e.contains("already accepted"), "{e}");
+    assert_eq!(
+        t.parse_webhook(&s.trigger).unwrap(),
+        Some(s.trigger_event.clone())
+    );
+    assert_eq!(t.parse_webhook(&s.trigger).unwrap(), Some(s.trigger_event));
     let e = t.parse_webhook(&s.unidentified).unwrap_err().to_string();
     assert!(e.contains("no delivery ID"), "{e}");
+}
+
+#[test]
+fn label_removal_and_edits_are_task_events() {
+    let (t, _) = sandbox();
+    let parse = |body| t.parse_webhook(&t.webhook(&body)).unwrap();
+    assert_eq!(
+        parse(
+            json!({"delivery": "e1", "type": "label_removed", "issue": "FAKE-1", "label": "kod", "user": "dev"})
+        ),
+        Some(Delivery {
+            id: "e1".into(),
+            event: TaskEvent::Unlabeled {
+                issue: "FAKE-1".into(),
+                by: "dev".into()
+            }
+        })
+    );
+    assert_eq!(
+        parse(json!({"delivery": "e2", "type": "issue_edited", "issue": "FAKE-1"})),
+        Some(Delivery {
+            id: "e2".into(),
+            event: TaskEvent::Edited {
+                issue: "FAKE-1".into()
+            }
+        })
+    );
+    // Another label coming off is not ours.
+    assert_eq!(
+        parse(
+            json!({"delivery": "e3", "type": "label_removed", "issue": "FAKE-1", "label": "frontend", "user": "dev"})
+        ),
+        None
+    );
+    // Signed but without its issue: an error, not a quiet None.
+    assert!(
+        t.parse_webhook(&t.webhook(&json!({"delivery": "e4", "type": "issue_edited"})))
+            .is_err()
+    );
 }

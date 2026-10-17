@@ -34,6 +34,14 @@ pub struct Sandbox {
     pub comment_event: Delivery,
     /// A recorded, signed webhook that is not a task event.
     pub ignored: Webhook,
+    /// A recorded webhook removing the trigger label, and its delivery.
+    pub untrigger: Webhook,
+    pub untrigger_event: Delivery,
+    /// A recorded webhook removing some other label: not a task event.
+    pub other_unlabel: Webhook,
+    /// A recorded webhook for an edit of the story's fields, and its delivery.
+    pub edited: Webhook,
+    pub edited_event: Delivery,
 }
 
 pub fn check(t: &dyn Tracker, s: &Sandbox) {
@@ -125,8 +133,7 @@ pub fn check(t: &dyn Tracker, s: &Sandbox) {
     );
 
     let parse = |w: &Webhook| t.parse_webhook(w);
-    // Forgeries first, while the trigger's delivery ID is unspent, so only a
-    // signature check can refuse them; they are errors, never a quiet None.
+    // Forgeries are errors, never a quiet None.
     assert!(
         parse(&s.tampered).is_err(),
         "a changed body passed the signature check"
@@ -152,12 +159,32 @@ pub fn check(t: &dyn Tracker, s: &Sandbox) {
         Some(s.comment_event.clone())
     );
     assert_eq!(parse(&s.ignored).expect("ignored webhook"), None);
-    assert!(
-        parse(&s.trigger).is_err(),
-        "a replayed trigger was accepted"
+    assert_eq!(
+        parse(&s.untrigger).expect("untrigger webhook"),
+        Some(s.untrigger_event.clone()),
+        "the unlabel was not reported with who removed it"
     );
-    assert!(
-        parse(&s.comment).is_err(),
-        "a replayed comment was accepted"
+    assert_eq!(
+        parse(&s.other_unlabel).expect("other unlabel webhook"),
+        None,
+        "removing a label other than the trigger is not a task event"
+    );
+    assert_eq!(
+        parse(&s.edited).expect("edited webhook"),
+        Some(s.edited_event.clone()),
+        "an edit was not reported"
+    );
+    // The adapter keeps no state: a redelivery parses the same, and the
+    // dispatcher's store, not the adapter, refuses it as a duplicate. An
+    // adapter that spent IDs would lose an event whose first write failed.
+    assert_eq!(
+        parse(&s.trigger).expect("redelivered trigger"),
+        Some(s.trigger_event.clone()),
+        "a redelivery parsed differently"
+    );
+    assert_eq!(
+        parse(&s.comment).expect("redelivered comment"),
+        Some(s.comment_event.clone()),
+        "a redelivery parsed differently"
     );
 }
