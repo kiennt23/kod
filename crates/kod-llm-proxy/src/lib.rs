@@ -11,6 +11,9 @@
 //! allowed /v1/messages request with a 2xx response gets a second line, event
 //! "usage", when its response body ends, with the token counts the response
 //! reported (null when it reported none or the stream ended early).
+pub mod budget;
+pub mod config;
+
 use axum::{
     Router,
     body::{Body, to_bytes},
