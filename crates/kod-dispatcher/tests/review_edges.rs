@@ -370,3 +370,112 @@ fn overdue_global_stop_alert_does_not_depend_on_audit() {
         "{alerts:?}"
     );
 }
+
+fn hold_audit(h: &Harness) -> rusqlite::Connection {
+    let lock = rusqlite::Connection::open(&h.audit).unwrap();
+    lock.execute_batch("BEGIN EXCLUSIVE").unwrap();
+    lock
+}
+
+fn wait_for(what: &str, f: impl Fn() -> bool) {
+    let end = std::time::Instant::now() + Duration::from_millis(1000);
+    while !f() {
+        assert!(
+            std::time::Instant::now() < end,
+            "{what} waited on the audit log"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn an_edit_cancels_the_run_when_the_tracker_is_down() {
+    let h = harness();
+    h.running();
+    *h.flaky.fail_issue.lock().unwrap() = Some("FAKE-1".into());
+    h.deliver(&edited(&h.tracker, "e-1", "FAKE-1"));
+    assert_eq!(h.states(), [("run-1".to_owned(), "canceled")]);
+    assert_eq!(
+        h.count("SELECT count(*) FROM runs WHERE reason LIKE '%revision unknown%'"),
+        1
+    );
+    assert_eq!(h.count("SELECT count(*) FROM deliveries WHERE done = 0"), 0);
+}
+
+#[test]
+fn a_kill_queues_its_stop_all_retry_before_the_audit_append() {
+    let h = harness();
+    h.running();
+    h.gw.fail_stop_all.store(true, Ordering::SeqCst);
+    let lock = hold_audit(&h);
+    let d = h.d.clone();
+    let kill = std::thread::spawn(move || {
+        let (body, sig) = cli("kill", "kiennt23", NOW, OWNER_KEY);
+        d.signed_command(&body, &sig, NOW)
+    });
+    wait_for("the stop_all retry", || {
+        h.count("SELECT count(*) FROM followups WHERE kind = 'stop_all'") == 1
+    });
+    lock.execute_batch("ROLLBACK").unwrap();
+    assert!(kill.join().unwrap().is_err());
+}
+
+#[test]
+fn a_resume_waiting_on_the_audit_log_does_not_delay_a_kill() {
+    let h = harness();
+    let lock = hold_audit(&h);
+    let d = h.d.clone();
+    let resume = std::thread::spawn(move || {
+        let (body, sig) = cli("resume", "kiennt23", NOW, OWNER_KEY);
+        d.signed_command(&body, &sig, NOW)
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    let d = h.d.clone();
+    let kill = std::thread::spawn(move || {
+        let (body, sig) = cli("kill", "kiennt23", NOW + 1, OWNER_KEY);
+        d.signed_command(&body, &sig, NOW + 1)
+    });
+    wait_for("the kill", || h.gw.calls().contains(&"stop_all".to_owned()));
+    lock.execute_batch("ROLLBACK").unwrap();
+    // Whether the resume lands after the kill is not the point.
+    let _ = resume.join().unwrap();
+    kill.join().unwrap().unwrap();
+}
+
+#[test]
+fn a_kill_during_publish_still_checks_for_the_published_pr() {
+    let h = harness();
+    h.running();
+    let d = with_gateway(&h, Arc::new(LostPublish(h.gw.clone())));
+    let kill_d = d.clone();
+    *h.gw.on_publish.lock().unwrap() = Some(Box::new(move || {
+        let (body, sig) = cli("kill", "kiennt23", NOW, OWNER_KEY);
+        kill_d.signed_command(&body, &sig, NOW).unwrap();
+    }));
+    d.finished("run-1", RunState::Done, "tests pass").unwrap();
+    assert_eq!(h.states(), [("run-1".to_owned(), "canceled")]);
+    h.reopen().work_at(NOW + 1000).unwrap();
+    assert_eq!(
+        h.count("SELECT count(*) FROM followups WHERE kind = 'check_publish' AND done = 1"),
+        1
+    );
+    let c = rusqlite::Connection::open(&h.audit).unwrap();
+    let n: i64 = c
+        .query_row(
+            "SELECT count(*) FROM audit WHERE payload LIKE '%canceled_after_publish%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 1);
+}
+
+#[test]
+fn a_queued_run_is_not_started_while_halted() {
+    let h = harness();
+    h.queued("FAKE-1");
+    h.sql("INSERT INTO control (id, halted, by) VALUES (1, 1, 'x') ON CONFLICT (id) DO UPDATE SET halted = 1");
+    h.d.work_at(NOW).unwrap();
+    assert!(!h.gw.calls().iter().any(|c| c.starts_with("start")));
+    assert_eq!(h.states(), [("run-1".to_owned(), "queued")]);
+}

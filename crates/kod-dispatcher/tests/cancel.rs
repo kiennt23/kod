@@ -84,8 +84,13 @@ fn a_cancel_does_not_wait_behind_a_failing_event_for_its_ticket() {
     let h = harness();
     h.running();
     *h.flaky.fail_issue.lock().unwrap() = Some("FAKE-1".into());
-    h.deliver(&edited(&h.tracker, "d-2", "FAKE-1"));
+    h.deliver(&label(&h.tracker, "d-2", "FAKE-1", "dev"));
     assert_eq!(h.states(), [("run-1".to_owned(), "running")]);
+    assert_eq!(
+        h.count("SELECT done FROM deliveries WHERE delivery = 'd-2'"),
+        0,
+        "the failing event must still be pending"
+    );
     h.deliver(&unlabel(&h.tracker, "d-3", "FAKE-1", "dev"));
     assert_eq!(h.states(), [("run-1".to_owned(), "canceled")]);
 }

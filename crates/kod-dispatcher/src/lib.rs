@@ -1051,16 +1051,22 @@ impl Dispatcher {
         let Some((_, old)) = live else {
             return self.done(delivery);
         };
-        let new = revision(&self.tracker.get_issue(ticket)?);
-        if new == old {
-            return self.done(delivery);
-        }
-        self.cancel(
-            delivery,
-            ticket,
-            &format!("the ticket changed (revision {old} to {new}); it is back in ready at the new revision"),
-            "a ticket edit",
-        )?;
+        // A tracker that cannot answer must not keep a run alive: cancel.
+        let why = match self.tracker.get_issue(ticket) {
+            Ok(issue) => {
+                let new = revision(&issue);
+                if new == old {
+                    return self.done(delivery);
+                }
+                format!(
+                    "the ticket changed (revision {old} to {new}); it is back in ready at the new revision"
+                )
+            }
+            Err(_) => format!(
+                "the ticket was edited and its revision unknown (was {old}); it is back in ready"
+            ),
+        };
+        self.cancel(delivery, ticket, &why, "a ticket edit")?;
         Ok(())
     }
 
@@ -1197,11 +1203,6 @@ impl Dispatcher {
             }
         }
         let stopped = self.gateway.stop_all();
-        if self.config.may_always_stop(by) {
-            let _ = self
-                .audit
-                .append(RUN_AUDIT, &json!({"kind": "kill_switch", "by": by}));
-        }
         if stopped.is_err()
             && let Some(epoch) = epoch
             && let Err(e) = follow(&self.db(), "stop_all", "", &epoch.to_string())
@@ -1212,6 +1213,12 @@ impl Dispatcher {
             ));
         }
         drop(stop);
+        // Best effort, after the retry is queued and the lock is free.
+        if self.config.may_always_stop(by) {
+            let _ = self
+                .audit
+                .append(RUN_AUDIT, &json!({"kind": "kill_switch", "by": by}));
+        }
         let _ = self.follow_up(now());
         if let Err(e) = ended {
             errors.push(format!("the store did not take it: {}", scrub(&e)));
@@ -1236,6 +1243,14 @@ impl Dispatcher {
         if !self.config.may_always_stop(by) {
             bail!("only the owner or backup may resume");
         }
+        // The policy and the audit log are asked before the lock is taken, so
+        // a slow one never holds up a kill.
+        self.human_may(&json!({
+            "action": "resume",
+            "scope": "all",
+            "actor": {"kind": "human", "login": by},
+        }))
+        .with_context(|| format!("{by} may not resume"))?;
         let _stop = match self.global_stop.try_lock() {
             Ok(guard) => guard,
             Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
@@ -1243,12 +1258,6 @@ impl Dispatcher {
                 bail!("a global stop is still in flight; retry resume after it returns")
             }
         };
-        self.human_may(&json!({
-            "action": "resume",
-            "scope": "all",
-            "actor": {"kind": "human", "login": by},
-        }))
-        .with_context(|| format!("{by} may not resume"))?;
         self.db().execute(
             "INSERT INTO control (id, halted, by) VALUES (1, 0, ?1)
              ON CONFLICT (id) DO UPDATE SET halted = 0, by = ?1, epoch = epoch + 1",
