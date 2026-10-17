@@ -746,6 +746,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "kod-dispatcher"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "kod-audit",
+ "kod-policy",
+ "kod-tracker",
+ "rusqlite",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tower",
+]
+
+[[package]]
 name = "kod-eval"
 version = "0.1.0"
 dependencies = [
