@@ -587,31 +587,42 @@ impl Dispatcher {
                 "comment" => self.tracker.comment(&target, &arg),
                 k => Err(anyhow!("unknown follow-up {k}")),
             };
-            let c = self.db();
-            match r {
-                Ok(()) => c.execute("UPDATE followups SET done = 1 WHERE id = ?1", [id])?,
-                Err(e) => {
-                    let attempts = attempts + 1;
-                    let error = scrub(&e);
-                    let stopping = matches!(kind.as_str(), "revoke" | "stop" | "stop_all");
-                    let dead = !stopping && kind != "check_publish" && attempts >= MAX_ATTEMPTS;
-                    c.execute(
-                        "UPDATE followups SET attempts = ?2, next_at = ?3, error = ?4, done = ?5
-                         WHERE id = ?1",
-                        params![
-                            id,
-                            attempts,
-                            now + backoff(attempts),
-                            error,
-                            if dead { 2 } else { 0 }
-                        ],
-                    )?;
-                    if stopping && attempts == MAX_ATTEMPTS {
-                        Self::alarm(&c, &self.audit, &kind, &target, attempts, &error)?;
+            // The audit record is appended after the store guard is dropped: a
+            // slow audit log must not hold up the store.
+            let overdue = {
+                let c = self.db();
+                match r {
+                    Ok(()) => {
+                        c.execute("UPDATE followups SET done = 1 WHERE id = ?1", [id])?;
+                        None
                     }
-                    0
+                    Err(e) => {
+                        let attempts = attempts + 1;
+                        let error = scrub(&e);
+                        let stopping = matches!(kind.as_str(), "revoke" | "stop" | "stop_all");
+                        let dead = !stopping && kind != "check_publish" && attempts >= MAX_ATTEMPTS;
+                        c.execute(
+                            "UPDATE followups SET attempts = ?2, next_at = ?3, error = ?4, done = ?5
+                             WHERE id = ?1",
+                            params![
+                                id,
+                                attempts,
+                                now + backoff(attempts),
+                                error,
+                                if dead { 2 } else { 0 }
+                            ],
+                        )?;
+                        if stopping && attempts == MAX_ATTEMPTS {
+                            Some(Self::alarm(&c, &kind, &target, attempts, &error)?)
+                        } else {
+                            None
+                        }
+                    }
                 }
             };
+            if let Some(record) = overdue {
+                let _ = self.audit.append(RUN_AUDIT, &record);
+            }
         }
         Ok(())
     }
@@ -620,15 +631,13 @@ impl Dispatcher {
     /// the run's ticket and in the audit log (best effort), and keep trying.
     fn alarm(
         c: &Connection,
-        audit: &AuditLog,
         kind: &str,
         target: &str,
         attempts: i64,
         error: &str,
-    ) -> Result<()> {
+    ) -> Result<Value> {
         let record = json!({"kind": "stop_overdue", "call": kind, "run": target, "attempts": attempts, "error": error});
         eprintln!("{record}");
-        let _ = audit.append(RUN_AUDIT, &record);
         let ticket: Option<String> = match seq_of(target) {
             Ok(seq) => c
                 .query_row("SELECT ticket FROM runs WHERE seq = ?1", [seq], |r| {
@@ -647,7 +656,7 @@ impl Dispatcher {
                 ),
             )?;
         }
-        Ok(())
+        Ok(record)
     }
 
     /// The kill switch's epoch: moved on by each `resume`.
@@ -1154,7 +1163,6 @@ impl Dispatcher {
             }))
             .with_context(|| format!("{by} may not use the kill switch"))?;
         }
-        let stop = self.global_stop.lock().unwrap_or_else(|e| e.into_inner());
         let ended = (|| -> Result<(i64, Vec<String>)> {
             let mut c = self.db();
             let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1211,8 +1219,19 @@ impl Dispatcher {
                 }
             }
         }
-        let stopped = self.gateway.stop_all();
-        if stopped.is_err()
+        // The store and the revokes are done; only now wait for the lock, which
+        // a hung stop_all retry may hold. A resume that moved the epoch since
+        // the transaction means this kill is over: it must not stop new runs.
+        let stop = self.global_stop.lock().unwrap_or_else(|e| e.into_inner());
+        let lifted = ended.is_ok()
+            && matches!((Self::epoch(&self.db()), epoch), (Ok(now), Some(then)) if now != then);
+        let stopped = if lifted {
+            Ok(())
+        } else {
+            self.gateway.stop_all()
+        };
+        if !lifted
+            && stopped.is_err()
             && let Some(epoch) = epoch
             && let Err(e) = follow(&self.db(), "stop_all", "", &epoch.to_string())
         {
@@ -1268,16 +1287,21 @@ impl Dispatcher {
                 bail!("a global stop is still in flight; retry resume after it returns")
             }
         };
+        // The marker is checked and the halt lifted in one transaction, so a
+        // kill cannot land between them.
         // ponytail: a kill whose store write failed leaves no marker, so a
         // resume can still pass it; its stop_all retry is then what is lost.
-        if Self::kills(&self.db())? != kills {
+        let mut c = self.db();
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if Self::kills(&tx)? != kills {
             bail!("a kill landed during the resume; retry with a fresh signed request");
         }
-        self.db().execute(
+        tx.execute(
             "INSERT INTO control (id, halted, by) VALUES (1, 0, ?1)
              ON CONFLICT (id) DO UPDATE SET halted = 0, by = ?1, epoch = epoch + 1",
             [by],
         )?;
+        tx.commit()?;
         Ok(())
     }
 

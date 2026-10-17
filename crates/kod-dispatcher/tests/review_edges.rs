@@ -490,3 +490,60 @@ fn a_queued_run_is_not_started_while_halted() {
     assert!(!h.gw.calls().iter().any(|c| c.starts_with("start")));
     assert_eq!(h.states(), [("run-1".to_owned(), "queued")]);
 }
+
+fn halted_in_store(h: &Harness) -> bool {
+    h.count("SELECT count(*) FROM control WHERE halted = 1") == 1
+}
+
+#[test]
+fn a_hung_stop_all_retry_does_not_stop_a_kill_from_committing() {
+    let h = harness();
+    h.running();
+    h.sql(&format!(
+        "INSERT INTO followups(kind,target,arg,next_at) VALUES('stop_all','','0',{NOW})"
+    ));
+    let (tx, rx) = mpsc::channel();
+    let gateway = Arc::new(SlowKill {
+        inner: h.gw.clone(),
+        first: AtomicBool::new(true),
+        entered: tx,
+        release: (Mutex::new(false), Condvar::new()),
+    });
+    let d = with_gateway(&h, gateway.clone());
+    let retry_d = d.clone();
+    let retry = std::thread::spawn(move || retry_d.work_at(NOW + 1000));
+    rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let kill = std::thread::spawn(move || {
+        let (body, sig) = cli("kill", "kiennt23", NOW, OWNER_KEY);
+        d.signed_command(&body, &sig, NOW)
+    });
+    wait_for("the kill's store write", || {
+        halted_in_store(&h) && h.count("SELECT count(*) FROM runs WHERE state = 'canceled'") == 1
+    });
+    *gateway.release.0.lock().unwrap() = true;
+    gateway.release.1.notify_all();
+    retry.join().unwrap().unwrap();
+    kill.join().unwrap().unwrap();
+}
+
+#[test]
+fn an_overdue_stop_alarm_waiting_on_the_audit_log_does_not_block_the_store() {
+    let h = harness();
+    h.running();
+    h.gw.fail_stop.store(true, Ordering::SeqCst);
+    h.deliver(&unlabel(&h.tracker, "u-1", "FAKE-1", "dev"));
+    h.sql("UPDATE followups SET attempts = 4, next_at = 0 WHERE kind = 'stop'");
+    let lock = hold_audit(&h);
+    let d = h.d.clone();
+    let work = std::thread::spawn(move || d.work_at(NOW));
+    std::thread::sleep(Duration::from_millis(300));
+    let d = h.d.clone();
+    let kill = std::thread::spawn(move || {
+        let (body, sig) = cli("kill", "kiennt23", NOW, OWNER_KEY);
+        d.signed_command(&body, &sig, NOW)
+    });
+    wait_for("the kill's store write", || halted_in_store(&h));
+    lock.execute_batch("ROLLBACK").unwrap();
+    work.join().unwrap().unwrap();
+    let _ = kill.join().unwrap();
+}
