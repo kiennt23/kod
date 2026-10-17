@@ -52,13 +52,15 @@ use std::{
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Never forwarded in either direction. Client credentials are replaced.
-const DROP: [&str; 6] = [
+const DROP: [&str; 7] = [
     "host",
     "content-length",
     "connection",
     "transfer-encoding",
     "x-api-key",
     "authorization",
+    // reqwest here has no gzip, so a compressed reply could not be metered.
+    "accept-encoding",
 ];
 
 /// Defaults for the KOD_* settings, shared with kod-eval, which records them.
@@ -263,6 +265,9 @@ struct Checked {
     /// 0 for count_tokens.
     max_tokens: u64,
     images: u64,
+    /// The checked body re-serialized: what is forwarded, so a duplicate key
+    /// cannot show the upstream something other than what was checked.
+    body: Vec<u8>,
 }
 
 /// Checks the request body against the model and token limits and the shape
@@ -315,6 +320,7 @@ fn check_body(lim: &Limits, path: &str, body: &[u8]) -> Result<Checked, Refusal>
             model,
             max_tokens: 0,
             images,
+            body: serde_json::to_vec(&v).unwrap_or_default(),
         });
     }
     match v.get("max_tokens").and_then(Value::as_u64) {
@@ -322,6 +328,7 @@ fn check_body(lim: &Limits, path: &str, body: &[u8]) -> Result<Checked, Refusal>
             model,
             max_tokens,
             images,
+            body: serde_json::to_vec(&v).unwrap_or_default(),
         }),
         _ => {
             let why = format!("max_tokens must be a whole number up to {}", lim.max_tokens);
@@ -488,6 +495,7 @@ async fn forward(State(st): State<Arc<AppState>>, req: Request) -> Response {
         model,
         max_tokens,
         images,
+        body: checked,
     } = match check_body(lim, &path, &body) {
         Ok(c) => c,
         Err(r) => return refuse(&st, id, &path, r).await,
@@ -525,7 +533,7 @@ async fn forward(State(st): State<Arc<AppState>>, req: Request) -> Response {
         return refuse(&st, id, &path, ("deny_model", StatusCode::FORBIDDEN, why)).await;
     };
     let reserved = if path == "/v1/messages" {
-        budget::reservation(&price, body.len(), images, max_tokens)
+        budget::reservation(&price, body.len().max(checked.len()), images, max_tokens)
     } else {
         Spend::default()
     };
@@ -533,10 +541,12 @@ async fn forward(State(st): State<Arc<AppState>>, req: Request) -> Response {
         let why = "the request could pass the run's budget".into();
         return refuse(&st, id, &path, ("over_spend", StatusCode::FORBIDDEN, why)).await;
     }
-    let release = |run: &Run| {
-        if let Ok(mut l) = run.ledger.lock() {
-            l.release(reserved);
-        }
+    // Releases the reservation on drop, so a client that disconnects while
+    // the handler waits does not leak it. The Meter takes it over.
+    let reservation = Reservation {
+        run: run.clone(),
+        spend: reserved,
+        held: true,
     };
     let prompt = json!({
         "run": id,
@@ -554,7 +564,6 @@ async fn forward(State(st): State<Arc<AppState>>, req: Request) -> Response {
         .await
         .is_err()
     {
-        release(&run);
         let why = "the prompt was not recorded".into();
         return refuse(
             &st,
@@ -567,7 +576,6 @@ async fn forward(State(st): State<Arc<AppState>>, req: Request) -> Response {
     // Held through settlement and the output audit write, so queued calls
     // see any halt before they can reach the upstream.
     let Ok(permit) = run.in_flight.clone().acquire_owned().await else {
-        release(&run);
         let why = "the run's request limit was closed".into();
         return refuse(
             &st,
@@ -578,7 +586,6 @@ async fn forward(State(st): State<Arc<AppState>>, req: Request) -> Response {
         .await;
     };
     if run.ledger.lock().map_or(true, |l| l.halted()) {
-        release(&run);
         let why = "the run is halted".into();
         return refuse(&st, id, &path, ("halted", StatusCode::FORBIDDEN, why)).await;
     }
@@ -586,7 +593,7 @@ async fn forward(State(st): State<Arc<AppState>>, req: Request) -> Response {
         .client
         .request(method, url)
         .headers(headers)
-        .body(body)
+        .body(checked)
         .send()
         .await
     {
@@ -611,7 +618,7 @@ async fn forward(State(st): State<Arc<AppState>>, req: Request) -> Response {
                 sha: Sha256::new(),
                 run: run.clone(),
                 audit: st.cfg.audit.clone(),
-                reserved,
+                reservation,
                 price,
                 path: path.clone(),
                 status: up.status().as_u16(),
@@ -628,7 +635,6 @@ async fn forward(State(st): State<Arc<AppState>>, req: Request) -> Response {
                 .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
         }
         Err(e) => {
-            release(&run);
             // Without the URL, which carries a query string the agent chose.
             let why = e.without_url().to_string();
             eprintln!("upstream: {why}");
@@ -668,6 +674,23 @@ fn log_with(event: &str, run: &str, path: &str, status: u16, mut extra: Map<Stri
     println!("{}", Value::Object(extra));
 }
 
+/// A run's reserved spend, given back on drop unless a Meter settled it.
+struct Reservation {
+    run: Arc<Run>,
+    spend: Spend,
+    held: bool,
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        if self.held
+            && let Ok(mut l) = self.run.ledger.lock()
+        {
+            l.release(self.spend);
+        }
+    }
+}
+
 /// Watches a response body as it passes through. When the body is dropped
 /// (after its last byte, or when the client went away) it settles the run's
 /// reservation, logs the usage line and writes the output capture.
@@ -679,7 +702,7 @@ struct Meter {
     sha: Sha256,
     run: Arc<Run>,
     audit: Arc<AuditLog>,
-    reserved: Spend,
+    reservation: Reservation,
     price: Price,
     path: String,
     status: u16,
@@ -721,7 +744,8 @@ impl Drop for Meter {
         let (spent, halted, newly_halted) = match self.run.ledger.lock() {
             Ok(mut l) => {
                 let was = l.halted();
-                l.settle(self.reserved, actual);
+                l.settle(self.reservation.spend, actual);
+                self.reservation.held = false;
                 (l.spent(), l.halted(), !was && l.halted())
             }
             Err(_) => (Spend::default(), true, false),

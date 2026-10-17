@@ -69,7 +69,11 @@ async fn forwards_with_the_real_key_and_drops_client_credentials() {
     assert_eq!(res.status(), 200);
     assert_eq!(
         res.text().await.unwrap(),
-        format!("key=real-key auth=false query=beta=true body={body}")
+        // The body forwarded is the checked one, re-serialized.
+        format!(
+            "key=real-key auth=false query=beta=true body={}",
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()
+        )
     );
 }
 

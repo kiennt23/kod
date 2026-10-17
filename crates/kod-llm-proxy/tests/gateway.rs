@@ -621,3 +621,115 @@ async fn a_failed_audit_write_refuses_the_request() {
     lock.execute_batch("COMMIT").unwrap();
     assert_eq!(status(&g, msg(MODEL, 10)).await, 200);
 }
+
+/// Records the last request's headers and body; the first call stalls when
+/// `stall_first` is set.
+type Seen = Arc<std::sync::Mutex<(axum::http::HeaderMap, Vec<u8>)>>;
+async fn recording(stall_first: bool) -> (String, Seen, Arc<AtomicUsize>) {
+    let seen: Seen = Arc::default();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (s, c) = (seen.clone(), calls.clone());
+    let router = Router::new().route(
+        "/v1/messages",
+        post(move |h: axum::http::HeaderMap, body: Bytes| {
+            *s.lock().unwrap() = (h, body.to_vec());
+            let first = c.fetch_add(1, Ordering::SeqCst) == 0;
+            async move {
+                if stall_first && first {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                }
+                format!(r#"{{"usage":{SMALL}}}"#)
+            }
+        }),
+    );
+    (serve(router).await, seen, calls)
+}
+
+/// Room for exactly one reservation, so a leaked one refuses the next call.
+fn one_reservation() -> (String, Setup) {
+    let body = msg(MODEL, 10);
+    let r = reservation(&common::PRICE, body.len(), 0, 10);
+    let setup = Setup {
+        run: run(
+            &[CLASS],
+            Budget {
+                max_tokens: r.tokens,
+                max_cost_micro_usd: 1_000_000,
+            },
+        ),
+        ..Setup::default()
+    };
+    (body, setup)
+}
+
+#[tokio::test]
+async fn a_client_that_disconnects_mid_flight_releases_its_reservation() {
+    let (up, _, calls) = recording(true).await;
+    let (body, setup) = one_reservation();
+    let g = gateway(&up, setup).await;
+    let gone = reqwest::Client::new()
+        .post(format!("{}/v1/messages", g.url))
+        .body(body.clone())
+        .timeout(Duration::from_millis(300))
+        .send()
+        .await;
+    assert!(gone.is_err());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(status(&g, body).await, 200);
+}
+
+#[tokio::test]
+async fn a_failed_prompt_audit_write_releases_its_reservation() {
+    let (up, calls, _) = {
+        let (u, c) = upstream(SMALL).await;
+        (u, c, ())
+    };
+    let (body, setup) = one_reservation();
+    let g = gateway(&up, setup).await;
+    let lock = rusqlite::Connection::open(&g.db).unwrap();
+    lock.execute_batch("BEGIN EXCLUSIVE").unwrap();
+    assert_eq!(status(&g, body.clone()).await, 503);
+    lock.execute_batch("COMMIT").unwrap();
+    assert_eq!(status(&g, body).await, 200);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn the_upstream_never_sees_accept_encoding() {
+    let (up, seen, _) = recording(false).await;
+    let g = gateway(&up, Setup::default()).await;
+    let res = reqwest::Client::new()
+        .post(format!("{}/v1/messages", g.url))
+        .header("accept-encoding", "gzip")
+        .body(msg(MODEL, 10))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let seen = seen.lock().unwrap();
+    assert!(seen.0.get("accept-encoding").is_none());
+    assert_eq!(seen.0["x-api-key"], "real-key");
+}
+
+#[tokio::test]
+async fn the_upstream_receives_exactly_the_checked_body() {
+    let (up, seen, _) = recording(false).await;
+    let g = gateway(&up, Setup::default()).await;
+    // The last duplicate is what the allowlist checked; the first would pass
+    // the limit of 1000 only if the upstream took it instead.
+    let raw = format!(
+        r#"{{"model":"{MODEL}","max_tokens":999999,"max_tokens":10,"messages":[1],"messages":[]}}"#
+    );
+    assert_eq!(status(&g, raw.clone()).await, 200);
+    let sent = String::from_utf8(seen.lock().unwrap().1.clone()).unwrap();
+    assert!(!sent.contains("999999"), "{sent}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&sent).unwrap(),
+        json!({"model": MODEL, "max_tokens": 10, "messages": []})
+    );
+    // The capture describes what the client sent.
+    let e = entries(&g.db);
+    let p = e.iter().find(|(t, _)| t == "prompts").unwrap();
+    assert_eq!(p.1["request"]["bytes"], raw.len());
+}
