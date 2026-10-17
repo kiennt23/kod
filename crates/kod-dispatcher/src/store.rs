@@ -2,6 +2,16 @@
 //! follow-up calls, and the kill switch. The database itself keeps run states
 //! moving forward and allows one live run per ticket. A run's state is also
 //! its durable cancel flag: the gateway reads it before every call.
+//!
+//! A follow-up that revokes or stops is never given up: it is retried with
+//! backoff until the gateway confirms it. A stop of every sandbox carries
+//! the kill switch's epoch, which `resume` moves on, so a retry left over
+//! from a kill never stops runs started after the resume.
+//!
+//! A delivery is keyed by a hash of its signed body, so a redelivery, or a
+//! replay with a different unsigned delivery header, is a duplicate. `done`
+//! is 0 while queued, 1 once its effect is committed, and 2 when it failed
+//! `MAX_ATTEMPTS` times (a dead letter, kept with its last error).
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension};
 use std::{path::Path, time::Duration};
