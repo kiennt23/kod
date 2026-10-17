@@ -25,6 +25,9 @@ use std::{
 pub mod broker;
 pub mod docs;
 pub mod forge;
+mod mcp;
+
+pub use mcp::router;
 
 /// A run token is at least this many lower-case hex characters, as in the
 /// LLM gateway.

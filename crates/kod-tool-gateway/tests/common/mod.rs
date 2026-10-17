@@ -175,3 +175,19 @@ impl Harness {
         String::from_utf8_lossy(&std::fs::read(&self.audit).unwrap()).into_owned()
     }
 }
+
+/// Serves the gateway's routes on a free local port from a thread of its
+/// own and returns the base URL.
+pub fn serve(gw: Arc<Gateway>) -> String {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            tx.send(listener.local_addr().unwrap()).unwrap();
+            let app = kod_tool_gateway::router(gw, vec!["127.0.0.1".into()]);
+            axum::serve(listener, app).await.unwrap();
+        });
+    });
+    format!("http://{}", rx.recv().unwrap())
+}
