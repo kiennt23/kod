@@ -445,3 +445,28 @@ fn concurrent_workers_start_a_queued_run_once() {
     );
     assert!(!h.gw.calls().contains(&"stop run-1".to_owned()));
 }
+
+const SECRET: &str = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+
+#[test]
+fn a_policy_load_error_with_a_secret_is_redacted_in_the_comment() {
+    let h = harness_with(|_| Err(anyhow::anyhow!("cannot read policy at {SECRET}")));
+    h.deliver(&label(&h.tracker, "d-1", "FAKE-1", "dev"));
+    let c = h.last_comment("FAKE-1");
+    assert!(c.contains("the policy is unavailable"), "{c}");
+    assert!(!c.contains(SECRET), "{c}");
+}
+
+#[test]
+fn a_runner_reason_with_a_secret_is_redacted_in_the_store_and_comment() {
+    let h = harness();
+    h.running();
+    h.d.finished(
+        "run-1",
+        RunState::Blocked,
+        &format!("stuck, token {SECRET}"),
+    )
+    .unwrap();
+    assert!(!h.last_comment("FAKE-1").contains(SECRET));
+    assert!(!h.d.runs().unwrap()[0].reason.contains(SECRET));
+}

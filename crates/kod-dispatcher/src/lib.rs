@@ -330,7 +330,7 @@ impl Dispatcher {
     ) -> Result<Dispatcher> {
         let d = Dispatcher {
             config,
-            policy: policy.map_err(|e| format!("{e:#}")),
+            policy: policy.map_err(|e| scrub(&e)),
             audit,
             tracker,
             gateway,
@@ -699,7 +699,10 @@ impl Dispatcher {
                 &tx,
                 "comment",
                 ticket,
-                &format!("Kod did not start this ticket: {}.", reasons.join("; ")),
+                &redact(&format!(
+                    "Kod did not start this ticket: {}.",
+                    reasons.join("; ")
+                )),
             )?;
         }
         tx.execute("UPDATE deliveries SET done = 1 WHERE id = ?1", [delivery])?;
@@ -778,6 +781,7 @@ impl Dispatcher {
         reason: &str,
         from: &[RunState],
     ) -> Result<bool> {
+        let reason = &redact(reason);
         let from: Vec<String> = from.iter().map(|s| format!("'{}'", s.name())).collect();
         let ticket: Option<String> = c
             .query_row(
