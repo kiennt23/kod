@@ -60,6 +60,20 @@ pub fn proxy_denials(log: &str) -> usize {
         .count()
 }
 
+/// Requests the gateway refused on a case's spend budget, over every case's
+/// proxy log. A missing log counts nothing; that case is not verified anyway.
+pub fn spend_refusals(run_dir: &Path, m: &Manifest) -> usize {
+    m.cases
+        .iter()
+        .map(|id| {
+            let log = fs::read_to_string(run_dir.join(id).join("proxy.log")).unwrap_or_default();
+            proxy_events(&log)
+                .filter(|v| v["event"] == "over_spend" || v["event"] == "halted")
+                .count()
+        })
+        .sum()
+}
+
 /// Input and output tokens summed over the proxy's usage lines (None when no
 /// line had a value), and how many model responses lack either count: usage
 /// lines with a null, plus successful /v1/messages responses that never got a
@@ -132,6 +146,7 @@ pub fn render(m: &Manifest, results: &[CaseResult], denials: usize) -> String {
          - Proxy image: {}\n\
          - Sandbox images: {}\n\
          - Proxy limits: models {}; paths {}; max_tokens {}; max_body {}; max_requests {}; max_concurrent {}\n\
+         - Spend budget per case: {}\n\
          - Inputs and base commits: manifest.json and each case's inputs/\n\
          \n## Safety failures\n\n",
         m.run_id,
@@ -146,7 +161,11 @@ pub fn render(m: &Manifest, results: &[CaseResult], denials: usize) -> String {
         p.max_tokens,
         p.max_body,
         p.max_requests,
-        p.max_concurrent
+        p.max_concurrent,
+        m.spend.as_ref().map_or("none".to_owned(), |b| format!(
+            "max_tokens {}; max_cost_micro_usd {}",
+            b.max_tokens, b.max_cost_micro_usd
+        ))
     );
     let safety: Vec<String> = results
         .iter()
@@ -312,6 +331,26 @@ pub fn compare(baseline: &Path, candidate: &Path) -> Result<(String, bool)> {
             setup(&bm),
             setup(&cm)
         );
+    }
+    // Budgets and prices must match. A phase 0 run had no spend budget; it
+    // compares with a budgeted run only if that budget refused nothing, so
+    // the budget did not change the result.
+    match (&bm.spend, &cm.spend) {
+        (Some(a), Some(b)) if a != b => {
+            bail!("the runs had different spend budgets or price tables; rerun one of them")
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            for (d, m) in [(baseline, &bm), (candidate, &cm)] {
+                let n = spend_refusals(d, m);
+                if m.spend.is_some() && n > 0 {
+                    bail!(
+                        "run {} refused {n} requests on its spend budget and the other run had no budget; rerun both with one",
+                        m.run_id
+                    );
+                }
+            }
+        }
+        _ => {}
     }
     // The same ids must also mean the same experiment: the same resolved base
     // commits and the same saved inputs (ticket, tests, budget, held-back

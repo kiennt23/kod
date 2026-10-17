@@ -67,6 +67,18 @@ enum Cli {
         /// background model. Repeatable.
         #[arg(long)]
         extra_model: Vec<String>,
+        #[arg(long, default_value = "policy")]
+        policy_dir: PathBuf,
+        /// The gateway's price table: model id to micro-USD per million
+        /// tokens for input, output, cache_write and cache_read
+        #[arg(long)]
+        prices: PathBuf,
+        /// Each case's token budget at the gateway
+        #[arg(long)]
+        run_max_tokens: u64,
+        /// Each case's cost budget at the gateway, in micro-USD
+        #[arg(long)]
+        run_max_cost_micro_usd: u64,
     },
     /// Kill switch: no new containers start, and every Kod container on this
     /// host is killed. Delete the stop file ($KOD_STOP_FILE, or ~/.kod/STOP)
@@ -96,6 +108,10 @@ fn main() -> Result<()> {
             proxy_image,
             out,
             extra_model,
+            policy_dir,
+            prices,
+            run_max_tokens,
+            run_max_cost_micro_usd,
         } => {
             let runner = match (runner.as_str(), model, script) {
                 ("claude-code", Some(model), _) => Runner::ClaudeCode { model },
@@ -132,6 +148,10 @@ fn main() -> Result<()> {
                 out_root: out,
                 extra_models: extra_model,
                 stop_file: run::default_stop_file(),
+                policy_dir,
+                prices,
+                run_max_tokens,
+                run_max_cost_micro_usd,
             };
             let dir = run::run_all(&cases, &runner, &settings)?;
             println!("results: {}", dir.display());

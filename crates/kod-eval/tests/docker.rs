@@ -60,6 +60,9 @@ fn end_to_end() {
     assert!(m.proxy_image_id.starts_with("sha256:"), "{text}");
     assert!(m.sandbox_image_ids["test"].starts_with("sha256:"), "{text}");
     assert_eq!(m.proxy.max_requests, 200, "{text}");
+    assert_eq!(m.spend.as_ref().unwrap().max_tokens, 1_000_000, "{text}");
+    // One gateway for the run, with its own audit log.
+    assert!(dir.join("gateway/audit.db").is_file());
     assert_eq!(m.kod_eval_version, env!("CARGO_PKG_VERSION"));
     // The commit this test binary was built from, so "unknown" fails.
     let head = std::process::Command::new("git")
