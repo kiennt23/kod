@@ -86,7 +86,11 @@ fn the_signature_is_hmac_sha256() {
         &[0xaa; 131],
         b"Test Using Larger Than Block-Size Key - Hash Key First",
     );
-    assert_eq!(mac[..4], [0x60, 0xe4, 0x31, 0x59]);
+    let hex: String = mac.iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(
+        hex,
+        "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+    );
 }
 
 /// A request that fails the signature check doesn't use up its delivery ID,

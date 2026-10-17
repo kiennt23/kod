@@ -29,6 +29,8 @@ enum Flaw {
     IgnoresSignatures,
     /// Accepts any request that has a signature header, whatever its value.
     ChecksPresenceOnly,
+    /// Accepts a request with no signature header, but rejects a bad one.
+    AcceptsUnsigned,
     /// Keeps no delivery IDs, so a recorded webhook can be sent again.
     AcceptsReplays,
     EveryoneIsAMember,
@@ -89,6 +91,9 @@ impl Tracker for Broken {
             Flaw::ChecksPresenceOnly if request.header(SIGNATURE).is_some() => {
                 request.headers = vec![(SIGNATURE.into(), self.0.sign(&request.body))];
             }
+            Flaw::AcceptsUnsigned if request.header(SIGNATURE).is_none() => {
+                request.headers = vec![(SIGNATURE.into(), self.0.sign(&request.body))];
+            }
             Flaw::AcceptsReplays => {
                 let mut seen = self.2.lock().unwrap();
                 if let Some(d) = seen.get(&request.body) {
@@ -106,22 +111,30 @@ impl Tracker for Broken {
 
 #[test]
 fn the_contract_fails_an_adapter_with_any_one_flaw() {
-    for flaw in [
-        Flaw::IgnoresSignatures,
-        Flaw::ChecksPresenceOnly,
-        Flaw::AcceptsReplays,
-        Flaw::EveryoneIsAMember,
-        Flaw::TransitionDoesNothing,
-        Flaw::MissingIssueIsOk,
-        Flaw::DropsRequirementId,
-        Flaw::DropsLinks,
+    for (flaw, reason) in [
+        (Flaw::IgnoresSignatures, "a changed body passed"),
+        (Flaw::ChecksPresenceOnly, "a changed body passed"),
+        (Flaw::AcceptsUnsigned, "an unsigned webhook was accepted"),
+        (Flaw::AcceptsReplays, "a replayed trigger was accepted"),
+        (Flaw::EveryoneIsAMember, "outsider"),
+        (Flaw::TransitionDoesNothing, "transition to"),
+        (Flaw::MissingIssueIsOk, "comment on a missing issue"),
+        (Flaw::DropsRequirementId, "get_issue"),
+        (Flaw::DropsLinks, "does not link"),
     ] {
         let (t, s) = sandbox();
         let broken = Broken(t, flaw, Mutex::default());
-        let r = catch_unwind(AssertUnwindSafe(|| check(&broken, &s)));
-        assert!(
-            r.is_err(),
+        let err = catch_unwind(AssertUnwindSafe(|| check(&broken, &s))).expect_err(&format!(
             "the contract passed an adapter whose flaw is {flaw:?}"
+        ));
+        let msg = err
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| err.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        assert!(
+            msg.contains(reason),
+            "flaw {flaw:?} failed for the wrong reason (wanted {reason:?}): {msg}"
         );
     }
 }

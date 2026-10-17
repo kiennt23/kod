@@ -25,6 +25,8 @@ pub struct Sandbox {
     pub tampered: Webhook,
     /// The trigger with one character of its signature value changed.
     pub wrong_signature: Webhook,
+    /// The trigger with only its signature header removed.
+    pub unsigned: Webhook,
     /// A signed webhook with no delivery ID.
     pub unidentified: Webhook,
     /// A recorded comment webhook, and its delivery.
@@ -133,12 +135,8 @@ pub fn check(t: &dyn Tracker, s: &Sandbox) {
         parse(&s.wrong_signature).is_err(),
         "a wrong signature value was accepted"
     );
-    let unsigned = Webhook {
-        headers: vec![],
-        body: s.trigger.body.clone(),
-    };
     assert!(
-        parse(&unsigned).is_err(),
+        parse(&s.unsigned).is_err(),
         "an unsigned webhook was accepted"
     );
     assert!(

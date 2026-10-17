@@ -306,6 +306,11 @@ pub fn sandbox() -> (FakeTracker, Sandbox) {
     let sig = &mut wrong_signature.headers[0].1;
     let first = if sig.starts_with('0') { "1" } else { "0" };
     sig.replace_range(..1, first);
+    // The trigger with only its signature header removed.
+    let mut unsigned = trigger.clone();
+    unsigned
+        .headers
+        .retain(|(k, _)| !k.eq_ignore_ascii_case(SIGNATURE));
     let s = Sandbox {
         issue: expected.clone(),
         missing: "FAKE-404".into(),
@@ -329,6 +334,7 @@ pub fn sandbox() -> (FakeTracker, Sandbox) {
         },
         tampered,
         wrong_signature,
+        unsigned,
         unidentified: t.webhook(
             &json!({"type": "label_added", "issue": "FAKE-1", "label": "kod", "user": "dev"}),
         ),
