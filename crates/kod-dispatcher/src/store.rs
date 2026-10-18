@@ -13,7 +13,7 @@
 //! is 0 while queued, 1 once its effect is committed, and 2 when it failed
 //! `MAX_ATTEMPTS` times (a dead letter, kept with its last error).
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::{path::Path, time::Duration};
 
 /// How long a write waits for another writer before it fails.
@@ -72,6 +72,15 @@ CREATE TABLE IF NOT EXISTS control (
 
 /// SQL for the states of a run that has not ended.
 pub const LIVE: &str = "('queued', 'running', 'publishing')";
+
+pub(super) fn retire_labels(c: &Connection, ticket: &str, delivery: &str) -> Result<()> {
+    c.execute(
+        "UPDATE deliveries SET done = 1 WHERE ticket = ?1 AND priority = 1 AND done = 0
+         AND rowid < (SELECT rowid FROM deliveries WHERE id = ?2)",
+        params![ticket, delivery],
+    )?;
+    Ok(())
+}
 
 /// Opens (creating if needed) the store at `path`.
 pub fn open(path: &Path) -> Result<Connection> {
