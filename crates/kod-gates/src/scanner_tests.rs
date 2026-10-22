@@ -45,6 +45,7 @@ fn docker_fixture(files: &[(&str, &str)]) -> (tempfile::TempDir, DockerScanner) 
             archive,
             sha: SHA.into(),
             docker,
+            cache: None,
         },
     )
 }
@@ -64,7 +65,7 @@ fn real_containers_are_isolated_and_nonzero_exit_and_timeout_fail() {
     }
     let (_dir, mut scanner) = docker_fixture(&[("marker", "original\n")]);
     scanner.config.commands.insert("tests".into(), vec!["/bin/sh".into(), "-ec".into(),
-        "test \"$(id -u)\" = 10001; test -z \"${KOD_GITHUB_TOKEN:-}\"; test ! -S /var/run/docker.sock; test \"$(cat marker)\" = original; ! touch /opt/kod/host-write; ! touch /input/source.tar.gz; test -z \"$(ip route 2>/dev/null)\"; echo changed > marker".into()]);
+        "test \"$(id -u)\" = 10001; test -z \"${KOD_GITHUB_TOKEN:-}\"; test ! -S /var/run/docker.sock; test \"$(cat marker)\" = original; test \"$(stat -f -c %T /work)\" != tmpfs; ! touch /opt/kod/host-write; ! touch /input/source.tar.gz; test -z \"$(ip route 2>/dev/null)\"; echo changed > marker".into()]);
     container(&scanner, "tests").unwrap();
     container(&scanner, "tests").unwrap();
     scanner.config.commands.insert(
@@ -151,6 +152,7 @@ fn source_must_match_the_target_sha_before_docker_is_started() {
         archive: "/does-not-exist".into(),
         sha: SHA.into(),
         docker: "/does-not-exist".into(),
+        cache: None,
     };
     assert!(
         scanner
@@ -177,6 +179,7 @@ fn unlabelled_and_sandbox_daemons_are_refused() {
             archive: dir.path().join("absent-archive"),
             sha: SHA.into(),
             docker,
+            cache: None,
         };
         assert!(
             scanner
@@ -186,4 +189,116 @@ fn unlabelled_and_sandbox_daemons_are_refused() {
                 .contains("exclusive kod.role=gate")
         );
     }
+}
+
+#[test]
+fn container_names_are_unique_without_a_temporary_directory() {
+    let a = resource_name(SHA).unwrap();
+    let b = resource_name(SHA).unwrap();
+    assert_ne!(a, b);
+    assert!(a.starts_with("kod-gate-aaaaaaaa-"));
+}
+
+#[test]
+fn real_preparation_fetches_new_dependencies_and_stale_caches_are_refused() {
+    if std::env::var("KOD_DOCKER_TESTS").as_deref() != Ok("1") {
+        return;
+    }
+    let (dir, mut scanner) = docker_fixture(&[
+        (
+            "Cargo.toml",
+            "[package]\nname=\"fresh\"\nversion=\"0.1.0\"\nedition=\"2024\"\nlicense=\"MIT\"\n[dependencies]\neither=\"=1.13.0\"\n",
+        ),
+        (
+            "src/lib.rs",
+            "pub fn answer() -> either::Either<u8,u8> { either::Left(42) }",
+        ),
+    ]);
+    assert!(
+        Process::new("cargo")
+            .args(["generate-lockfile", "--manifest-path"])
+            .arg(dir.path().join("fixture/Cargo.toml"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::fs::write(dir.path().join("fixture/.cargo-marker"), "untrusted").unwrap();
+    std::fs::create_dir(dir.path().join("fixture/.cargo")).unwrap();
+    std::fs::write(
+        dir.path().join("fixture/.cargo/config.toml"),
+        "invalid TOML [[[\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&scanner.archive, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(
+        Process::new("tar")
+            .arg("-czf")
+            .arg(&scanner.archive)
+            .arg("-C")
+            .arg(dir.path())
+            .arg("fixture")
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::fs::set_permissions(&scanner.archive, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let network = resource_name(SHA).unwrap();
+    scanner.config.package_network = network.clone();
+    scanner.cache = Some(resource_name(SHA).unwrap());
+    assert!(
+        Process::new(&scanner.docker)
+            .args(["network", "create", &network])
+            .stdout(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let result = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(scanner.prepare_container());
+    if let Err(error) = result {
+        assert!(
+            Process::new(&scanner.docker)
+                .args(["network", "rm", &network])
+                .status()
+                .unwrap()
+                .success()
+        );
+        panic!("{error:#}");
+    }
+    scanner.config.commands.insert("tests".into(), vec!["/bin/sh".into(), "-ec".into(),
+        "rm -rf .cargo; test -d /prepared/cargo/advisory-dbs; /usr/local/cargo/bin/cargo test --locked --offline".into()]);
+    let scan = container(&scanner, "tests");
+    let cache = scanner.cache.as_ref().unwrap();
+    let stale = Process::new(&scanner.docker)
+        .args([
+            "run",
+            "--rm",
+            "--network=none",
+            "--entrypoint=/bin/sh",
+            "--mount",
+            &format!("type=volume,source={cache},target=/prepared"),
+            &scanner.config.image,
+            "-c",
+            "echo 0 > /prepared/at",
+        ])
+        .status()
+        .unwrap();
+    let rejected = container(&scanner, "tests");
+    scanner.remove_cache().unwrap();
+    assert!(
+        Process::new(&scanner.docker)
+            .args(["network", "rm", &network])
+            .stdout(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    );
+    scan.unwrap();
+    assert!(stale.success());
+    assert!(rejected.is_err());
 }

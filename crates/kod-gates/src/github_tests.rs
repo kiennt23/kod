@@ -222,3 +222,31 @@ fn reviewer_write_permissions_are_read_from_github() {
         );
     }
 }
+
+#[test]
+fn deleted_reviewers_and_null_pending_commits_do_not_poison_a_pr() {
+    let s = server(vec![
+        (200, pull(0)),
+        (200, json!([])),
+        (
+            200,
+            json!([
+                {"id":1,"user":null,"commit_id":SHA,"state":"APPROVED"},
+                {"id":2,"user":{"login":"draft","type":"User"},"commit_id":null,"state":"PENDING"},
+                {"id":3,"user":{"login":"reviewer","type":"User"},"commit_id":SHA,"state":"APPROVED"}
+            ]),
+        ),
+        (200, json!({"permission":"write"})),
+        (200, json!({"permission":"write"})),
+    ]);
+    let pr = s.github.pull(42).unwrap();
+    assert_eq!(pr.reviews.len(), 2);
+    assert_eq!(pr.reviews[0].commit, "");
+    assert_eq!(pr.reviews[1].login, "reviewer");
+}
+
+#[test]
+fn repo_validation_does_not_need_an_unrelated_gate_configuration() {
+    assert!(GitHub::new("../repo", "test").is_err());
+    assert!(GitHub::new("owner/repo", "test").is_ok());
+}

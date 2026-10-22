@@ -881,6 +881,7 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "getrandom 0.4.3",
  "kod-audit",
  "kod-policy",
  "kod-tracker",

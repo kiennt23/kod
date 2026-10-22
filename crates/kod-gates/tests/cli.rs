@@ -8,7 +8,7 @@ fn ruleset_cli_emits_an_app_bound_merge_queue_ruleset() {
         .unwrap();
     assert!(output.status.success());
     let rules: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(rules["enforcement"], "active");
+    assert_eq!(rules["enforcement"], "disabled");
     assert!(
         rules["rules"]
             .as_array()

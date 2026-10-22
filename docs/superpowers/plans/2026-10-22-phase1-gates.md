@@ -17,12 +17,13 @@ merged audit log and tracker contract; acceptance uses the fake tracker.
   GitHub App. Rules pin that App's ID, with no bypass actors.
 - A trusted host downloads the exact head's source archive. Run each scan
   in a fresh, unprivileged, networkless container with a read-only root and
-  archive, no credentials, host sockets, host workspace or shared cache.
+  archive, no credentials, host sockets, host workspace or shared writable cache.
   The gate daemon must carry the exclusive `kod.role=gate` Docker label.
   Source extraction and all repository execution happen inside the container.
 - Scanner image digests, commands, policy, owners and evidence are trusted
-  deployment inputs. The image preloads dependencies from reviewed main;
-  new dependencies require a reviewed image rebuild. Rust SAST is clippy.
+  deployment inputs. Per-candidate preparation refreshes locked dependencies
+  and advisories through a package-only network, without running source code;
+  scans consume the prepared cache read-only and stay offline. Rust SAST is clippy.
 - Re-evaluate on PR/review updates and artifact approval, and on merge-group
   candidates. An adapter must serialize evaluation/invalidation per PR.
   Merge candidates use the PR head for approvals and the candidate SHA for
@@ -54,3 +55,5 @@ CODEOWNERS, fresh approvals and merge queue rechecks, with auto-merge off.
 The branch supplies deployment configuration and commands; changing live
 GitHub rules, installing hosts/App credentials and choosing compliance export
 are explicit deployment steps, not side effects of building this crate.
+The shipped profile is an inactive example and generated rules are disabled.
+The owner-authored approval conflict must be decided before activation.

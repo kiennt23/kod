@@ -5,7 +5,7 @@ use kod_gates::{
     Conclusion, Config, Evidence, Gates,
     github::GitHub,
     records::HostRecords,
-    scanner::{DockerScanner, ScanConfig},
+    scanner::{DockerScanner, ScanConfig, resource_name},
 };
 use kod_policy::Policy;
 use serde::Deserialize;
@@ -13,35 +13,93 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::ExitCode,
+    sync::OnceLock,
 };
 
 struct DownloadScanner<'a> {
     github: &'a GitHub,
     config: ScanConfig,
     docker: PathBuf,
+    archive: OnceLock<std::result::Result<tempfile::TempDir, String>>,
+    prepared: OnceLock<std::result::Result<DockerScanner, String>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn the_same_archive_is_downloaded_once_for_all_scans() {
+        let cache = OnceLock::new();
+        let calls = std::cell::Cell::new(0);
+        for _ in 0..4 {
+            let dir = cached_archive(
+                &cache,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                |_, out| {
+                    calls.set(calls.get() + 1);
+                    out.write_all(b"immutable source")?;
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                std::fs::read(dir.path().join("source.tar.gz")).unwrap(),
+                b"immutable source"
+            );
+        }
+        assert_eq!(calls.get(), 1);
+    }
+}
+
+fn cached_archive<'a>(
+    cache: &'a OnceLock<std::result::Result<tempfile::TempDir, String>>,
+    sha: &str,
+    download: impl FnOnce(&str, &mut dyn Write) -> Result<()>,
+) -> Result<&'a tempfile::TempDir> {
+    let result = cache.get_or_init(|| {
+        (|| -> Result<tempfile::TempDir> {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir()?;
+            let path = dir.path().join("source.tar.gz");
+            let mut file = std::fs::File::create(&path)?;
+            download(sha, &mut file)?;
+            file.flush()?;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444))?;
+            Ok(dir)
+        })()
+        .map_err(|e| format!("{e:#}"))
+    });
+    result.as_ref().map_err(|e| anyhow::anyhow!("{e}"))
 }
 impl kod_gates::Scanner for DownloadScanner<'_> {
     fn version(&self) -> Result<String> {
         self.config.version()
     }
     fn scan(&self, name: &str, sha: &str) -> Result<()> {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir()?;
-        let path = dir.path().join("source.tar.gz");
-        let mut file = std::fs::File::create(&path)?;
-        self.github.archive(sha, &mut file)?;
-        file.flush()?;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444))?;
-        kod_gates::Scanner::scan(
-            &DockerScanner {
-                config: self.config.clone(),
-                archive: path,
-                sha: sha.into(),
-                docker: self.docker.clone(),
-            },
-            name,
-            sha,
-        )
+        let prepared = self.prepared.get_or_init(|| {
+            (|| -> Result<DockerScanner> {
+                let dir =
+                    cached_archive(&self.archive, sha, |sha, out| self.github.archive(sha, out))?;
+                let scanner = DockerScanner {
+                    config: self.config.clone(),
+                    archive: dir.path().join("source.tar.gz"),
+                    sha: sha.into(),
+                    docker: self.docker.clone(),
+                    cache: Some(resource_name(sha)?),
+                };
+                scanner.prepare_cache()?;
+                Ok(scanner)
+            })()
+            .map_err(|e| format!("{e:#}"))
+        });
+        let scanner = prepared.as_ref().map_err(|e| anyhow::anyhow!("{e}"))?;
+        kod_gates::Scanner::scan(scanner, name, sha)
+    }
+    fn finish(&self) -> Result<()> {
+        if let Some(Ok(scanner)) = self.prepared.get() {
+            scanner.remove_cache()?;
+        }
+        Ok(())
     }
 }
 
@@ -178,6 +236,8 @@ fn execute(cli: Cli) -> Result<bool> {
                 github: &github,
                 config: scans,
                 docker,
+                archive: OnceLock::new(),
+                prepared: OnceLock::new(),
             };
             let gates = Gates {
                 config: &config,

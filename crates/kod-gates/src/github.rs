@@ -53,8 +53,8 @@ struct File {
 #[derive(Deserialize)]
 struct RawReview {
     id: u64,
-    user: User,
-    commit_id: String,
+    user: Option<User>,
+    commit_id: Option<String>,
     state: ReviewState,
 }
 
@@ -64,13 +64,7 @@ impl GitHub {
     }
 
     fn with_api(repo: &str, token: &str, api: &str) -> Result<Self> {
-        crate::Config {
-            repo: repo.into(),
-            protect_all: false,
-            protected: vec![],
-            codeowners: vec!["owner".into()],
-        }
-        .validate()?;
+        crate::validate_repo(repo)?;
         let mut headers = HeaderMap::new();
         let mut auth = HeaderValue::from_str(&format!("Bearer {token}"))
             .context("invalid GitHub credential")?;
@@ -214,13 +208,17 @@ impl Forge for GitHub {
         let mut permissions = BTreeMap::new();
         let reviews = reviews
             .into_iter()
-            .map(|r| -> Result<Review> {
-                let human = r.user.kind == "User";
+            .filter_map(|r| {
+                r.user
+                    .map(|user| (r.id, user, r.commit_id.unwrap_or_default(), r.state))
+            })
+            .map(|(id, user, commit, state)| -> Result<Review> {
+                let human = user.kind == "User";
                 let can_approve = if human {
-                    if !crate::login(&r.user.login) {
+                    if !crate::login(&user.login) {
                         bail!("invalid GitHub review login");
                     }
-                    let key = r.user.login.to_ascii_lowercase();
+                    let key = user.login.to_ascii_lowercase();
                     if let Some(allowed) = permissions.get(&key) {
                         *allowed
                     } else {
@@ -240,12 +238,12 @@ impl Forge for GitHub {
                     false
                 };
                 Ok(Review {
-                    id: r.id,
-                    login: r.user.login,
+                    id,
+                    login: user.login,
                     human,
                     can_approve,
-                    commit: r.commit_id,
-                    state: r.state,
+                    commit,
+                    state,
                 })
             })
             .collect::<Result<Vec<_>>>()?;

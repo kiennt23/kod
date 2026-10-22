@@ -36,6 +36,7 @@ struct Git {
     reports: Mutex<Vec<(String, Check)>>,
     reads: AtomicUsize,
     change_on_read: bool,
+    fail_failure_report: bool,
 }
 impl Forge for Git {
     fn pull(&self, _: u64) -> Result<PullRequest> {
@@ -50,15 +51,28 @@ impl Forge for Git {
             .lock()
             .unwrap()
             .push((sha.into(), check.clone()));
+        if self.fail_failure_report
+            && check.conclusion == Conclusion::Failure
+            && check.name == "inputs-current"
+        {
+            bail!("GitHub unavailable");
+        }
         Ok(())
     }
 }
 #[derive(Default)]
 struct Scans {
     fail: Option<String>,
+    fail_finish: bool,
     calls: Mutex<Vec<(String, String)>>,
 }
 impl Scanner for Scans {
+    fn finish(&self) -> Result<()> {
+        if self.fail_finish {
+            bail!("cache cleanup unavailable");
+        }
+        Ok(())
+    }
     fn version(&self) -> Result<String> {
         Ok("fake-scanner-1".into())
     }
@@ -135,6 +149,7 @@ fn fixture() -> Fixture {
             reports: Mutex::default(),
             reads: AtomicUsize::new(0),
             change_on_read: false,
+            fail_failure_report: false,
         },
         scans: Scans::default(),
         dir,
@@ -273,11 +288,53 @@ fn protected_paths_need_an_extra_owner_approval() {
         "tests/checks.rs",
         "CODEOWNERS",
         "auth/login.rs",
+        "Cargo.lock",
+        "clippy.toml",
+        ".clippy.toml",
+        "rust-toolchain.toml",
+        "rust-toolchain",
     ] {
         let f = fixture();
         f.git.pr.lock().unwrap().paths = vec![path.into()];
         f.fails("protected-paths");
     }
+}
+
+#[test]
+fn reporting_failures_preserve_the_evaluation_cause_and_attempt_every_check() {
+    let mut f = fixture();
+    f.evidence.story = "missing-story".into();
+    f.git.fail_failure_report = true;
+    let error = format!("{:#}", f.gates().run(&f.evidence, HEAD).unwrap_err());
+    assert!(error.contains("missing-story"), "{error}");
+    assert!(error.contains("GitHub unavailable"), "{error}");
+    let reports = f.git.reports.lock().unwrap();
+    assert_eq!(
+        reports
+            .iter()
+            .filter(|(_, check)| check.conclusion == Conclusion::Failure)
+            .count(),
+        7
+    );
+    let db = rusqlite::Connection::open(f.dir.path().join("audit.db")).unwrap();
+    let reason: String = db.query_row("SELECT json_extract(payload, '$.error') FROM audit WHERE json_extract(payload, '$.kind') = 'gate_evaluation_failed'", [], |r| r.get(0)).unwrap();
+    assert!(reason.contains("missing-story"));
+}
+
+#[test]
+fn cleanup_failure_prevents_publishing_successful_checks() {
+    let mut f = fixture();
+    f.scans.fail_finish = true;
+    let error = format!("{:#}", f.gates().run(&f.evidence, HEAD).unwrap_err());
+    assert!(error.contains("cache cleanup unavailable"));
+    assert!(
+        f.git
+            .reports
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(_, c)| c.conclusion != Conclusion::Success)
+    );
 }
 
 #[test]

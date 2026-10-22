@@ -11,6 +11,7 @@ pub struct ScanConfig {
     pub image: String,
     pub timeout_secs: u64,
     pub memory_mb: u64,
+    pub package_network: String,
     pub commands: BTreeMap<String, Vec<String>>,
 }
 
@@ -26,6 +27,7 @@ impl ScanConfig {
             image: image.into(),
             timeout_secs: 1800,
             memory_mb: 8192,
+            package_network: "kod-packages".into(),
             commands: [
                 (
                     "tests".into(),
@@ -83,6 +85,18 @@ impl ScanConfig {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if self.package_network.is_empty()
+            || matches!(
+                self.package_network.as_str(),
+                "host" | "none" | "bridge" | "default"
+            )
+            || !self
+                .package_network
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            bail!("a dedicated package-only Docker network is required");
+        }
         let digest = self
             .image
             .rsplit_once("@sha256:")
@@ -121,6 +135,18 @@ pub struct DockerScanner {
     pub archive: PathBuf,
     pub sha: String,
     pub docker: PathBuf,
+    pub cache: Option<String>,
+}
+
+pub fn resource_name(sha: &str) -> Result<String> {
+    validate_sha(sha)?;
+    let mut random = [0u8; 16];
+    getrandom::fill(&mut random).map_err(|e| anyhow::anyhow!("container name randomness: {e}"))?;
+    Ok(format!(
+        "kod-gate-{}-{:032x}",
+        &sha[..8],
+        u128::from_le_bytes(random)
+    ))
 }
 
 impl DockerScanner {
@@ -145,6 +171,19 @@ impl DockerScanner {
     }
 
     fn args(&self, name: &str, container: &str) -> Result<Vec<String>> {
+        let mut args = self.container_args(container, false)?;
+        args.extend(
+            self.config
+                .commands
+                .get(name)
+                .context("unknown scan")?
+                .iter()
+                .cloned(),
+        );
+        Ok(args)
+    }
+
+    fn container_args(&self, container: &str, preparing: bool) -> Result<Vec<String>> {
         let path = self.archive.canonicalize()?;
         let path = path.to_str().context("non-UTF-8 archive path")?;
         if path.contains([',', '\n', '\r']) {
@@ -172,28 +211,54 @@ impl DockerScanner {
         .collect();
         args.push(format!("--memory={}m", self.config.memory_mb));
         args.push(format!("--memory-swap={}m", self.config.memory_mb));
-        args.push(format!(
-            "--tmpfs=/work:rw,nosuid,nodev,exec,size={}m,uid=10001,gid=10001",
-            self.config.memory_mb
-        ));
+        args.extend(["--mount".into(), "type=volume,target=/work".into()]);
+        args.push(format!("--env=KOD_SOURCE_SHA={}", self.sha));
+        if preparing {
+            for arg in &mut args {
+                if arg == "--network=none" {
+                    *arg = format!("--network={}", self.config.package_network);
+                }
+                if arg == "--entrypoint=/opt/kod/scan" {
+                    *arg = "--entrypoint=/opt/kod/prepare".into();
+                }
+            }
+        }
+        if let Some(cache) = &self.cache {
+            if cache.is_empty()
+                || !cache
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            {
+                bail!("invalid prepared cache volume");
+            }
+            args.extend([
+                "--mount".into(),
+                format!(
+                    "type=volume,source={cache},target=/prepared{}",
+                    if preparing { "" } else { ",readonly" }
+                ),
+            ]);
+        } else if preparing {
+            bail!("preparation requires a private cache volume");
+        }
         args.extend([
             "--mount".into(),
             format!("type=bind,source={path},target=/input/source.tar.gz,readonly"),
             self.config.image.clone(),
         ]);
-        args.extend(
-            self.config
-                .commands
-                .get(name)
-                .context("unknown scan")?
-                .iter()
-                .cloned(),
-        );
         Ok(args)
     }
 
     async fn run(&self, name: &str) -> Result<()> {
         self.config.validate()?;
+        self.inventory().await?;
+        if self.cache.is_none() {
+            bail!("scans require freshly prepared dependencies and advisories");
+        }
+        self.run_container(name).await
+    }
+
+    async fn inventory(&self) -> Result<()> {
         let output = Command::new(&self.docker)
             .args(["info", "--format", "{{json .Labels}}"])
             .env_clear()
@@ -215,25 +280,20 @@ impl DockerScanner {
         {
             bail!("Docker daemon must have the exclusive kod.role=gate label");
         }
-        self.run_container(name).await
+        Ok(())
     }
 
     async fn run_container(&self, name: &str) -> Result<()> {
-        let id = tempfile::Builder::new().prefix("kod-gate-").tempdir()?;
-        let container = id
-            .path()
-            .file_name()
-            .and_then(|s| s.to_str())
-            .context("container name")?;
+        let container = resource_name(&self.sha)?;
         let result = self
             .command(
-                &self.args(name, container)?,
+                &self.args(name, &container)?,
                 Duration::from_secs(self.config.timeout_secs),
             )
             .await;
         let cleanup = self
             .command(
-                &["rm".into(), "--force".into(), container.into()],
+                &["rm".into(), "--force".into(), "--volumes".into(), container],
                 Duration::from_secs(10),
             )
             .await;
@@ -247,6 +307,74 @@ impl DockerScanner {
             Ok(false) => bail!("{name} failed (nonzero scanner exit)"),
             Err(e) => Err(e),
         }
+    }
+
+    pub fn prepare_cache(&self) -> Result<()> {
+        self.config.validate()?;
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async {
+                self.inventory().await?;
+                self.prepare_container().await
+            })
+    }
+
+    async fn prepare_container(&self) -> Result<()> {
+        let cache = self
+            .cache
+            .as_ref()
+            .context("missing prepared cache volume")?;
+        let container = resource_name(&self.sha)?;
+        let args = self.container_args(&container, true)?;
+        if !self
+            .command(
+                &["volume".into(), "create".into(), cache.clone()],
+                Duration::from_secs(10),
+            )
+            .await?
+        {
+            bail!("creating private dependency cache failed");
+        }
+        let result = self
+            .command(&args, Duration::from_secs(self.config.timeout_secs))
+            .await;
+        let cleanup = self
+            .command(
+                &["rm".into(), "--force".into(), "--volumes".into(), container],
+                Duration::from_secs(10),
+            )
+            .await;
+        if matches!((&result, &cleanup), (Ok(true), Ok(true))) {
+            return Ok(());
+        }
+        let removal = self
+            .command(
+                &["volume".into(), "rm".into(), cache.clone()],
+                Duration::from_secs(10),
+            )
+            .await;
+        bail!(
+            "dependency preparation failed: command={result:?}, container cleanup={cleanup:?}, cache cleanup={removal:?}"
+        )
+    }
+
+    pub fn remove_cache(&self) -> Result<()> {
+        let cache = self
+            .cache
+            .as_ref()
+            .context("missing prepared cache volume")?;
+        let success = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(self.command(
+                &["volume".into(), "rm".into(), cache.clone()],
+                Duration::from_secs(10),
+            ))?;
+        if !success {
+            bail!("removing private dependency cache failed");
+        }
+        Ok(())
     }
 }
 

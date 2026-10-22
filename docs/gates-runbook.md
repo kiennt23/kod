@@ -12,12 +12,13 @@ Build the binary from reviewed main, never from the PR being checked:
 
 ```sh
 cargo build --release --locked -p kod-gates
-docker build -t kod-gates -f images/gates/Dockerfile .
+docker build -t kod-gates --build-arg RUST_VERSION=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml) -f images/gates/Dockerfile .
 docker image inspect kod-gates --format '{{.Id}}'
 kod-gates scan-config --image <sha256-image-id> > scans.json
 ```
 
-Install the binary, policy, `gates/config.json`, `scans.json`, immutable run
+Review and adapt the inactive `gates/config.example.json` before installation.
+Install the binary, policy, adapted configuration, `scans.json`, immutable run
 evidence and current approval snapshots outside all PR workspaces. Protect
 them with host permissions. Use a dedicated gate VM/host and local Docker
 daemon, with `"labels": ["kod.role=gate"]` in its daemon configuration.
@@ -26,17 +27,34 @@ The label is an enforced deployment marker, not proof of physical isolation.
 Do not add that label to a development or sandbox daemon just to pass a check.
 
 Every scan gets a fresh container, a read-only root, the source archive as
-its sole read-only host mount, private tmpfs work/cache, no network, no
+its sole read-only host mount, private disposable disk work/cache, no network, no
 capabilities, no Docker socket, no credentials and bounded resources. The
-wrapper preloads a copy of the image's reviewed dependency cache; nothing
-written by a scan survives or becomes a release/cache input. The image
+wrapper copies a read-only prepared cache into its private disk volume; build
+artifacts no longer consume tmpfs pages from the compiler's memory budget.
+Container cleanup removes its anonymous work volume. Nothing written by a
+scan survives or becomes a release/cache input. The image
 contains Rust tests/clippy, cargo-deny 0.20.2 and gitleaks 8.24.3. Rust SAST
 here means clippy; language-specific security rules require a reviewed
 replacement scan configuration/image.
 
-Rebuild and pin the image after reviewed dependency changes and on an
-advisory database refresh schedule. Offline scans fail on uncached new
-dependencies. Never solve that by giving scans arbitrary network access.
+Each evaluation downloads its exact source archive once. Before scanning,
+the trusted preparation entrypoint fetches that candidate's locked dependencies
+and clones the current advisory DB into a private cache volume. It never runs
+repository tests/build scripts and removes source-owned `.cargo` configuration
+before invoking Cargo. Preparation uses the configured `package_network`
+(default `kod-packages`): a dedicated Docker network with host-enforced egress
+restricted to the package mirror/index and advisory source. Provision and
+verify that network before deployment; merely naming a network does not
+create an egress policy. Preparation has no credentials or host sockets.
+
+The four scans remain networkless and mount prepared data read-only; dependency
+changes no longer need a scanner image rebuild. The cache binds to the candidate
+SHA, expires after 24 hours, and is removed before successful check publication.
+Any dependency fetch, advisory refresh, expiry or cleanup error fails the gates.
+Image-build caches are only seeds for preparation; the connected scan path
+refuses to run without prepared data. Rebuild the tool image when its pinned
+toolchain or scanner versions change. The image toolchain comes from the build
+argument derived from `rust-toolchain.toml`; the wrapper has no fixed version.
 The trusted deny/gitleaks configs live under `/opt/kod`, and source-owned
 gitleaks config, ignore files and inline allow comments cannot suppress a
 finding. Scanner output is discarded so planted credentials cannot leak
@@ -148,31 +166,38 @@ Generate a ruleset using the dedicated App's integration ID:
 kod-gates ruleset --app-id <app-id> > ruleset.json
 ```
 
-Review it with `gates/repository-settings.json` and `.github/CODEOWNERS`.
+The generated ruleset is disabled by default. Review it with
+`gates/repository-settings.json`, `gates/README.md` and `.github/CODEOWNERS`.
 The ruleset pins every check to that App, forbids bypass actors and force
 push/deletion, requires CODEOWNERS, resolved threads, stale approval
 dismissal and approval of the most recent push, and requires a merge queue.
 The separate repository setting disables auto-merge.
 
-After the gate host and event ingester are healthy, an administrator applies:
+An administrator may install the disabled ruleset for inspection:
 
 ```sh
 gh api --method POST repos/<owner>/<repo>/rulesets --input ruleset.json
 gh api --method PATCH repos/<owner>/<repo> --input gates/repository-settings.json
 ```
 
-Verify the active rules through GitHub's API and exercise a real queue
-candidate before enabling delegation. Merge queue availability depends on
+Do not set its enforcement to active until the gate host, event ingester,
+package egress policy and independent reviewer topology pass connected
+acceptance. After activation, verify the active rules through GitHub's API
+and exercise a real queue candidate before enabling delegation. Merge queue availability depends on
 repository ownership and GitHub plan; if unavailable, do not remove the
 merge-time freshness requirement to make activation pass. In particular,
 verify support before applying these rules to the personal `kiennt23/kod`
 repository. Live activation is not claimed by the offline acceptance suite.
 
-`gates/config.json` protects every path because this repo is the harness.
+`gates/config.example.json` protects every path because this repo is the harness.
 The existing policy needs the owner and backup once named; protected changes
 also need two distinct current human approvers, including the configured
-CODEOWNER. The PR author and bot reviews do not count. Add the backup to the
-trusted people/owner configuration and CODEOWNERS when appointed. For product
+CODEOWNER. The PR author and bot reviews do not count. This single-owner
+example cannot pass an owner-authored PR: the owner is required by policy but
+cannot self-approve. A second reviewer alone does not resolve that conflict.
+Keep the profile inactive until reviewers are appointed and the owner decides
+the policy for owner-authored changes. This PR does not relax self-approval or
+allow bypasses. For product
 repos, keep the trusted owners in sync with CODEOWNERS and configure protected
 prefixes for embedded tests and any repository-specific sensitive code.
 

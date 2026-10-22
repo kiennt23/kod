@@ -108,6 +108,9 @@ pub trait Forge {
 pub trait Scanner {
     fn version(&self) -> Result<String>;
     fn scan(&self, name: &str, sha: &str) -> Result<()>;
+    fn finish(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Configuration loaded outside every PR workspace. Prefixes are literal
@@ -124,10 +127,7 @@ pub struct Config {
 
 impl Config {
     pub fn validate(&self) -> Result<()> {
-        let parts: Vec<_> = self.repo.split('/').collect();
-        if parts.len() != 2 || parts.iter().any(|s| !login(s) || matches!(*s, "." | "..")) {
-            bail!("repo must be owner/name");
-        }
+        validate_repo(&self.repo)?;
         if self.codeowners.is_empty() || self.codeowners.iter().any(|s| !login(s)) {
             bail!("codeowners must contain resolved human logins");
         }
@@ -149,6 +149,11 @@ impl Config {
             ".github",
             ".cargo",
             "Cargo.toml",
+            "Cargo.lock",
+            "clippy.toml",
+            ".clippy.toml",
+            "rust-toolchain",
+            "rust-toolchain.toml",
             "build.rs",
             "CODEOWNERS",
             "policy",
@@ -187,6 +192,14 @@ fn login(s: &str) -> bool {
     !s.is_empty()
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+}
+
+pub fn validate_repo(repo: &str) -> Result<()> {
+    let parts: Vec<_> = repo.split('/').collect();
+    if parts.len() != 2 || parts.iter().any(|s| !login(s) || matches!(*s, "." | "..")) {
+        bail!("repo must be owner/name");
+    }
+    Ok(())
 }
 
 pub fn validate_sha(sha: &str) -> Result<()> {
@@ -234,15 +247,14 @@ fn approvers(pr: &PullRequest) -> Result<Vec<String>> {
     }
     if latest
         .values()
-        .any(|r| r.human && r.state == ReviewState::ChangesRequested)
+        .any(|r| r.state == ReviewState::ChangesRequested)
     {
         bail!("an effective human review requests changes");
     }
     Ok(latest
         .into_iter()
         .filter_map(|(name, r)| {
-            (r.human
-                && r.state == ReviewState::Approved
+            (r.state == ReviewState::Approved
                 && r.commit == pr.head
                 && !name.eq_ignore_ascii_case(&pr.author))
             .then_some(name)
@@ -350,7 +362,13 @@ impl Gates<'_> {
         validate_sha(&e.head)?;
         validate_sha(target)?;
         self.invalidate(target)?;
-        let result = self.evaluate(e, target);
+        let result = match (self.evaluate(e, target), self.scanner.finish()) {
+            (result, Ok(())) => result,
+            (Ok(_), Err(cleanup)) => Err(cleanup.context("finishing scan resources")),
+            (Err(error), Err(cleanup)) => {
+                Err(error.context(format!("finishing scan resources: {cleanup:#}")))
+            }
+        };
         match result {
             Ok(checks) => {
                 for check in &checks {
@@ -359,10 +377,24 @@ impl Gates<'_> {
                 Ok(checks)
             }
             Err(error) => {
-                for name in CHECKS {
-                    self.report(target, &Check { name: name.into(), conclusion: Conclusion::Failure, summary: "Gate infrastructure or authoritative records unavailable; retry required".into() })?;
+                let mut reporting_errors = Vec::new();
+                if let Err(audit_error) = self.audit.append(RUN_AUDIT, &json!({"kind": "gate_evaluation_failed",
+                    "repo": self.config.repo, "sha": target, "error": kod_audit::redact::redact(&format!("{error:#}"))})) {
+                    reporting_errors.push(format!("recording evaluation failure: {audit_error:#}"));
                 }
-                Err(error)
+                for name in CHECKS {
+                    if let Err(report_error) = self.report(target, &Check { name: name.into(), conclusion: Conclusion::Failure, summary: "Gate infrastructure or authoritative records unavailable; retry required".into() }) {
+                        reporting_errors.push(format!("{name}: {report_error:#}"));
+                    }
+                }
+                if reporting_errors.is_empty() {
+                    Err(error)
+                } else {
+                    Err(error.context(kod_audit::redact::redact(&format!(
+                        "failure reporting errors: {}",
+                        reporting_errors.join("; ")
+                    ))))
+                }
             }
         }
     }
@@ -471,7 +503,7 @@ pub fn ruleset(app_id: u64) -> Result<serde_json::Value> {
         bail!("a dedicated GitHub App ID is required");
     }
     Ok(
-        json!({"name": "kod-gates", "target": "branch", "enforcement": "active", "bypass_actors": [],
+        json!({"name": "kod-gates", "target": "branch", "enforcement": "disabled", "bypass_actors": [],
         "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
         "rules": [
             {"type": "deletion"}, {"type": "non_fast_forward"},

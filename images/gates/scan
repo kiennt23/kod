@@ -1,13 +1,22 @@
 #!/bin/sh
 set -eu
-mkdir /work/src
+mkdir /work/src /work/tmp
+export TMPDIR=/work/tmp
 tar -xzf /input/source.tar.gz --strip-components=1 -C /work/src --no-same-owner --no-same-permissions
 mkdir /work/cargo
-cp -a /opt/kod/cargo/. /work/cargo/
+if [ -d /prepared/cargo ]; then
+  test "$(cat /prepared/sha)" = "$KOD_SOURCE_SHA"
+  prepared_at=$(cat /prepared/at)
+  case "$prepared_at" in ''|*[!0-9]*) exit 1 ;; esac
+  age=$(($(date +%s) - prepared_at))
+  test "$age" -ge 0 && test "$age" -le 86400
+  cp -a /prepared/cargo/. /work/cargo/
+else
+  cp -a /opt/kod/cargo/. /work/cargo/
+fi
 export CARGO_HOME=/work/cargo
 export CARGO_TARGET_DIR=/work/target
 export CARGO_NET_OFFLINE=true
-export RUSTUP_TOOLCHAIN=1.99.0
 cd /work/src
 rm -f .gitleaksignore
 exec "$@"

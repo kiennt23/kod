@@ -7,6 +7,7 @@ publish = false
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+getrandom = "0.4"
 kod-audit = { path = "../kod-audit" }
 kod-policy = { path = "../kod-policy" }
 kod-tracker = { path = "../kod-tracker" }
