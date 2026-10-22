@@ -42,6 +42,12 @@ enum Flaw {
     EveryoneIsAMember,
     TransitionDoesNothing,
     MissingIssueIsOk,
+    MissingReadIsOk,
+    MissingTransitionIsOk,
+    MissingLinkIsOk,
+    MissingReworkIsOk,
+    DropsReworkFields,
+    DropsReworkBacklink,
     DropsRequirementId,
     DropsLinks,
 }
@@ -55,10 +61,21 @@ impl Tracker for Broken {
         self.0.name()
     }
     fn get_issue(&self, key: &str) -> Result<Issue> {
+        if self.1 == Flaw::MissingReadIsOk && key == "FAKE-404" {
+            return self.0.get_issue("FAKE-1");
+        }
         let mut i = self.0.get_issue(key)?;
+        if key.starts_with("REWORK-") {
+            if self.1 == Flaw::DropsReworkFields {
+                i.body = "kod contract test: is the limit 100 or 1000?".into();
+            }
+            if self.1 == Flaw::DropsReworkBacklink {
+                i.links.clear();
+            }
+        }
         match self.1 {
             Flaw::DropsRequirementId => i.requirement_id = None,
-            Flaw::DropsLinks => i.links.clear(),
+            Flaw::DropsLinks if key == "FAKE-1" => i.links.clear(),
             _ => {}
         }
         Ok(i)
@@ -70,15 +87,24 @@ impl Tracker for Broken {
         }
     }
     fn transition(&self, key: &str, state: State) -> Result<()> {
+        if self.1 == Flaw::MissingTransitionIsOk && key == "FAKE-404" {
+            return Ok(());
+        }
         match self.1 {
             Flaw::TransitionDoesNothing => Ok(()),
             _ => self.0.transition(key, state),
         }
     }
     fn link_pr(&self, key: &str, url: &str) -> Result<()> {
+        if self.1 == Flaw::MissingLinkIsOk && key == "FAKE-404" {
+            return Ok(());
+        }
         self.0.link_pr(key, url)
     }
     fn create_linked(&self, story: &str, kind: ReworkKind, fields: &Rework) -> Result<String> {
+        if self.1 == Flaw::MissingReworkIsOk && story == "FAKE-404" {
+            return Ok("nonexistent".into());
+        }
         self.0.create_linked(story, kind, fields)
     }
     fn is_team_member(&self, user: &str) -> Result<bool> {
@@ -147,6 +173,12 @@ fn the_contract_fails_an_adapter_with_any_one_flaw() {
         (Flaw::EveryoneIsAMember, "outsider"),
         (Flaw::TransitionDoesNothing, "transition to"),
         (Flaw::MissingIssueIsOk, "comment on a missing issue"),
+        (Flaw::MissingReadIsOk, "get_issue on a missing issue"),
+        (Flaw::MissingTransitionIsOk, "transition on a missing issue"),
+        (Flaw::MissingLinkIsOk, "link_pr on a missing issue"),
+        (Flaw::MissingReworkIsOk, "create_linked on a missing story"),
+        (Flaw::DropsReworkFields, "lacks its stage"),
+        (Flaw::DropsReworkBacklink, "has no story back-link"),
         (Flaw::DropsRequirementId, "get_issue"),
         (Flaw::DropsLinks, "does not link"),
     ] {

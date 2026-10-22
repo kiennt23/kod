@@ -30,7 +30,7 @@ impl Mapping {
 
     /// Checks a mapping. `at` names its source in errors.
     pub fn parse(at: &str, text: &str) -> Result<Mapping> {
-        let v: Value = serde_json::from_str(text).with_context(|| format!("{at}: not JSON"))?;
+        let v = crate::strict_json::parse(text).with_context(|| format!("{at}: not JSON"))?;
         let o = exact_keys(
             at,
             &v,
@@ -88,6 +88,10 @@ impl Mapping {
     /// The workflow state `transition` moves an issue to.
     pub fn target(&self, s: State) -> &str {
         &self.target[&s]
+    }
+
+    pub fn workflows(&self) -> impl Iterator<Item = &str> {
+        self.standard.keys().map(String::as_str)
     }
 }
 

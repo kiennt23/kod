@@ -14,6 +14,7 @@ repository.
 | [Phase 0 runbook](docs/phase0-runbook.md) | Host setup, pinned images, smoke test, baseline, kill-switch drill, exit criteria |
 | [Phase 1 gate runner](docs/gates-runbook.md) | Trusted checks, isolated scanners, GitHub rules and activation requirements |
 | [Workflow status](docs/status-runbook.md) | `kod status`, computed story progress and one maintained tracker comment |
+| [GitHub Issues tracker](docs/github-tracker-runbook.md) | First tracker adapter, issue metadata, signed events and status-comment recovery |
 | [Building the eval set](docs/eval-set.md) | How to turn merged changes into cases, test commands per language, adversarial cases |
 | [Pinned versions](evals/VERSIONS.md) | Every version a baseline depends on |
 | [ADR 0001](docs/adr/0001-per-task-execution-mode.md) | How implementation plans are executed and reviewed |

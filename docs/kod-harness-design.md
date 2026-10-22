@@ -276,7 +276,7 @@ The controls in Trust boundaries and the matrix below aren't reduced. Only how t
 
 ## Issue tracker: pluggable
 
-**Decision:** the harness doesn't depend on any one tracker. Jira, Linear, GitHub Issues and others plug in through a tracker adapter and the tracker's MCP server, selected in the artifact registry. The first tracker is still to be chosen.
+**Decision:** the harness doesn't depend on any one tracker. Jira, Linear, GitHub Issues and others plug in through a tracker adapter and the tracker's MCP server, selected in the artifact registry. GitHub Issues is the first tracker (sub-plan 6c).
 
 The tracker connects to the harness in two places, so pluggability needs two pieces:
 
@@ -315,7 +315,7 @@ The tracker connects to the harness in two places, so pluggability needs two pie
 
 **To decide:**
 
-- [ ] First tracker (Jira, Linear or GitHub Issues)
+- [x] First tracker: GitHub Issues, selected by the owner for sub-plan 6c
 
 - [ ] The API scopes and rate limits our tracker adapter needs
 

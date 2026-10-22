@@ -6,7 +6,11 @@ use serde::{Deserialize, Serialize};
 
 pub mod contract;
 pub mod fake;
+pub mod github;
 pub mod mapping;
+mod signature;
+mod strict_json;
+pub use signature::hmac_sha256;
 
 /// The standard workflow states. The core uses only these.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -71,7 +75,8 @@ pub enum ReworkKind {
 }
 
 /// What a rework request records, besides the story it is linked to.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Rework {
     /// The stage that found the problem, e.g. "build".
     pub stage: String,

@@ -1,0 +1,29 @@
+{
+  "action": "edited",
+  "repository": {
+    "full_name": "Codertocat/Hello-World"
+  },
+  "sender": {
+    "id": 21031067,
+    "login": "Codertocat",
+    "type": "User"
+  },
+  "issue": {
+    "id": 444500041,
+    "number": 1,
+    "repository_url": "https://api.github.com/repos/Codertocat/Hello-World",
+    "title": "Spelling error in the README file",
+    "body": "It looks like you accidently spelled 'commit' with two 't's.",
+    "state": "open",
+    "user": {
+      "id": 21031067,
+      "login": "Codertocat",
+      "type": "User"
+    },
+    "labels": [
+      {
+        "name": "bug"
+      }
+    ]
+  }
+}
