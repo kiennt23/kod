@@ -112,7 +112,8 @@ impl Mcp {
             .text()
             .map_err(|e| anyhow!("reading the tool gateway's reply: {}", e.without_url()))?;
         if !status.is_success() {
-            let head = scrub(crate::api::head(&text, 200));
+            let scrubbed = scrub(&text);
+            let head = crate::api::head(&scrubbed, 200);
             bail!("{method}: HTTP {status}: {head}");
         }
         let mut r: Value = serde_json::from_str(&text)

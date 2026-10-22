@@ -156,3 +156,22 @@ fn an_error_page_that_echoes_the_path_does_not_leak_the_run_token() {
     assert!(e.contains("/r/[REDACTED]/mcp"), "{e}");
     assert!(!e.contains(TOKEN), "{e}");
 }
+
+#[test]
+fn an_echoed_token_cut_by_the_error_length_limit_does_not_leak() {
+    // The echoed path starts ~180 chars in, so a cut at 200 chars would
+    // leave a partial token that scrub no longer recognises.
+    let app = axum::Router::new().fallback(|uri: axum::http::Uri| async move {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("{} no handler for {uri}", "x".repeat(160)),
+        )
+    });
+    let base = serve(app);
+    let e = Mcp::connect(&format!("{base}/r/{TOKEN}/mcp"))
+        .err()
+        .unwrap();
+    let e = format!("{e:#}");
+    assert!(e.contains("HTTP 500"), "{e}");
+    assert!(!e.contains(&TOKEN[..16]), "{e}");
+}
