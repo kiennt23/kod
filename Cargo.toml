@@ -7,6 +7,7 @@ members = [
     "crates/kod-llm-proxy",
     "crates/kod-loop",
     "crates/kod-policy",
+    "crates/kod-status",
     "crates/kod-tool-gateway",
     "crates/kod-tracker",
 ]

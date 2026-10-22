@@ -98,7 +98,7 @@ impl RunState {
         }
     }
 
-    fn parse(name: &str) -> Result<RunState> {
+    pub fn parse(name: &str) -> Result<RunState> {
         RunState::ALL
             .into_iter()
             .find(|s| s.name() == name)
