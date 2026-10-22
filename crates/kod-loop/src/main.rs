@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use kod_loop::{Config, Outcome, context};
+use kod_loop::{Config, Outcome, context, mcp::Mcp};
 use std::{io::Read, path::PathBuf, process::ExitCode, time::Duration};
 
 /// Kod's agent loop. Reads the prompt on stdin, works in the current
@@ -30,7 +30,9 @@ struct Cli {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let outcome = match setup(&cli) {
-        Ok((cfg, prompt)) => kod_loop::run(&cfg, &prompt, &mut std::io::stderr()),
+        Ok((cfg, prompt, mcp)) => {
+            kod_loop::run_with(&cfg, mcp.as_ref(), &prompt, &mut std::io::stderr())
+        }
         Err(e) => Outcome::failed(format!("{e:#}")),
     };
     println!(
@@ -44,7 +46,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn setup(cli: &Cli) -> Result<(Config, String)> {
+fn setup(cli: &Cli) -> Result<(Config, String, Option<Mcp>)> {
     let base = std::fs::read_to_string(&cli.system_prompt)
         .with_context(|| format!("reading {}", cli.system_prompt.display()))?;
     let base_url = std::env::var("ANTHROPIC_BASE_URL")
@@ -68,5 +70,11 @@ fn setup(cli: &Cli) -> Result<(Config, String)> {
         command_timeout: Duration::from_secs(cli.command_timeout_secs),
         retry_backoff: [2, 10, 30].map(Duration::from_secs).to_vec(),
     };
-    Ok((cfg, prompt))
+    // Optional: without it the run has only its local tools. Set and
+    // unreachable is a failed run, not a run without the gateway.
+    let mcp = match std::env::var("KOD_MCP_URL") {
+        Ok(url) => Some(Mcp::connect(&url).context("KOD_MCP_URL: the tool gateway")?),
+        Err(_) => None,
+    };
+    Ok((cfg, prompt, mcp))
 }
