@@ -1,0 +1,17 @@
+#!/bin/sh
+set -eu
+mkdir /work/src /work/tmp
+export TMPDIR=/work/tmp
+tar -xzf /input/source.tar.gz --strip-components=1 -C /work/src --no-same-owner --no-same-permissions
+find /work/src -name .cargo -prune -exec rm -rf -- {} +
+mkdir /prepared/cargo
+cp -a /opt/kod/cargo/. /prepared/cargo/
+export CARGO_HOME=/prepared/cargo
+export CARGO_NET_OFFLINE=false
+export CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
+cd /work/src
+cargo fetch --locked
+rm -rf /prepared/cargo/advisory-dbs
+cargo deny --config /opt/kod/deny.toml fetch
+printf '%s\n' "$KOD_SOURCE_SHA" > /prepared/sha
+date +%s > /prepared/at

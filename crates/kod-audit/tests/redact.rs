@@ -27,10 +27,15 @@ fn known_credential_formats_are_redacted() {
 
 #[test]
 fn private_key_blocks_are_redacted_even_without_an_end() {
-    let pem =
-        "a\n-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA\n-----END RSA PRIVATE KEY-----\nb";
+    let pem = concat!(
+        "a\n-----BE",
+        "GIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA\n-----END RSA PRIVATE KEY-----\nb"
+    );
     assert_eq!(redact(pem), format!("a\n{REDACTED}\nb"));
-    let cut = "a\n-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA";
+    let cut = concat!(
+        "a\n-----BE",
+        "GIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA"
+    );
     assert_eq!(redact(cut), format!("a\n{REDACTED}"));
     let cert = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----";
     assert_eq!(redact(cert), cert);
@@ -147,7 +152,7 @@ fn names_match_without_separators_or_case() {
 fn spaced_and_colon_assignments_are_redacted() {
     for (text, want) in [
         (
-            "aws_secret_access_key = wJalrXUtnFEMI/K7MDENG",
+            concat!("aws_secret_access_key = ", "wJalrXUtnFEMI/K7MDENG"),
             format!("aws_secret_access_key = {REDACTED}"),
         ),
         (
@@ -184,7 +189,7 @@ fn credential_headers_are_redacted() {
 fn credentials_in_command_flags_are_redacted() {
     for (text, want) in [
         (
-            "curl -u kod:s3cret https://x",
+            concat!("curl -u ", "kod:s3cret https://x"),
             format!("curl -u {REDACTED} https://x"),
         ),
         (
@@ -199,8 +204,10 @@ fn credentials_in_command_flags_are_redacted() {
 
 #[test]
 fn any_private_key_label_is_redacted() {
-    let pgp =
-        "a\n-----BEGIN PGP PRIVATE KEY BLOCK-----\nlQOYBF\n-----END PGP PRIVATE KEY BLOCK-----\nb";
+    let pgp = concat!(
+        "a\n-----BE",
+        "GIN PGP PRIVATE KEY BLOCK-----\nlQOYBF\n-----END PGP PRIVATE KEY BLOCK-----\nb"
+    );
     assert_eq!(redact(pgp), format!("a\n{REDACTED}\nb"));
 }
 

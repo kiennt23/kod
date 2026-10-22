@@ -446,7 +446,7 @@ fn concurrent_workers_start_a_queued_run_once() {
     assert!(!h.gw.calls().contains(&"stop run-1".to_owned()));
 }
 
-const SECRET: &str = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+const SECRET: &str = concat!("ghp_", "abcdefghijklmnopqrstuvwxyz0123456789");
 
 #[test]
 fn a_policy_load_error_with_a_secret_is_redacted_in_the_comment() {

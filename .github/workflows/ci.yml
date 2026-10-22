@@ -24,3 +24,12 @@ jobs:
       - run: docker build -t kod-llm-proxy --build-arg RUST_VERSION=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml) -f images/proxy/Dockerfile .
       - run: docker build -t kod-sandbox-test --build-arg RUST_VERSION=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml) --build-arg EXTRA_PACKAGES=curl -f images/sandbox/Dockerfile .
       - run: cargo test -p kod-eval --test docker --test gateway_down --test kill_switch --test kod_loop
+  gates:
+    runs-on: ubuntu-24.04
+    needs: check
+    env:
+      KOD_DOCKER_TESTS: "1"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: docker build -t kod-gates-test --build-arg RUST_VERSION=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml) -f images/gates/Dockerfile .
+      - run: KOD_GATE_TEST_IMAGE=$(docker image inspect kod-gates-test --format '{{.Id}}') KOD_DOCKER_BIN=$(command -v docker) cargo test -p kod-gates

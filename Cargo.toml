@@ -3,6 +3,7 @@ members = [
     "crates/kod-audit",
     "crates/kod-dispatcher",
     "crates/kod-eval",
+    "crates/kod-gates",
     "crates/kod-llm-proxy",
     "crates/kod-loop",
     "crates/kod-policy",

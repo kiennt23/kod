@@ -12,6 +12,7 @@ repository.
 | [Kod: an agent harness for our SDLC](docs/kod-harness-design.md) | Harness architecture, PR flow, rework and staleness, pluggable models/trackers/runners, Rust components, policies, roadmap |
 | [DevSecOps SDLC with AI Agents](docs/devsecops-sdlc.md) | Stages, gates, rework loops, stage outputs, agent roster, control architecture, threats, risks, metrics, rollout |
 | [Phase 0 runbook](docs/phase0-runbook.md) | Host setup, pinned images, smoke test, baseline, kill-switch drill, exit criteria |
+| [Phase 1 gate runner](docs/gates-runbook.md) | Trusted checks, isolated scanners, GitHub rules and activation requirements |
 | [Building the eval set](docs/eval-set.md) | How to turn merged changes into cases, test commands per language, adversarial cases |
 | [Pinned versions](evals/VERSIONS.md) | Every version a baseline depends on |
 | [ADR 0001](docs/adr/0001-per-task-execution-mode.md) | How implementation plans are executed and reviewed |

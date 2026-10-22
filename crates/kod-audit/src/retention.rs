@@ -6,7 +6,8 @@ use serde_json::{Value, json};
 
 /// Payloads logically cleared per transaction, so a purge never holds the write lock
 /// long enough to time out a gateway append.
-pub const PURGE_BATCH: usize = 500;
+/// Per-entry policy evaluation needs headroom on shared CI and gate hosts.
+pub const PURGE_BATCH: usize = 100;
 
 impl AuditLog {
     /// Deletes the payloads of `record_type` entries whose retention has

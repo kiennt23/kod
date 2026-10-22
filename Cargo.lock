@@ -875,6 +875,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "kod-gates"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "getrandom 0.4.3",
+ "kod-audit",
+ "kod-policy",
+ "kod-tracker",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "kod-llm-proxy"
 version = "0.1.0"
 dependencies = [
