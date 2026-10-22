@@ -72,6 +72,7 @@ pub struct FakeIssue {
 struct Inner {
     issues: BTreeMap<String, FakeIssue>,
     comments: Vec<(String, String)>,
+    status_comments: BTreeMap<String, usize>,
     prs: Vec<(String, String)>,
     members: HashSet<String>,
     created: u64,
@@ -191,6 +192,17 @@ impl Tracker for FakeTracker {
         let target = self.mapping.target(state).to_owned();
         self.with_issue(key, |i| {
             i.issues.get_mut(key).unwrap().workflow_state = target;
+        })
+    }
+
+    fn status_comment(&self, key: &str, text: &str) -> Result<()> {
+        self.with_issue(key, |i| {
+            if let Some(&index) = i.status_comments.get(key) {
+                i.comments[index].1 = text.into();
+            } else {
+                i.status_comments.insert(key.into(), i.comments.len());
+                i.comments.push((key.into(), text.into()));
+            }
         })
     }
 

@@ -46,6 +46,32 @@ pub trait Artifacts {
     fn current(&self, pinned_link: &str) -> Result<String>;
 }
 
+pub fn check_pins(
+    pins: &[String],
+    required_links: &[String],
+    artifacts: &dyn Artifacts,
+) -> Result<()> {
+    if required_links.is_empty() {
+        bail!("the story has no required approved inputs");
+    }
+    let unique: BTreeSet<_> = pins.iter().cloned().collect();
+    if unique.len() != pins.len() {
+        bail!("duplicate run pins");
+    }
+    let mut required = BTreeSet::new();
+    for link in required_links {
+        let current = artifacts.current(link)?;
+        if current.trim().is_empty() {
+            bail!("artifact registry returned an empty revision");
+        }
+        required.insert(current);
+    }
+    if unique != required {
+        bail!("required inputs are missing or superseded");
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ReviewState {
@@ -314,25 +340,7 @@ impl Gates<'_> {
         {
             bail!("run evidence is missing or does not bind this head and policy");
         }
-        if issue.approved_versions.is_empty() {
-            bail!("the story has no required approved inputs");
-        }
-        let pins: BTreeSet<_> = e.pins.iter().cloned().collect();
-        if pins.len() != e.pins.len() {
-            bail!("duplicate run pins");
-        }
-        let mut required = BTreeSet::new();
-        for link in &issue.approved_versions {
-            let current = self.artifacts.current(link)?;
-            if current.trim().is_empty() {
-                bail!("artifact registry returned an empty revision");
-            }
-            required.insert(current);
-        }
-        if pins != required {
-            bail!("required inputs are missing or superseded");
-        }
-        Ok(())
+        check_pins(&e.pins, &issue.approved_versions, self.artifacts)
     }
 
     fn approved(

@@ -2,13 +2,15 @@
 //! issue tracker, in standard states and fields. Tracker-specific names live
 //! in each tracker's mapping (see `mapping`), never in the core.
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 
 pub mod contract;
 pub mod fake;
 pub mod mapping;
 
 /// The standard workflow states. The core uses only these.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum State {
     Ready,
     InProgress,
@@ -39,7 +41,8 @@ impl State {
 }
 
 /// An issue in standard fields.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Issue {
     /// The tracker's own key, e.g. PAY-123.
     pub key: String,
@@ -59,7 +62,8 @@ pub struct Issue {
 }
 
 /// The kind of a rework request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ReworkKind {
     Question,
     Amendment,
@@ -136,6 +140,11 @@ pub trait Tracker: Send + Sync {
     /// Errors if the issue's workflow state is not in the mapping.
     fn get_issue(&self, key: &str) -> Result<Issue>;
     fn comment(&self, key: &str, text: &str) -> Result<()>;
+    /// Upsert the single Kod-owned status comment; never select a human comment by its text.
+    /// Implementations serialize updates per story and reconcile uncertain creates before retrying.
+    fn status_comment(&self, _key: &str, _text: &str) -> Result<()> {
+        anyhow::bail!("tracker does not support status comments")
+    }
     fn transition(&self, key: &str, state: State) -> Result<()>;
     fn link_pr(&self, key: &str, url: &str) -> Result<()>;
     /// Opens a rework request linked to the story, in a state mapped to
