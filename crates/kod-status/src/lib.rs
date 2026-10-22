@@ -1,9 +1,9 @@
 pub mod records;
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use kod_audit::{AuditLog, RUN_AUDIT, redact::redact};
 use kod_dispatcher::{RunRow, RunState};
-use kod_gates::{CHECKS, Conclusion, validate_repo, validate_sha};
+use kod_gates::{CHECKS, Conclusion, check_pins, validate_repo, validate_sha};
 use kod_tracker::{ReworkKind, State, Tracker};
 use records::{PrState, Records, Snapshot, Source};
 use serde::{Deserialize, Serialize};
@@ -106,13 +106,20 @@ pub struct View {
 }
 
 fn safe(text: &str) -> String {
-    redact(text)
-        .chars()
-        .map(|c| {
-            if c.is_control() || "\\`*_{}[]<>()!#|~@".contains(c) {
-                ' '
-            } else {
+    let chars: Vec<_> = redact(text).chars().collect();
+    chars
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| {
+            if c.is_alphanumeric()
+                || (c == '-'
+                    && i > 0
+                    && chars[i - 1].is_alphanumeric()
+                    && chars.get(i + 1).is_some_and(|c| c.is_alphanumeric()))
+            {
                 c
+            } else {
+                ' '
             }
         })
         .collect()
@@ -212,23 +219,13 @@ fn combined(states: impl IntoIterator<Item = Status>) -> Status {
 }
 
 fn validate(s: &Snapshot, runs: &[RunRow], story: &str) -> Result<()> {
-    ensure!(
-        !story.trim().is_empty() && s.story.key == story,
-        "records belong to another story"
-    );
-    let mut keys = BTreeSet::from([story]);
-    for issue in &s.tickets {
-        ensure!(
-            !issue.key.trim().is_empty() && keys.insert(issue.key.as_str()),
-            "duplicate or empty ticket"
-        );
-        ensure!(
-            s.story.links.contains(&issue.key),
-            "ticket is not linked to this story"
-        );
-    }
+    let keys = s.keys(story)?;
     let mut rework = BTreeSet::new();
     for r in &s.rework {
+        ensure!(
+            r.kind != ReworkKind::Replan || r.target == Stage::Plan,
+            "a replan must target planning"
+        );
         ensure!(
             !r.key.trim().is_empty() && !keys.contains(r.key.as_str()) && rework.insert(&r.key),
             "duplicate or invalid rework"
@@ -372,7 +369,7 @@ pub fn compute(records: &Records, story: &str) -> Result<View> {
             ));
         }
         if let Some(r) = runs.last()
-            && !matches!(i.state, State::Done | State::Blocked)
+            && !matches!(i.state, State::Ready | State::Done | State::Blocked)
         {
             status = run_status(r.state);
         }
@@ -385,16 +382,11 @@ pub fn compute(records: &Records, story: &str) -> Result<View> {
                     notes.push(format!("{label} closed"));
                     continue;
                 }
-                PrState::Merged => {
-                    notes.push(format!("{label} merged"));
-                    review_states.push(Status::Approved);
-                    continue;
-                }
-                PrState::Open => {}
+                PrState::Merged | PrState::Open => {}
             }
             let mut required = BTreeSet::new();
             let mut missing = false;
-            for link in s.story.approved_versions.iter().chain(&i.approved_versions) {
+            for link in &s.story.approved_versions {
                 match s
                     .artifacts
                     .iter()
@@ -409,12 +401,10 @@ pub fn compute(records: &Records, story: &str) -> Result<View> {
                     }
                 }
             }
-            let pins: BTreeSet<_> = p.evidence.pins.iter().map(String::as_str).collect();
-            let stale = p.head != p.evidence.head
-                || missing
-                || required.is_empty()
-                || required != pins
-                || pins.len() != p.evidence.pins.len();
+            let merged = matches!(p.state, PrState::Merged);
+            let stale = !merged
+                && (p.head != p.evidence.head
+                    || check_pins(&p.evidence.pins, &s.story.approved_versions, s).is_err());
             let current: BTreeMap<_, _> = p
                 .checks
                 .iter()
@@ -434,7 +424,13 @@ pub fn compute(records: &Records, story: &str) -> Result<View> {
                 };
             notes.push(format!(
                 "{label} {}{}",
-                if p.draft { "draft" } else { "in review" },
+                if merged {
+                    "merged"
+                } else if p.draft {
+                    "draft"
+                } else {
+                    "in review"
+                },
                 if stale { "; stale inputs or head" } else { "" }
             ));
             if stale {
@@ -474,7 +470,9 @@ pub fn compute(records: &Records, story: &str) -> Result<View> {
                     notes.push(format!("{name} failure reason: {}", safe(&check.summary)));
                 }
             }
-            pull_states.push(if gate(&CHECKS) == Status::Blocked {
+            pull_states.push(if merged {
+                Status::Approved
+            } else if gate(&CHECKS) == Status::Blocked {
                 Status::Blocked
             } else if stale {
                 Status::Stale
@@ -483,17 +481,17 @@ pub fn compute(records: &Records, story: &str) -> Result<View> {
             } else {
                 Status::InReview
             });
-            review_states.push(
-                if gate(&["inputs-current", "requester-check", "protected-paths"])
-                    == Status::Blocked
-                {
-                    Status::Blocked
-                } else if stale {
-                    Status::Stale
-                } else {
-                    Status::InReview
-                },
-            );
+            review_states.push(if merged {
+                Status::Approved
+            } else if gate(&["inputs-current", "requester-check", "protected-paths"])
+                == Status::Blocked
+            {
+                Status::Blocked
+            } else if stale {
+                Status::Stale
+            } else {
+                Status::InReview
+            });
             build_states.push(if stale {
                 Status::Stale
             } else {
@@ -505,8 +503,25 @@ pub fn compute(records: &Records, story: &str) -> Result<View> {
                 gate(&["tests"])
             });
         }
-        if !pull_states.is_empty() {
-            if status == Status::Blocked {
+        let has_open = s
+            .pulls
+            .iter()
+            .any(|p| p.ticket == i.key && matches!(p.state, PrState::Open));
+        let latest_merge = s
+            .pulls
+            .iter()
+            .filter(|p| p.ticket == i.key && matches!(p.state, PrState::Merged))
+            .filter_map(|p| kod_dispatcher::store::seq_of(&p.evidence.run))
+            .max();
+        let newer_run = !has_open
+            && latest_merge
+                .zip(
+                    runs.last()
+                        .and_then(|r| kod_dispatcher::store::seq_of(&r.id)),
+                )
+                .is_some_and(|(merged, latest)| latest > merged);
+        if !pull_states.is_empty() && !newer_run && (has_open || i.state != State::Ready) {
+            if status == Status::Blocked && has_open {
                 pull_states.push(status);
             }
             status = combined(pull_states);
@@ -533,12 +548,9 @@ pub fn compute(records: &Records, story: &str) -> Result<View> {
             .status = combined(states);
     }
     let mut rework = Vec::new();
+    let mut rework_states: BTreeMap<Stage, Vec<Status>> = BTreeMap::new();
     for r in s.rework.iter().filter(|r| r.state != State::Done) {
-        let target = if r.kind == ReworkKind::Replan {
-            Stage::Plan
-        } else {
-            r.target
-        };
+        let target = r.target;
         rework.push(format!(
             "{} {:?} -> {} ({})",
             safe(&r.key),
@@ -550,12 +562,17 @@ pub fn compute(records: &Records, story: &str) -> Result<View> {
             let view = stages
                 .get_mut(&target)
                 .ok_or_else(|| anyhow::anyhow!("missing stage"))?;
-            view.status = if r.state == State::Blocked || view.status == Status::Blocked {
-                Status::Blocked
-            } else {
-                Status::InReview
-            };
+            rework_states
+                .entry(target)
+                .or_default()
+                .push(workflow(r.state));
             view.details.push(format!("rework {}", safe(&r.key)));
+        }
+    }
+    for (stage, states) in rework_states {
+        let view = stages.get_mut(&stage).context("missing stage")?;
+        if !matches!(view.status, Status::Stale | Status::Blocked) {
+            view.status = combined(states);
         }
     }
     tickets.sort_by(|a, b| a.key.cmp(&b.key));
@@ -587,6 +604,19 @@ pub fn refresh(
         bail!("tracker returned another story");
     }
     let text = view.render();
-    audit.before(RUN_AUDIT, &json!({"kind": "workflow_status_comment", "tracker": tracker.name(), "story": story, "text": text}), || tracker.status_comment(story, &text))??;
+    let intent = audit.append(RUN_AUDIT, &json!({"kind": "workflow_status_comment_intent", "tracker": tracker.name(), "story": story, "text": text}))?;
+    match tracker.status_comment(story, &text) {
+        Ok(()) => {
+            audit.append(RUN_AUDIT, &json!({"kind": "workflow_status_comment_posted", "tracker": tracker.name(), "story": story, "intent": intent})).context("comment posted but recording outcome failed; reconcile before retry")?;
+        }
+        Err(error) => {
+            let reason = redact(&format!("{error:#}"));
+            let failure = anyhow::anyhow!(reason.clone());
+            if let Err(outcome) = audit.append(RUN_AUDIT, &json!({"kind": "workflow_status_comment_failed", "tracker": tracker.name(), "story": story, "intent": intent, "error": reason})) {
+                return Err(failure.context(format!("recording failed comment outcome: {}", redact(&format!("{outcome:#}")))));
+            }
+            return Err(failure);
+        }
+    }
     Ok(view)
 }

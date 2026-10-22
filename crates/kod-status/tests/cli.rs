@@ -16,7 +16,7 @@ fn cli_and_comment_renderer_match_and_host_records_are_read_fresh() {
     )
     .unwrap();
     c.execute(
-        "INSERT INTO runs (ticket, revision, state) VALUES ('OTHER', 'revision', 'blocked')",
+        "INSERT INTO runs (ticket, revision, state, reason) VALUES ('OTHER', 'revision', 'blocked', X'FF')",
         [],
     )
     .unwrap();

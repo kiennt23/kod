@@ -50,7 +50,7 @@ fn stale_pr_and_open_rework_are_visible_in_the_same_story_view() {
         runs: vec![run()],
     };
     let view = compute(&records, "FAKE-1").unwrap();
-    assert_eq!(stage(&view, Stage::Design), Status::InReview);
+    assert_eq!(stage(&view, Stage::Design), Status::NotStarted);
     assert_eq!(stage(&view, Stage::Code), Status::Stale);
     assert_eq!(stage(&view, Stage::Test), Status::Stale);
     assert_eq!(stage(&view, Stage::Release), Status::Unknown);
@@ -201,6 +201,7 @@ fn questions_do_not_rewind_stages_and_replans_return_to_planning() {
     .unwrap();
     assert_eq!(stage(&v, Stage::Design), Status::Approved);
     s.rework[0].kind = ReworkKind::Replan;
+    s.rework[0].target = Stage::Plan;
     let v = compute(
         &Records {
             snapshot: s,
@@ -209,7 +210,7 @@ fn questions_do_not_rewind_stages_and_replans_return_to_planning() {
         "FAKE-1",
     )
     .unwrap();
-    assert_eq!(stage(&v, Stage::Plan), Status::InReview);
+    assert_eq!(stage(&v, Stage::Plan), Status::NotStarted);
 }
 
 #[test]
@@ -300,7 +301,7 @@ fn comments_cannot_inject_mentions_terminal_controls_or_credentials() {
     )
     .unwrap()
     .render();
-    for forbidden in ["@all", "[click]", "\u{1b}", "super-secret"] {
+    for forbidden in ["@all", "[click]", "\u{1b}", "super-secret", "https://"] {
         assert!(!text.contains(forbidden), "{text}");
     }
 }
@@ -309,7 +310,6 @@ fn comments_cannot_inject_mentions_terminal_controls_or_credentials() {
 fn closed_and_merged_prs_remain_history_after_approvals_change() {
     let mut s = snapshot();
     s.rework.clear();
-    s.tickets[0].state = State::Done;
     s.pulls[0].state = kod_status::records::PrState::Merged;
     let v = compute(
         &Records {
@@ -321,6 +321,8 @@ fn closed_and_merged_prs_remain_history_after_approvals_change() {
     .unwrap();
     assert_eq!(stage(&v, Stage::Code), Status::Approved);
     assert_eq!(stage(&v, Stage::Review), Status::Approved);
+    assert_eq!(stage(&v, Stage::Build), Status::Approved);
+    assert_eq!(stage(&v, Stage::Test), Status::Approved);
     assert!(v.render().contains("PR #91 merged"));
     assert!(!v.render().contains("stale inputs"));
     s.pulls[0].state = kod_status::records::PrState::Closed;
@@ -334,6 +336,150 @@ fn closed_and_merged_prs_remain_history_after_approvals_change() {
     .unwrap();
     assert!(v.render().contains("PR #91 closed"));
     assert_eq!(stage(&v, Stage::Review), Status::Unknown);
+}
+
+#[test]
+fn status_pins_use_exactly_the_same_required_set_as_the_gate() {
+    let mut s = snapshot();
+    s.rework.clear();
+    s.tickets[0].approved_versions.push("ticket-only".into());
+    for pins in [
+        vec!["design-v3".into()],
+        vec!["design-v3".into(), "ticket-v1".into()],
+    ] {
+        s.pulls[0].evidence.pins = pins.clone();
+        let records = Records {
+            snapshot: s.clone(),
+            runs: vec![],
+        };
+        let view = compute(&records, "FAKE-1").unwrap();
+        assert_eq!(stage(&view, Stage::Code) == Status::Stale, pins.len() != 1);
+    }
+}
+
+#[test]
+fn ready_tickets_are_not_blocked_by_a_previous_terminal_run() {
+    let mut s = snapshot();
+    s.pulls.clear();
+    s.tickets[0].state = State::Ready;
+    for state in [RunState::Canceled, RunState::OverBudget, RunState::Blocked] {
+        let r = RunRow { state, ..run() };
+        let v = compute(
+            &Records {
+                snapshot: s.clone(),
+                runs: vec![r],
+            },
+            "FAKE-1",
+        )
+        .unwrap();
+        assert_eq!(v.tickets[0].status, Status::NotStarted);
+    }
+}
+
+#[test]
+fn rework_uses_its_workflow_state_and_does_not_hide_stale_work() {
+    let mut s = snapshot();
+    for (state, expected) in [
+        (State::Ready, Status::NotStarted),
+        (State::InProgress, Status::InProgress),
+        (State::InReview, Status::InReview),
+        (State::Blocked, Status::Blocked),
+    ] {
+        s.rework[0].state = state;
+        let v = compute(
+            &Records {
+                snapshot: s.clone(),
+                runs: vec![],
+            },
+            "FAKE-1",
+        )
+        .unwrap();
+        assert_eq!(stage(&v, Stage::Design), expected);
+    }
+    s.rework[0].target = Stage::Code;
+    s.rework[0].state = State::InReview;
+    let v = compute(
+        &Records {
+            snapshot: s,
+            runs: vec![],
+        },
+        "FAKE-1",
+    )
+    .unwrap();
+    assert_eq!(stage(&v, Stage::Code), Status::Stale);
+}
+
+#[test]
+fn a_replan_for_anything_other_than_planning_is_rejected() {
+    let mut s = snapshot();
+    s.rework[0].kind = ReworkKind::Replan;
+    assert!(
+        compute(
+            &Records {
+                snapshot: s,
+                runs: vec![]
+            },
+            "FAKE-1"
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn an_older_merged_pr_does_not_hide_a_later_run_or_a_ready_transition() {
+    let mut s = snapshot();
+    s.pulls[0].state = kod_status::records::PrState::Merged;
+    let r = RunRow {
+        id: "run-3".into(),
+        state: RunState::Running,
+        ..run()
+    };
+    let v = compute(
+        &Records {
+            snapshot: s.clone(),
+            runs: vec![r],
+        },
+        "FAKE-1",
+    )
+    .unwrap();
+    assert_eq!(v.tickets[0].status, Status::InProgress);
+    s.tickets[0].state = State::Ready;
+    let v = compute(
+        &Records {
+            snapshot: s,
+            runs: vec![run()],
+        },
+        "FAKE-1",
+    )
+    .unwrap();
+    assert_eq!(v.tickets[0].status, Status::NotStarted);
+}
+
+#[test]
+fn tracker_markup_and_autolinks_are_neutralized_in_untrusted_fields() {
+    let mut s = snapshot();
+    s.story.title =
+        "+underlined+ ^super^ ??cite?? https://evil.example www.evil.example [label|target]".into();
+    let v = compute(
+        &Records {
+            snapshot: s,
+            runs: vec![],
+        },
+        "FAKE-1",
+    )
+    .unwrap()
+    .render();
+    for markup in [
+        "+underlined+",
+        "^super^",
+        "??cite??",
+        "https://",
+        "www.",
+        "[label|target]",
+    ] {
+        assert!(!v.contains(markup), "{v}");
+    }
+    assert!(v.contains("underlined"));
 }
 
 #[test]

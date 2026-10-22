@@ -5,7 +5,7 @@ use kod_gates::{Check, Evidence};
 use kod_tracker::{Issue, ReworkKind, State};
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::{collections::BTreeSet, path::PathBuf};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -62,6 +62,37 @@ pub struct Snapshot {
     pub rework: Vec<ReworkRecord>,
 }
 
+impl Snapshot {
+    pub(crate) fn keys(&self, story: &str) -> Result<BTreeSet<&str>> {
+        anyhow::ensure!(
+            !story.trim().is_empty() && self.story.key == story,
+            "records belong to another story"
+        );
+        let mut keys = BTreeSet::from([self.story.key.as_str()]);
+        for issue in &self.tickets {
+            anyhow::ensure!(
+                !issue.key.trim().is_empty() && keys.insert(issue.key.as_str()),
+                "duplicate or empty ticket"
+            );
+            anyhow::ensure!(
+                self.story.links.contains(&issue.key),
+                "ticket is not linked to this story"
+            );
+        }
+        Ok(keys)
+    }
+}
+
+impl kod_gates::Artifacts for Snapshot {
+    fn current(&self, link: &str) -> Result<String> {
+        self.artifacts
+            .iter()
+            .find(|a| a.link == link)
+            .and_then(|a| a.approved.clone())
+            .context("unknown approved artifact")
+    }
+}
+
 pub struct Records {
     pub snapshot: Snapshot,
     pub runs: Vec<RunRow>,
@@ -82,16 +113,14 @@ impl Source for HostRecords {
             &std::fs::read(&self.snapshot).context("reading workflow source records")?,
         )
         .context("invalid workflow source records")?;
-        anyhow::ensure!(
-            snapshot.story.key == story,
-            "records belong to another story"
-        );
+        let tickets = snapshot.keys(story)?;
         let c = Connection::open_with_flags(&self.dispatcher, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .context("opening dispatcher records read-only")?;
         c.busy_timeout(kod_dispatcher::store::BUSY_TIMEOUT)?;
+        let placeholders = vec!["?"; tickets.len()].join(",");
         let rows = c
-            .prepare("SELECT seq, ticket, revision, state, reason FROM runs ORDER BY seq")?
-            .query_map([], |r| {
+            .prepare(&format!("SELECT seq, ticket, revision, state, reason FROM runs WHERE ticket IN ({placeholders}) ORDER BY seq"))?
+            .query_map(rusqlite::params_from_iter(tickets.iter()), |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
                     r.get::<_, String>(1)?,
@@ -101,15 +130,8 @@ impl Source for HostRecords {
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        let tickets: std::collections::BTreeSet<_> = snapshot
-            .tickets
-            .iter()
-            .map(|i| i.key.as_str())
-            .chain([story])
-            .collect();
         let runs = rows
             .into_iter()
-            .filter(|(_, ticket, _, _, _)| tickets.contains(ticket.as_str()))
             .map(|(seq, ticket, revision, state, reason)| {
                 anyhow::ensure!(seq > 0, "invalid dispatcher run sequence");
                 Ok(RunRow {

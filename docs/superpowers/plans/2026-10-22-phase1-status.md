@@ -29,8 +29,8 @@ tracker and event integration remain 6c/6b work.
   default is an explicit unsupported error, so older/read-only adapters
   cannot silently append duplicates. The fake implements the operation.
 - `refresh` loads and renders the view, verifies the target story exists,
-  records the exact text through the existing audit-before-action primitive,
-  and updates the comment. The trusted host serializes the entire operation
+  records an intent with the exact text before the write, then records the
+  posted/failed outcome linked to that intent. The trusted host serializes the entire operation
   with other refreshes and record replacement for that story.
 
 ## Computation rules
@@ -40,11 +40,16 @@ stage in progress/review, without invalidating the prior approval. Missing
 required approvals, changed pins or a changed PR head mark an open PR stale.
 Only checks for the current head count; missing checks remain unknown.
 The adapter supplies the effective check generation, not all check history.
+The required set uses only the story's approved links and is checked with
+the same helper as `inputs-current`.
 
 Ticket state and the numerically latest run determine activity; an ended
 agent run does not prove that its PR merged. All recorded runs and PRs are
-listed. Open amendments return their target stage to review, and replans
-return planning to review. Questions are shown without rewinding a stage;
+listed. Merged PRs complete their ticket and supply historical Build/Test
+results, while newer runs and Ready transitions preserve reopened work.
+Ready tickets are not overridden by historical run outcomes. Open amendments
+and replans use their own workflow state without hiding staleness; replans
+must target Plan. Questions are shown without rewinding a stage;
 closed rework does not rewind anything. Unknown stages are not reported as
 approved. The view grants no permission and cannot substitute for gates.
 
@@ -66,14 +71,14 @@ See `docs/status-runbook.md` for operation and the final validation evidence.
 
 ## Implementation verification
 
-- `cargo test --all`: 500 passed, zero failures; existing Docker tests kept
+- `cargo test --all`: 510 passed, zero failures; existing Docker tests kept
   their normal opt-in behavior (`KOD_DOCKER_TESTS` unset).
 - `cargo clippy --all-targets -- -D warnings`, `cargo fmt --all --check` and
   `git diff --check`: passed.
 - Executed the `kod status` binary in text and JSON modes against a seeded
   story and SQLite run records. It showed PR #91 pinned to design-v3 as stale
-  against approved design-v4, plus amendment REWORK-320 returning Design to
-  review. Missing stage/check records showed unknown.
+  against approved design-v4, plus amendment REWORK-320 at its own workflow
+  state. Missing stage/check records showed unknown.
 - CLI tests compare the actual process output with the shared comment
   renderer and verify fresh reads and unchanged dispatcher DB contents.
   Comment tests verify repeated and concurrent upserts preserve human text,
@@ -84,3 +89,20 @@ See `docs/status-runbook.md` for operation and the final validation evidence.
 - No live tracker/App integration, Docker opt-in suite, deployment or held-out
   model eval was run. This projection changes no runner, model or gate policy;
   connected acceptance remains 6b/6c.
+
+## Review corrections
+
+The status view and gate now share pin validation. Merged PRs contribute
+Build/Test results and completion without masking a newer run or Ready
+transition. Rework uses its recorded state, preserves staleness, and rejects
+replans outside Plan. Free-text punctuation is neutralized to prevent URL
+autolinks and tracker markup. Comment audit records distinguish intent,
+posted and failed outcomes, including redacted errors and explicit outcome
+recording failures. SQL filters runs before decoding them, using a shared
+story/ticket validator.
+
+Twelve regression cases failed before the fixes. The final workspace run
+passes all 510 tests, including audit outcome failures and an unrelated
+malformed run row that must never be read for this story. Whole-branch
+self-review covered the shared gate helper, parameter binding, outcome
+ordering, conservative status aggregation and retained integration boundary.
