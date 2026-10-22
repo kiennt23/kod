@@ -112,6 +112,22 @@ pub fn check(t: &dyn Tracker, s: &Sandbox) {
         r.body.contains(&rework.text),
         "the rework request lacks its text: {r:?}"
     );
+    for (field, value) in [
+        ("stage", rework.stage.as_str()),
+        ("artifact", rework.artifact.as_str()),
+        ("version", rework.version.as_str()),
+        ("evidence", rework.evidence[0].as_str()),
+        ("kind", "question"),
+    ] {
+        assert!(
+            r.body.to_lowercase().contains(&value.to_lowercase()),
+            "the rework request lacks its {field}: {r:?}"
+        );
+    }
+    assert!(
+        r.links.iter().any(|linked| linked == key),
+        "the rework request has no story back-link: {r:?}"
+    );
     let story = t.get_issue(key).expect("get_issue after create_linked");
     assert!(
         story.links.contains(&created),

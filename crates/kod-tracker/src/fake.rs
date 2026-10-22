@@ -1,13 +1,13 @@
 //! An in-memory tracker for other sub-plans' tests. It keeps issues in
 //! workflow states and custom fields, as a real tracker does, and reads them
 //! through a `Mapping`, so it exercises the mapping too.
+pub use crate::hmac_sha256;
 use crate::{
     Delivery, Issue, Rework, ReworkKind, State, TaskEvent, Tracker, Webhook, contract::Sandbox,
     mapping::Mapping,
 };
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashSet},
     sync::Mutex,
@@ -32,26 +32,6 @@ pub const FAKE_MAPPING: &str = r#"{
 /// The signature header: hex HMAC-SHA256 of the body, keyed by the secret.
 /// The body's "delivery" field is the delivery ID, so it is signed too.
 pub const SIGNATURE: &str = "x-fake-signature";
-
-/// HMAC-SHA256 (RFC 2104) over sha2, which the workspace already has.
-pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
-    let mut block = [0u8; 64];
-    if key.len() > 64 {
-        block[..32].copy_from_slice(&Sha256::digest(key));
-    } else {
-        block[..key.len()].copy_from_slice(key);
-    }
-    let pad = |byte: u8| block.map(|b| b ^ byte);
-    let inner = Sha256::new()
-        .chain_update(pad(0x36))
-        .chain_update(data)
-        .finalize();
-    Sha256::new()
-        .chain_update(pad(0x5c))
-        .chain_update(inner)
-        .finalize()
-        .into()
-}
 
 /// An issue as the fake stores it: tracker names, not standard ones.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -126,10 +106,7 @@ impl FakeTracker {
 
     /// The signature header value for this body.
     pub fn sign(&self, body: &[u8]) -> String {
-        hmac_sha256(self.secret.as_bytes(), body)
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect()
+        crate::signature::hex(&hmac_sha256(self.secret.as_bytes(), body))
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {

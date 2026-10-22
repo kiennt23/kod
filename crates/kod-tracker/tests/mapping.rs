@@ -1,6 +1,26 @@
 use kod_tracker::{State, mapping::Mapping};
 use serde_json::{Value, json};
 
+#[test]
+fn duplicate_keys_at_any_mapping_depth_are_rejected() {
+    let valid: Value = serde_json::from_str(kod_tracker::fake::FAKE_MAPPING).unwrap();
+    let text = valid.to_string();
+    for (before, after) in [
+        (
+            "\"tracker\":\"fake\"",
+            "\"tracker\":\"fake\",\"tracker\":\"fake\"",
+        ),
+        (
+            "\"requirement_id\":\"req\"",
+            "\"requirement_id\":\"other\",\"requirement_id\":\"req\"",
+        ),
+    ] {
+        let duplicate = text.replacen(before, after, 1);
+        assert_ne!(duplicate, text);
+        assert!(Mapping::parse("duplicate", &duplicate).is_err());
+    }
+}
+
 fn good() -> Value {
     json!({
         "tracker": "acme",

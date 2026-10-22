@@ -984,11 +984,14 @@ name = "kod-tracker"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",
  "subtle",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]

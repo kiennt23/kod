@@ -1,0 +1,13 @@
+{
+  "tracker": "github",
+  "states": {
+    "ready": ["open"],
+    "in_progress": ["kod:in-progress"],
+    "in_review": ["kod:in-review"],
+    "blocked": ["kod:blocked"],
+    "done": ["closed"]
+  },
+  "fields": {"requirement_id": "requirement_id", "risk_class": "risk_class"},
+  "trigger_label": "kod",
+  "team_group": "repository-writers"
+}

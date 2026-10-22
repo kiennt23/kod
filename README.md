@@ -9,8 +9,9 @@ repository.
 
 Phase 0 is built. The first baseline (real cases, real model) is still to run.
 
-Phase 1 sub-plans 1 to 6, 6a, 7 and 8 are merged. 6b (connected integration),
-6c (first tracker adapter) and 9 (upstream doc drafting) are not started. The
+Phase 1 sub-plans 1 to 6, 6a, 7 and 8 are merged. Sub-plan 6c implements the
+GitHub Issues tracker adapter; connected acceptance remains 6b. Sub-plans
+6b (connected integration) and 9 (upstream doc drafting) are not started. The
 per-sub-plan table is in the
 [phase 1 overview](docs/superpowers/plans/2026-10-14-phase1-overview.md).
 The dispatcher and the tool gateway are libraries until 6b wires them into a
@@ -31,6 +32,7 @@ process, so they have no binary yet.
 | [Tool gateway runbook](docs/tool-gateway-runbook.md) | Run tokens, tools, publish, failure behaviour |
 | [Phase 1 gate runner](docs/gates-runbook.md) | Trusted checks, isolated scanners, GitHub rules and activation requirements |
 | [Workflow status](docs/status-runbook.md) | `kod status`, computed story progress and one maintained tracker comment |
+| [GitHub Issues tracker](docs/github-tracker-runbook.md) | First tracker adapter, issue metadata, signed events and status-comment recovery |
 | [Building the eval set](docs/eval-set.md) | How to turn merged changes into cases, test commands per language, adversarial cases |
 | [Pinned versions](evals/VERSIONS.md) | Every version a baseline depends on |
 | [ADR 0001](docs/adr/0001-per-task-execution-mode.md) | How implementation plans are executed and reviewed |
@@ -46,7 +48,7 @@ Docs live in this repo as Markdown. A build PR updates the README, the overview 
 | `crates/kod-loop` | Our agent loop, built into every sandbox image (`--runner kod-loop`) |
 | `crates/kod-policy` | Policy engine: Rego rules and data in `policy/`, evaluated in process |
 | `crates/kod-audit` | Hash-chained SQLite audit log and the `kod-audit` CLI |
-| `crates/kod-tracker` | Tracker adapter contract, a fake adapter and the contract test |
+| `crates/kod-tracker` | Tracker adapter contract, GitHub Issues adapter, fake adapter and contract tests |
 | `crates/kod-tool-gateway` | MCP tools for a run, and the host-only publish operation (library) |
 | `crates/kod-dispatcher` | Webhooks to runs, kill switch and recovery (library) |
 | `crates/kod-gates` | Trusted check runner for pull requests |
