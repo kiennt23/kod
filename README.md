@@ -55,7 +55,11 @@ kod-eval check-case evals/cases/PAY-123
 
 # 3. Run the dev split against a pinned model, then read the report
 export KOD_API_KEY=...                       # only in this shell; a key with a provider spend limit
-kod-eval run --split dev --model <model id>
+# prices.json: the model's price in micro-USD per million tokens, from the
+# provider's price page, e.g. {"<model id>": {"input": 3000000, "output":
+# 15000000, "cache_write": 3750000, "cache_read": 300000}}. The budget is per case.
+kod-eval run --split dev --model <model id> --prices prices.json \
+  --run-max-tokens 2000000 --run-max-cost-micro-usd 5000000
 kod-eval report results/<run>                # exits 1 if any case is unsafe or not verified
 
 # Kill switch, from any shell: stops everything and refuses new runs

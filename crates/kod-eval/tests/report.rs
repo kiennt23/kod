@@ -2,7 +2,7 @@ use kod_eval::{
     case::Split,
     report::{compare, load, median, proxy_denials, proxy_tokens, render, write},
     result::{CaseResult, Safety},
-    run::{Manifest, ProxyLimits},
+    run::{Manifest, ProxyLimits, SpendBudget},
 };
 use std::fs;
 
@@ -262,6 +262,11 @@ fn heads_the_report_with_the_manifest_versions_and_limits() {
         kod_eval_git_sha: "abc123".into(),
         proxy: ProxyLimits::from_env(|_| None, "claude-x".into()).unwrap(),
         proxy_image_id: "sha256:p".into(),
+        spend: Some(SpendBudget {
+            max_tokens: 5000,
+            max_cost_micro_usd: 70,
+            prices: serde_json::json!({}),
+        }),
         sandbox_image_ids: [("rust".to_owned(), "sha256:r".to_owned())].into(),
         base_commits: [("a".to_owned(), "f".repeat(40))].into(),
     };
@@ -275,6 +280,7 @@ fn heads_the_report_with_the_manifest_versions_and_limits() {
         "rust: sha256:r",
         "max_tokens 8192",
         "max_requests 200",
+        "Spend budget per case: max_tokens 5000; max_cost_micro_usd 70",
     ] {
         assert!(text.contains(want), "missing {want}: {text}");
     }
@@ -405,6 +411,61 @@ fn compare_refuses_runs_with_a_different_model_or_gateway() {
     edit_manifest(cand.path(), |m| m.proxy.allowed_models = "m1,m2".into());
     let (_, ok) = compare(base.path(), cand.path()).unwrap();
     assert!(ok);
+}
+
+fn budget(max_tokens: u64) -> Option<SpendBudget> {
+    Some(SpendBudget {
+        max_tokens,
+        max_cost_micro_usd: 1_000_000,
+        prices: serde_json::json!({"m": {"input": 3, "output": 15}}),
+    })
+}
+
+#[test]
+fn compare_refuses_runs_with_different_budgets_or_prices() {
+    let changes: [fn(&mut Manifest); 2] = [
+        |m| m.spend = budget(1),
+        |m| m.spend.as_mut().unwrap().prices = serde_json::json!({}),
+    ];
+    for change in changes {
+        let base = run_with(&[passing("a")]);
+        let cand = run_with(&[passing("a")]);
+        edit_manifest(base.path(), |m| m.spend = budget(100));
+        edit_manifest(cand.path(), |m| m.spend = budget(100));
+        edit_manifest(cand.path(), change);
+        let err = compare(base.path(), cand.path()).unwrap_err().to_string();
+        assert!(err.contains("different spend budgets"), "{err}");
+    }
+}
+
+/// A phase 0 baseline had no budget. It still compares with a budgeted run,
+/// unless the budget refused a request and so may have changed the result.
+#[test]
+fn a_phase0_baseline_compares_only_if_the_budget_refused_nothing() {
+    let base = run_with(&[passing("a")]);
+    let cand = run_with(&[passing("a")]);
+    edit_manifest(cand.path(), |m| m.spend = budget(100));
+    fs::write(
+        cand.path().join("a/proxy.log"),
+        "{\"event\":\"allow\",\"run\":\"a\"}\n",
+    )
+    .unwrap();
+    let (_, ok) = compare(base.path(), cand.path()).unwrap();
+    assert!(ok);
+    for event in ["over_spend", "halted"] {
+        fs::write(
+            cand.path().join("a/proxy.log"),
+            format!("{{\"event\":\"{event}\",\"run\":\"a\"}}\n"),
+        )
+        .unwrap();
+        for (b, c) in [(&base, &cand), (&cand, &base)] {
+            let err = compare(b.path(), c.path()).unwrap_err().to_string();
+            assert!(
+                err.contains("refused 1 requests on its spend budget"),
+                "{err}"
+            );
+        }
+    }
 }
 
 fn put_input(d: &std::path::Path, id: &str, file: &str, text: &str) {

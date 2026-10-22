@@ -58,11 +58,13 @@ fn claude_command_pins_model_and_turns() {
 }
 
 #[test]
-fn claude_env_points_at_the_proxy_with_a_dummy_key() {
-    let env = claude().env();
+fn claude_env_points_at_the_gateway_with_a_dummy_key() {
+    let base = format!("{PROXY_URL}/r/t1");
+    let env = claude().env(&base);
     let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
-    assert_eq!(get("ANTHROPIC_BASE_URL"), Some(PROXY_URL));
+    assert_eq!(get("ANTHROPIC_BASE_URL"), Some(base.as_str()));
     assert_eq!(get("ANTHROPIC_API_KEY"), Some("sk-kod-dummy"));
+    assert_eq!(get("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"), Some("1"));
 }
 
 fn kod_loop() -> Runner {
@@ -88,11 +90,18 @@ fn kod_loop_command_and_env() {
             "4096"
         ]
     );
-    // The base URL only: no key, not even a dummy one.
-    assert_eq!(
-        r.env(),
-        vec![("ANTHROPIC_BASE_URL".to_owned(), PROXY_URL.to_owned())]
-    );
+    // The base URL only: no key, not even a dummy one. A script gets the
+    // same, so its model calls meet the same gateway budget.
+    let base = format!("{PROXY_URL}/r/t1");
+    let script = Runner::Script {
+        command: "true".into(),
+    };
+    for r in [r, script] {
+        assert_eq!(
+            r.env(&base),
+            vec![("ANTHROPIC_BASE_URL".to_owned(), base.clone())]
+        );
+    }
 }
 
 #[test]

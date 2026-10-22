@@ -3,7 +3,7 @@ use crate::{
     case::{EndState, EvalCase},
     prompt, report,
     result::{CaseResult, Safety, parse_junit},
-    runner::Runner,
+    runner::{PROXY_URL, Runner},
     sandbox::{self, Mounts},
     workspace,
 };
@@ -28,6 +28,13 @@ pub struct Settings {
     /// The kill switch. `stop` kills every Kod container on the host, so the
     /// file is host-wide too: see `default_stop_file`.
     pub stop_file: PathBuf,
+    /// The repo's policy directory, mounted read-only into the gateway.
+    pub policy_dir: PathBuf,
+    /// The gateway's price table, copied into the run and its manifest.
+    pub prices: PathBuf,
+    /// Each case's spend budget at the gateway. No default: the caller sets it.
+    pub run_max_tokens: u64,
+    pub run_max_cost_micro_usd: u64,
 }
 
 /// Written before any case starts. Never holds KOD_API_KEY or another secret.
@@ -43,6 +50,8 @@ pub struct Manifest {
     pub kod_eval_git_sha: String,
     pub proxy: ProxyLimits,
     pub proxy_image_id: String,
+    /// Each case's spend budget. None in phase 0 manifests, which had none.
+    pub spend: Option<SpendBudget>,
     /// Image ID per language.
     pub sandbox_image_ids: BTreeMap<String, String>,
     /// Each case's base commit as resolved in its mirror.
@@ -90,6 +99,54 @@ impl ProxyLimits {
             max_concurrent: num("KOD_MAX_CONCURRENT", 2)?,
         })
     }
+}
+
+/// Each case's spend budget at the gateway, recorded in the manifest.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpendBudget {
+    pub max_tokens: u64,
+    pub max_cost_micro_usd: u64,
+    /// The price table as loaded, so two runs' costs mean the same thing.
+    pub prices: serde_json::Value,
+}
+
+/// The endpoint name the gateway's one upstream is routed as. kod-policy's
+/// placeholder routing allows only this one.
+pub const EVAL_ENDPOINT: &str = "placeholder";
+
+/// The one data class eval runs carry: the placeholder routing's only class.
+pub const EVAL_DATA_CLASS: &str = "placeholder";
+
+/// The gateway's runs file: one run per case, known by its token. The run id
+/// is the case id, so the gateway's log lines carry it.
+pub fn runs_json(tokens: &[(String, String)], b: &SpendBudget) -> serde_json::Value {
+    let runs = tokens.iter().map(|(token, case)| {
+        let run = serde_json::json!({
+            "id": case,
+            "ticket": case,
+            "repo": "kod-eval",
+            "data_classes": [EVAL_DATA_CLASS],
+            "max_tokens": b.max_tokens,
+            "max_cost_micro_usd": b.max_cost_micro_usd,
+        });
+        (token.clone(), run)
+    });
+    serde_json::Value::Object(runs.collect())
+}
+
+/// A fresh run token: 16 random bytes as 32 lower-case hex characters.
+pub fn token() -> Result<String> {
+    let mut b = [0u8; 16];
+    std::io::Read::read_exact(&mut fs::File::open("/dev/urandom")?, &mut b)?;
+    Ok(b.iter().map(|x| format!("{x:02x}")).collect())
+}
+
+/// The gateway's log lines for one case: those whose run is the case id.
+pub fn case_log(log: &str, case: &str) -> String {
+    log.lines()
+        .filter(|l| serde_json::from_str::<serde_json::Value>(l).is_ok_and(|v| v["run"] == case))
+        .map(|l| format!("{l}\n"))
+        .collect()
 }
 
 fn image_id(image: &str) -> Result<String> {
@@ -231,6 +288,17 @@ pub fn run_all(cases: &[EvalCase], runner: &Runner, s: &Settings) -> Result<Path
             limits.upstream
         );
     }
+    let prices = fs::read_to_string(&s.prices)
+        .with_context(|| format!("reading the price table {}", s.prices.display()))?;
+    let spend = SpendBudget {
+        max_tokens: s.run_max_tokens,
+        max_cost_micro_usd: s.run_max_cost_micro_usd,
+        prices: serde_json::from_str(&prices).context("the price table is not JSON")?,
+    };
+    let policy_dir = s
+        .policy_dir
+        .canonicalize()
+        .with_context(|| format!("the policy directory {}", s.policy_dir.display()))?;
     let mut sandbox_image_ids = BTreeMap::new();
     let mut base_commits = BTreeMap::new();
     for c in cases {
@@ -253,6 +321,7 @@ pub fn run_all(cases: &[EvalCase], runner: &Runner, s: &Settings) -> Result<Path
         kod_eval_git_sha: GIT_SHA.into(),
         proxy: limits.clone(),
         proxy_image_id: image_id(&s.proxy_image)?,
+        spend: Some(spend.clone()),
         sandbox_image_ids,
         base_commits,
     };
@@ -271,13 +340,50 @@ pub fn run_all(cases: &[EvalCase], runner: &Runner, s: &Settings) -> Result<Path
     let net = format!("kod-{id}");
     docker(&sv(&["network", "create", "--internal", &net]))?;
     let _env = RunEnv { id: id.clone() };
-    for case in cases {
+    // One gateway serves every case; each case has its own token, budget,
+    // request count and log lines. Never mount gw_dir into a case: runs.json
+    // holds every case's token, and audit.db every case's prompts.
+    let gw_dir = dir.join("gateway");
+    fs::create_dir(&gw_dir)?;
+    let tokens = cases
+        .iter()
+        .map(|c| Ok((token()?, c.id.clone())))
+        .collect::<Result<Vec<_>>>()?;
+    fs::write(gw_dir.join("prices.json"), &prices)?;
+    fs::write(
+        gw_dir.join("runs.json"),
+        runs_json(&tokens, &spend).to_string(),
+    )?;
+    let gw = format!("kod-llm-proxy-{id}");
+    let mounts = GatewayMounts {
+        dir: &gw_dir,
+        policy: &policy_dir,
+        user: host_ids(&gw_dir)?,
+    };
+    let up = start_gateway(
+        &gw,
+        &net,
+        &gateway_args(&gw, &id, &limits, &mounts, &s.proxy_image),
+        s,
+    )?;
+    // ponytail: the gateway keeps budgets in memory and is not restarted, so
+    // a gateway that dies ends the run; restart needs a persisted ledger.
+    let mut gateway_down = false;
+    for (case, (token, _)) in cases.iter().zip(&tokens) {
         let case_dir = dir.join(&case.id);
         fs::create_dir_all(&case_dir)?;
-        let r = if stopped(s) {
+        // The kill switch stops the gateway too, so it is checked first.
+        let r = if !up || stopped(s) {
             cancelled(case, "the kill switch was on before it started")
+        } else if gateway_down || !running(&gw) {
+            gateway_down = true;
+            cancelled(case, "the gateway stopped before it started")
         } else {
-            run_case(case, runner, s, &limits, &id, &net, &case_dir)?
+            let gateway = CaseGateway {
+                name: &gw,
+                base_url: format!("{PROXY_URL}/r/{token}"),
+            };
+            run_case(case, runner, s, &gateway, &id, &net, &case_dir)?
         };
         fs::write(
             case_dir.join("result.json"),
@@ -291,7 +397,18 @@ pub fn run_all(cases: &[EvalCase], runner: &Runner, s: &Settings) -> Result<Path
             r.passed()
         );
     }
+    if gateway_down {
+        bail!(
+            "the gateway stopped during run {}; the cases after it were cancelled",
+            dir.display()
+        );
+    }
     Ok(dir)
+}
+
+/// Whether the container is running.
+fn running(name: &str) -> bool {
+    docker(&sv(&["inspect", "-f", "{{.State.Running}}", name])).is_ok_and(|o| o.trim() == "true")
 }
 
 fn cancelled(case: &EvalCase, why: &str) -> CaseResult {
@@ -308,10 +425,26 @@ fn cancelled(case: &EvalCase, why: &str) -> CaseResult {
     }
 }
 
-/// `docker run` arguments for a case's proxy. The key is passed by name, so
-/// it never appears on a command line. Unset settings fall back to the
-/// proxy's defaults.
-pub fn proxy_args(name: &str, run_id: &str, lim: &ProxyLimits, image: &str) -> Vec<String> {
+/// Where the gateway's files live on the host.
+pub struct GatewayMounts<'a> {
+    /// Holds prices.json and runs.json, and gets audit.db. Mounted at /gateway.
+    pub dir: &'a Path,
+    /// The policy directory, mounted read-only at /policy.
+    pub policy: &'a Path,
+    /// The host uid and gid, so the gateway can write audit.db.
+    pub user: (u32, u32),
+}
+
+/// `docker run` arguments for the run's gateway. The key is passed by name,
+/// so it never appears on a command line. Unset settings fall back to the
+/// gateway's defaults.
+pub fn gateway_args(
+    name: &str,
+    run_id: &str,
+    lim: &ProxyLimits,
+    m: &GatewayMounts,
+    image: &str,
+) -> Vec<String> {
     let mut args = sv(&[
         "run",
         "-d",
@@ -319,9 +452,20 @@ pub fn proxy_args(name: &str, run_id: &str, lim: &ProxyLimits, image: &str) -> V
         name,
         "--label",
         &format!("kod.run={run_id}"),
+        "--user",
+        &format!("{}:{}", m.user.0, m.user.1),
+        "-v",
+        &format!("{}:/gateway", m.dir.display()),
+        "-v",
+        &format!("{}:/policy:ro", m.policy.display()),
     ]);
     args.extend(sv(&["-e", "KOD_API_KEY"]));
     for kv in [
+        "KOD_PRICES=/gateway/prices.json".to_owned(),
+        "KOD_RUNS=/gateway/runs.json".to_owned(),
+        "KOD_POLICY_DIR=/policy".to_owned(),
+        "KOD_AUDIT_DB=/gateway/audit.db".to_owned(),
+        format!("KOD_ENDPOINT={EVAL_ENDPOINT}"),
         format!("KOD_UPSTREAM={}", lim.upstream),
         format!("KOD_ALLOWED_PATHS={}", lim.allowed_paths),
         format!("KOD_MAX_TOKENS={}", lim.max_tokens),
@@ -336,23 +480,16 @@ pub fn proxy_args(name: &str, run_id: &str, lim: &ProxyLimits, image: &str) -> V
     args
 }
 
-/// One proxy per case, so the request budget and the log are per case.
-/// Returns false if the kill switch is on.
-fn start_proxy(
-    name: &str,
-    run_id: &str,
-    net: &str,
-    limits: &ProxyLimits,
-    s: &Settings,
-) -> Result<bool> {
-    let args = proxy_args(name, run_id, limits, &s.proxy_image);
-    // The proxy runs detached, so `launch` can't watch it. Check on both
+/// Starts the run's gateway and waits until it is ready. Returns false if
+/// the kill switch is on.
+fn start_gateway(name: &str, net: &str, args: &[String], s: &Settings) -> Result<bool> {
+    // The gateway runs detached, so `launch` can't watch it. Check on both
     // sides; if stop finished in between, the next launch sees the file and
-    // the run's cleanup removes the proxy.
+    // the run's cleanup removes the gateway.
     if stopped(s) {
         return Ok(false);
     }
-    docker(&args)?;
+    docker(args)?;
     docker(&sv(&[
         "network",
         "connect",
@@ -361,14 +498,47 @@ fn start_proxy(
         net,
         name,
     ]))?;
+    wait_ready(name)?;
     Ok(!stopped(s))
+}
+
+/// Waits up to 10 seconds for the gateway's "ready" line. It checks its
+/// config before it prints it, so a bad price table, runs file or policy
+/// stops the run here, with the gateway's error.
+fn wait_ready(name: &str) -> Result<()> {
+    for _ in 0..100 {
+        let logs = docker(&sv(&["logs", name]))?;
+        let ready = logs.lines().any(|l| {
+            serde_json::from_str::<serde_json::Value>(l).is_ok_and(|v| v["event"] == "ready")
+        });
+        if ready {
+            return Ok(());
+        }
+        if !running(name) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let err = Command::new("docker")
+        .args(["logs", name])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stderr).into_owned())
+        .unwrap_or_default();
+    bail!("the gateway did not start: {}", err.trim())
+}
+
+/// The run's gateway as one case sees it.
+struct CaseGateway<'a> {
+    name: &'a str,
+    /// The gateway URL with the case's token, `.../r/<token>`.
+    base_url: String,
 }
 
 fn run_case(
     case: &EvalCase,
     runner: &Runner,
     s: &Settings,
-    limits: &ProxyLimits,
+    gateway: &CaseGateway,
     run_id: &str,
     net: &str,
     dir: &Path,
@@ -380,10 +550,6 @@ fn run_case(
     fs::write(input.join("prompt.txt"), prompt::render(case))?;
 
     let image = sandbox::image(case, &s.image_prefix);
-    let proxy = format!("kod-llm-proxy-{run_id}-{}", case.id);
-    if !start_proxy(&proxy, run_id, net, limits, s)? {
-        return Ok(cancelled(case, "the kill switch was turned on"));
-    }
     let name = format!("kod-{run_id}-{}", case.id);
     let mounts = Mounts {
         read_only: &[(&work, "/seed"), (&input, "/in")],
@@ -397,7 +563,7 @@ fn run_case(
         net,
         &mounts,
         host_ids(dir)?,
-        &runner.env(),
+        &runner.env(&gateway.base_url),
     );
     args.push(image.clone());
     args.push("agent".into());
@@ -412,8 +578,9 @@ fn run_case(
     let agent_wall_ms = started.elapsed().as_millis() as u64;
     // The agent only ever had a copy; collect reads out/work.tar.
     let _ = fs::remove_dir_all(&work);
-    let proxy_log = docker(&sv(&["logs", &proxy]));
-    let _ = docker(&sv(&["rm", "-f", &proxy]));
+    // The case's lines from the shared gateway. A response's usage line is
+    // written when its body ends, before the agent sees the end.
+    let proxy_log = docker(&sv(&["logs", gateway.name])).map(|l| case_log(&l, &case.id));
     if launched == Launch::Stopped {
         return Ok(cancelled(case, "the kill switch was turned on"));
     }

@@ -1,3 +1,5 @@
+mod common;
+
 use axum::{
     Router,
     body::Bytes,
@@ -5,7 +7,8 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
-use kod_llm_proxy::{Config, Limits, USAGE_FIELDS, Usage, app};
+use common::{Gateway, MODEL, Setup, gateway, limits, msg, post_msg, serve};
+use kod_llm_proxy::{Limits, USAGE_FIELDS, Usage};
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -13,30 +16,11 @@ use std::sync::{
 use std::time::Duration;
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::TcpStream,
 };
 
-const MODEL: &str = "claude-test-1";
-
-async fn serve(router: Router) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-    format!("http://{addr}")
-}
-
-fn limits() -> Limits {
-    Limits {
-        allowed_models: vec![MODEL.into()],
-        max_tokens: 1000,
-        max_body: 4096,
-        max_requests: 100,
-        max_concurrent: 2,
-    }
-}
-
-/// A fake upstream that echoes what it received, behind the proxy.
-async fn proxy_with(limits: Limits) -> String {
+/// A fake upstream that echoes what it received, behind the gateway.
+async fn proxy_with(limits: Limits) -> Gateway {
     let upstream = Router::new()
         .route(
             "/v1/messages",
@@ -55,35 +39,24 @@ async fn proxy_with(limits: Limits) -> String {
         )
         .route("/v1/files", get(|| async { "LEAK" }));
     let upstream = serve(upstream).await;
-    serve(app(Config {
-        upstream,
-        api_key: "real-key".parse().unwrap(),
-        allowed_paths: vec!["/v1/messages".into()],
-        limits,
-    }))
+    gateway(
+        &upstream,
+        Setup {
+            limits,
+            ..Setup::default()
+        },
+    )
     .await
 }
 
-async fn proxy() -> String {
+async fn proxy() -> Gateway {
     proxy_with(limits()).await
-}
-
-fn msg(model: &str, max_tokens: u64) -> String {
-    format!(r#"{{"model":"{model}","max_tokens":{max_tokens},"messages":[]}}"#)
-}
-
-async fn post_msg(p: &str, body: String) -> reqwest::Response {
-    reqwest::Client::new()
-        .post(format!("{p}/v1/messages"))
-        .body(body)
-        .send()
-        .await
-        .unwrap()
 }
 
 #[tokio::test]
 async fn forwards_with_the_real_key_and_drops_client_credentials() {
-    let p = proxy().await;
+    let g = proxy().await;
+    let p = g.url.clone();
     let body = msg(MODEL, 100);
     let res = reqwest::Client::new()
         .post(format!("{p}/v1/messages?beta=true"))
@@ -96,13 +69,18 @@ async fn forwards_with_the_real_key_and_drops_client_credentials() {
     assert_eq!(res.status(), 200);
     assert_eq!(
         res.text().await.unwrap(),
-        format!("key=real-key auth=false query=beta=true body={body}")
+        // The body forwarded is the checked one, re-serialized.
+        format!(
+            "key=real-key auth=false query=beta=true body={}",
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()
+        )
     );
 }
 
 #[tokio::test]
 async fn refuses_other_endpoints() {
-    let p = proxy().await;
+    let g = proxy().await;
+    let p = g.url.clone();
     assert_eq!(
         reqwest::get(format!("{p}/v1/files"))
             .await
@@ -115,13 +93,14 @@ async fn refuses_other_endpoints() {
 #[tokio::test]
 async fn refuses_dot_dot_paths() {
     // Sent raw, because HTTP clients normalize "..".
-    let p = proxy().await;
-    let mut s = TcpStream::connect(p.trim_start_matches("http://"))
-        .await
-        .unwrap();
-    s.write_all(b"GET /v1/messages/../files HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
-        .await
-        .unwrap();
+    let g = proxy().await;
+    let p = g.url.clone();
+    let (host, prefix) = p.trim_start_matches("http://").split_once('/').unwrap();
+    let mut s = TcpStream::connect(host).await.unwrap();
+    let req = format!(
+        "GET /{prefix}/v1/messages/../files HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+    );
+    s.write_all(req.as_bytes()).await.unwrap();
     let mut buf = String::new();
     s.read_to_string(&mut buf).await.unwrap();
     assert!(buf.starts_with("HTTP/1.1 403"), "{buf}");
@@ -129,7 +108,8 @@ async fn refuses_dot_dot_paths() {
 
 #[tokio::test]
 async fn refuses_models_not_on_the_list() {
-    let p = proxy().await;
+    let g = proxy().await;
+    let p = g.url.clone();
     assert_eq!(
         post_msg(&p, msg("claude-expensive-9", 100)).await.status(),
         403
@@ -138,7 +118,8 @@ async fn refuses_models_not_on_the_list() {
 
 #[tokio::test]
 async fn refuses_missing_or_oversized_max_tokens() {
-    let p = proxy().await;
+    let g = proxy().await;
+    let p = g.url.clone();
     assert_eq!(post_msg(&p, msg(MODEL, 1001)).await.status(), 400);
     assert_eq!(
         post_msg(&p, format!(r#"{{"model":"{MODEL}","messages":[]}}"#))
@@ -151,7 +132,8 @@ async fn refuses_missing_or_oversized_max_tokens() {
 
 #[tokio::test]
 async fn refuses_oversized_bodies() {
-    let p = proxy().await;
+    let g = proxy().await;
+    let p = g.url.clone();
     let big = format!(
         r#"{{"model":"{MODEL}","max_tokens":10,"pad":"{}"}}"#,
         "x".repeat(5000)
@@ -161,11 +143,12 @@ async fn refuses_oversized_bodies() {
 
 #[tokio::test]
 async fn stops_forwarding_after_the_request_budget() {
-    let p = proxy_with(Limits {
+    let g = proxy_with(Limits {
         max_requests: 2,
         ..limits()
     })
     .await;
+    let p = g.url.clone();
     assert_eq!(post_msg(&p, msg(MODEL, 10)).await.status(), 200);
     assert_eq!(post_msg(&p, msg(MODEL, 10)).await.status(), 200);
     assert_eq!(post_msg(&p, msg(MODEL, 10)).await.status(), 429);
@@ -194,16 +177,18 @@ async fn limits_concurrent_requests() {
         }),
     );
     let upstream = serve(slow).await;
-    let p = serve(app(Config {
-        upstream,
-        api_key: "k".parse().unwrap(),
-        allowed_paths: vec!["/v1/messages".into()],
-        limits: Limits {
-            max_concurrent: 1,
-            ..limits()
+    let g = gateway(
+        &upstream,
+        Setup {
+            limits: Limits {
+                max_concurrent: 1,
+                ..limits()
+            },
+            ..Setup::default()
         },
-    }))
+    )
     .await;
+    let p = g.url.clone();
     let calls: Vec<_> = (0..3)
         .map(|_| tokio::spawn(post_msg_owned(p.clone())))
         .collect();
@@ -237,13 +222,8 @@ async fn does_not_follow_upstream_redirects() {
         }),
     ))
     .await;
-    let p = serve(app(Config {
-        upstream,
-        api_key: "real-key".parse().unwrap(),
-        allowed_paths: vec!["/v1/messages".into()],
-        limits: limits(),
-    }))
-    .await;
+    let g = gateway(&upstream, Setup::default()).await;
+    let p = g.url.clone();
     // The test's own client must not follow it either, or it would reach the thief.
     let res = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -311,8 +291,10 @@ fn reads_usage_from_json_and_event_streams_in_any_chunking() {
     assert!(u["output_tokens"].is_null(), "{u}");
 }
 
-/// Starts the proxy binary against `upstream`, waits until it answers, and
-/// returns its URL and its stdout lines.
+/// Starts the gateway binary against `upstream` with the repo's policy, the
+/// fixture's prices and run, and an audit log in a temporary directory. Waits
+/// until it answers, and returns the run's URL, the process, its stdout lines
+/// and the directory.
 async fn spawn_proxy(
     upstream: &str,
     env: &[(&str, &str)],
@@ -320,17 +302,27 @@ async fn spawn_proxy(
     String,
     tokio::process::Child,
     tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
+    tempfile::TempDir,
 ) {
+    let dir = tempfile::tempdir().unwrap();
+    let (prices, runs) = (dir.path().join("prices.json"), dir.path().join("runs.json"));
+    std::fs::write(&prices, common::PRICES_JSON).unwrap();
+    std::fs::write(&runs, common::RUNS_JSON).unwrap();
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
         .unwrap()
         .port();
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_kod-llm-proxy"))
+        .env("KOD_ENDPOINT", common::ENDPOINT)
         .env("KOD_UPSTREAM", upstream)
         .env("KOD_API_KEY", "real-key")
         .env("KOD_ALLOWED_MODELS", MODEL)
         .env("KOD_LISTEN", format!("127.0.0.1:{port}"))
+        .env("KOD_PRICES", &prices)
+        .env("KOD_RUNS", &runs)
+        .env("KOD_POLICY_DIR", common::policy_dir())
+        .env("KOD_AUDIT_DB", dir.path().join("audit.db"))
         .envs(env.iter().copied())
         .stdout(std::process::Stdio::piped())
         .kill_on_drop(true)
@@ -343,7 +335,8 @@ async fn spawn_proxy(
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let lines = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
-    (format!("http://127.0.0.1:{port}"), child, lines)
+    let url = format!("http://127.0.0.1:{port}/r/{}", common::TOKEN);
+    (url, child, lines, dir)
 }
 
 /// Log lines until the proxy has been quiet for half a second.
@@ -382,7 +375,7 @@ fn sse_upstream() -> Router {
 #[tokio::test]
 async fn logs_usage_after_a_stream_and_passes_it_through_unchanged() {
     let upstream = serve(sse_upstream()).await;
-    let (p, _child, mut lines) = spawn_proxy(&upstream, &[]).await;
+    let (p, _child, mut lines, _dir) = spawn_proxy(&upstream, &[]).await;
     let body = reqwest::Client::new()
         .post(format!("{p}/v1/messages"))
         .body(msg(MODEL, 10))
@@ -395,8 +388,8 @@ async fn logs_usage_after_a_stream_and_passes_it_through_unchanged() {
     assert_eq!(body, SSE);
     let events = drain(&mut lines).await;
     let names: Vec<_> = events.iter().map(|v| v["event"].clone()).collect();
-    assert_eq!(names, ["allow", "usage"]);
-    let v = &events[1];
+    assert_eq!(names, ["ready", "allow", "usage"]);
+    let v = &events[2];
     assert_eq!(
         (v["input_tokens"].clone(), v["output_tokens"].clone()),
         (12.into(), 34.into())
@@ -410,7 +403,7 @@ async fn logs_usage_after_a_stream_and_passes_it_through_unchanged() {
 #[tokio::test]
 async fn log_lines_are_bounded_by_the_request_budget() {
     let upstream = serve(sse_upstream()).await;
-    let (p, _child, mut lines) = spawn_proxy(&upstream, &[("KOD_MAX_REQUESTS", "3")]).await;
+    let (p, _child, mut lines, _dir) = spawn_proxy(&upstream, &[("KOD_MAX_REQUESTS", "3")]).await;
     let c = reqwest::Client::new();
     let long = format!("{p}/v1/{}", "x".repeat(10_000));
     assert_eq!(c.post(&long).send().await.unwrap().status(), 403);
@@ -422,7 +415,9 @@ async fn log_lines_are_bounded_by_the_request_budget() {
         .unwrap();
     assert_eq!(ok.status(), 200);
     ok.text().await.unwrap();
-    let fail = format!(r#"{{"model":"{MODEL}","max_tokens":10,"fail":1}}"#);
+    let fail = format!(
+        r#"{{"model":"{MODEL}","max_tokens":10,"messages":[{{"role":"user","content":"fail"}}]}}"#
+    );
     let res = c
         .post(format!("{p}/v1/messages"))
         .body(fail)
@@ -441,7 +436,7 @@ async fn log_lines_are_bounded_by_the_request_budget() {
         .collect();
     assert_eq!(
         names,
-        ["deny", "allow", "usage", "allow", "over_budget"],
+        ["ready", "deny", "allow", "usage", "allow", "over_budget"],
         "{events:?}"
     );
     for v in &events {
