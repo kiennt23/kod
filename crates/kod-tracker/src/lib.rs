@@ -93,11 +93,18 @@ pub enum TaskEvent {
         author: String,
         body: String,
     },
+    /// The trigger label was removed. The dispatcher cancels the ticket's
+    /// live run.
+    Unlabeled { issue: String, by: String },
+    /// The issue's title, body or fields changed. The dispatcher re-reads it
+    /// and stops a run whose inputs are now stale.
+    Edited { issue: String },
 }
 
-/// A verified task event and the tracker's ID for its delivery. The
-/// dispatcher keeps the IDs it has acted on, so a redelivery is not a second
-/// instruction.
+/// A verified task event and the tracker's ID for its delivery. The ID must
+/// come from the signed payload, never from an unsigned header. The adapter
+/// keeps no record of IDs: the dispatcher dedups in its own store, after
+/// the write that queues the event, so a failed write never spends an ID.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Delivery {
     pub id: String,
@@ -136,8 +143,8 @@ pub trait Tracker: Send + Sync {
     fn create_linked(&self, story: &str, kind: ReworkKind, fields: &Rework) -> Result<String>;
     fn is_team_member(&self, user: &str) -> Result<bool>;
     /// Checks the signature first: a bad or missing one is an error. A
-    /// signed request with no delivery ID, or with the ID of a delivery this
-    /// adapter already accepted, is an error too (a replay). A signed request
+    /// signed request with no delivery ID is an error too. A redelivery
+    /// parses the same again: the adapter keeps no IDs. A signed request
     /// that is not a task event (another label, another event type) is
     /// `Ok(None)`.
     fn parse_webhook(&self, request: &Webhook) -> Result<Option<Delivery>>;
