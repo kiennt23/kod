@@ -6,7 +6,7 @@ impl Dispatcher {
             let mut c = self.db();
             let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
             // An edit must also retire admissions that have read the old ticket.
-            store::retire_labels(&tx, ticket, delivery)?;
+            store::requeue_labels(&tx, ticket, delivery)?;
             let live = live_run(&tx, ticket)?;
             if live.is_none() {
                 tx.execute("UPDATE deliveries SET done = 1 WHERE id = ?1", [delivery])?;
@@ -14,7 +14,7 @@ impl Dispatcher {
             tx.commit()?;
             live
         };
-        let Some((_, old)) = live else {
+        let Some((seq, old)) = live else {
             return Ok(());
         };
         // A tracker that cannot answer must not keep a run alive: cancel.
@@ -32,7 +32,7 @@ impl Dispatcher {
                 "the ticket was edited and its revision unknown (was {old}); it is back in ready"
             ),
         };
-        self.cancel(delivery, ticket, &why, "a ticket edit")?;
+        self.cancel(delivery, ticket, &why, "a ticket edit", Some(seq))?;
         Ok(())
     }
 }

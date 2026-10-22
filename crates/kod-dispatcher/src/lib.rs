@@ -40,6 +40,8 @@ pub use config::Config;
 
 /// Attempts before a delivery or follow-up becomes a dead letter.
 pub const MAX_ATTEMPTS: i64 = 5;
+/// Seconds a claimed follow-up is left alone by other callers.
+const FOLLOW_UP_LEASE: i64 = 120;
 
 /// Seconds before attempt `n + 1`: 2, 4, 8, ... up to about 4 minutes.
 fn backoff(attempts: i64) -> i64 {
@@ -179,10 +181,7 @@ pub fn run_id(seq: i64) -> String {
 }
 
 fn seq_of(run_id: &str) -> Result<i64> {
-    run_id
-        .strip_prefix("run-")
-        .and_then(|n| n.parse().ok())
-        .with_context(|| format!("{run_id:?} is not a run ID"))
+    store::seq_of(run_id).with_context(|| format!("{run_id:?} is not a run ID"))
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -816,7 +815,15 @@ impl Dispatcher {
                     )?;
                     tx.commit()?;
                 }
-                let published = self.gateway.publish(run);
+                // A publish that failed may still have made the PR (a timeout
+                // after it): look before giving the run to a human.
+                let published = self.gateway.publish(run).or_else(|e| {
+                    let start = self.run_start(seq)?;
+                    match self.gateway.find_published(&start) {
+                        Ok(Some(pr)) => Ok(pr),
+                        _ => Err(e),
+                    }
+                });
                 let (to, why) = match &published {
                     Ok(pr) => (RunState::Done, format!("{reason}; published {pr}")),
                     Err(e) => (
@@ -847,6 +854,21 @@ impl Dispatcher {
             }
             _ => bail!("{} is not how a run ends", outcome.name()),
         }
+    }
+
+    fn run_start(&self, seq: i64) -> Result<RunStart> {
+        Ok(self.db().query_row(
+            "SELECT ticket, revision FROM runs WHERE seq = ?1",
+            [seq],
+            |r| {
+                Ok(RunStart {
+                    id: run_id(seq),
+                    ticket: r.get(0)?,
+                    revision: r.get(1)?,
+                    repo: self.config.repo.clone(),
+                })
+            },
+        )?)
     }
 
     fn reconcile_publish(&self, followup: i64, run: &str, known_pr: &str) -> Result<()> {
@@ -919,13 +941,17 @@ impl Dispatcher {
         ticket: &str,
         reason: &str,
         by: &str,
+        only: Option<i64>,
     ) -> Result<Option<String>> {
         let ended = {
             let mut c = self.db();
             let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let live = [RunState::Queued, RunState::Running, RunState::Publishing];
             let ended = match live_run(&tx, ticket)? {
-                Some((seq, _)) if Self::end(&tx, seq, RunState::Canceled, reason, &live)? => {
+                Some((seq, _))
+                    if only.is_none_or(|o| o == seq)
+                        && Self::end(&tx, seq, RunState::Canceled, reason, &live)? =>
+                {
                     Some(run_id(seq))
                 }
                 _ => None,
@@ -948,7 +974,7 @@ impl Dispatcher {
 
     fn unlabeled(&self, delivery: &str, ticket: &str, by: &str) -> Result<()> {
         let reason = format!("the trigger label was removed by {by}");
-        self.cancel(delivery, ticket, &reason, by)?;
+        self.cancel(delivery, ticket, &reason, by, None)?;
         Ok(())
     }
 
@@ -1008,7 +1034,13 @@ impl Dispatcher {
                 "target": {"run": run},
             }))?;
         }
-        self.cancel(delivery, ticket, &format!("canceled by {by}"), by)?;
+        self.cancel(
+            delivery,
+            ticket,
+            &format!("canceled by {by}"),
+            by,
+            Some(seq),
+        )?;
         Ok(())
     }
 
@@ -1035,28 +1067,17 @@ impl Dispatcher {
                  ON CONFLICT (id) DO UPDATE SET halted = 1, by = ?1, kills = kills + 1",
                 [by],
             )?;
-            let ended: Vec<(i64, String)> = tx
-                .prepare(&format!(
-                    "UPDATE runs SET state = 'canceled', reason = ?1 WHERE state IN {LIVE} RETURNING seq, ticket"
-                ))?
-                .query_map([format!("the kill switch, by {by}")], |r| {
-                    Ok((r.get(0)?, r.get(1)?))
-                })?
+            let live: Vec<i64> = tx
+                .prepare(&format!("SELECT seq FROM runs WHERE state IN {LIVE}"))?
+                .query_map([], |r| r.get(0))?
                 .collect::<rusqlite::Result<_>>()?;
-            let runs: Vec<String> = ended.iter().map(|(seq, _)| run_id(*seq)).collect();
-            for (seq, ticket) in ended {
-                follow(&tx, "revoke", &run_id(seq), "")?;
-                follow(&tx, "stop", &run_id(seq), "")?;
-                follow(&tx, "transition", &ticket, State::Ready.name())?;
-                follow(
-                    &tx,
-                    "comment",
-                    &ticket,
-                    &format!(
-                        "Kod {} ended canceled: the kill switch, by {by}.",
-                        run_id(seq)
-                    ),
-                )?;
+            let all = [RunState::Queued, RunState::Running, RunState::Publishing];
+            let reason = format!("the kill switch, by {by}");
+            let mut runs = vec![];
+            for seq in live {
+                if Self::end(&tx, seq, RunState::Canceled, &reason, &all)? {
+                    runs.push(run_id(seq));
+                }
             }
             let epoch = Self::epoch(&tx)?;
             tx.commit()?;

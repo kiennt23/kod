@@ -124,6 +124,10 @@ pub struct Flaky {
     /// Takes the delivery ID from an unsigned `x-delivery` header, as a
     /// careless adapter might.
     pub header_ids: AtomicBool,
+    /// `comment` takes this long.
+    pub comment_delay: Mutex<Option<std::time::Duration>>,
+    /// Runs once inside the next `get_issue`.
+    pub on_get_issue: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl Flaky {
@@ -140,6 +144,9 @@ impl Tracker for Flaky {
         self.t.name()
     }
     fn get_issue(&self, key: &str) -> Result<Issue> {
+        if let Some(f) = self.on_get_issue.lock().unwrap().take() {
+            f();
+        }
         if self.fail_issue.lock().unwrap().as_deref() == Some(key) {
             bail!("fake tracker: {key} timed out");
         }
@@ -147,6 +154,10 @@ impl Tracker for Flaky {
     }
     fn comment(&self, key: &str, text: &str) -> Result<()> {
         self.writes()?;
+        let delay = *self.comment_delay.lock().unwrap();
+        if let Some(d) = delay {
+            std::thread::sleep(d);
+        }
         self.t.comment(key, text)
     }
     fn transition(&self, key: &str, state: State) -> Result<()> {
@@ -246,6 +257,8 @@ pub fn harness_with(policy: impl FnOnce(&Path) -> Result<Policy>) -> Harness {
         fail_writes: AtomicBool::default(),
         fail_issue: Mutex::default(),
         header_ids: AtomicBool::default(),
+        comment_delay: Mutex::default(),
+        on_get_issue: Mutex::default(),
     });
     let d = dispatcher(dir.path(), flaky.clone(), gw.clone(), policy(dir.path()));
     Harness {

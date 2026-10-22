@@ -37,7 +37,34 @@ impl Dispatcher {
             })?
             .collect::<rusqlite::Result<_>>()?
         };
-        for (id, kind, target, arg, attempts) in due {
+        // One row's store error must not skip the revokes and stops after it.
+        let mut first_error = None;
+        for row in due {
+            if let Err(e) = self.make_follow_up(now, row)
+                && first_error.is_none()
+            {
+                first_error = Some(e);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    fn make_follow_up(
+        &self,
+        now: i64,
+        (id, kind, target, arg, attempts): (i64, String, String, String, i64),
+    ) -> Result<()> {
+        // Claimed before the call, so a concurrent caller skips the row. The
+        // lease is how long a call may take before another caller retries it.
+        // ponytail: a call longer than FOLLOW_UP_LEASE may be made twice.
+        if self.db().execute(
+            "UPDATE followups SET next_at = ?2 WHERE id = ?1 AND done = 0 AND next_at <= ?3",
+            params![id, now + FOLLOW_UP_LEASE, now],
+        )? == 0
+        {
+            return Ok(());
+        }
+        {
             let r = match kind.as_str() {
                 "revoke" => self.gateway.revoke(&target),
                 "stop" => self.gateway.stop(&target),
@@ -48,7 +75,7 @@ impl Dispatcher {
                             "UPDATE followups SET done = 1, error = 'the kill switch was lifted' WHERE id = ?1",
                             [id],
                         )?;
-                        continue;
+                        return Ok(());
                     }
                     self.gateway.stop_all()
                 }

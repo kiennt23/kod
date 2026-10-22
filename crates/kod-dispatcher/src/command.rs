@@ -28,10 +28,7 @@ pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
 
 /// The signature the CLI sends for `body`.
 pub fn sign(key: &[u8], body: &[u8]) -> String {
-    hmac_sha256(key, body)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    crate::hex(&hmac_sha256(key, body))
 }
 
 /// Compares in constant time.

@@ -82,6 +82,20 @@ pub(super) fn retire_labels(c: &Connection, ticket: &str, delivery: &str) -> Res
     Ok(())
 }
 
+/// An edit retires the labels queued before it, which may have read the old
+/// ticket, and queues each again behind it, to read the ticket fresh. A label
+/// that has not started is not lost.
+pub(super) fn requeue_labels(c: &Connection, ticket: &str, delivery: &str) -> Result<()> {
+    c.execute(
+        "INSERT INTO deliveries (id, delivery, ticket, event, priority)
+         SELECT id || '/' || ?2, delivery, ticket, event, priority FROM deliveries
+         WHERE ticket = ?1 AND priority = 1 AND done = 0
+         AND rowid < (SELECT rowid FROM deliveries WHERE id = ?2)",
+        params![ticket, delivery],
+    )?;
+    retire_labels(c, ticket, delivery)
+}
+
 /// Opens (creating if needed) the store at `path`.
 pub fn open(path: &Path) -> Result<Connection> {
     let c = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
@@ -94,14 +108,19 @@ pub fn open(path: &Path) -> Result<Connection> {
     Ok(c)
 }
 
-/// Whether the run must stop: it has ended, or there is no such run. The
-/// gateway's `Stopped` check reads this on its own connection to the store.
-pub fn stopped(c: &Connection, run_id: &str) -> Result<bool> {
-    let Some(seq) = run_id
+/// The one strict run ID parser: `run-N` as the dispatcher writes it, with
+/// no sign and no leading zeros.
+pub fn seq_of(run_id: &str) -> Option<i64> {
+    run_id
         .strip_prefix("run-")
         .and_then(|n| n.parse::<i64>().ok())
         .filter(|seq| format!("run-{seq}") == run_id)
-    else {
+}
+
+/// Whether the run must stop: it has ended, or there is no such run. The
+/// gateway's `Stopped` check reads this on its own connection to the store.
+pub fn stopped(c: &Connection, run_id: &str) -> Result<bool> {
+    let Some(seq) = seq_of(run_id) else {
         return Ok(true);
     };
     let live: Option<bool> = c
