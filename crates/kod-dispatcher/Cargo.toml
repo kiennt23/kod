@@ -1,0 +1,21 @@
+[package]
+name = "kod-dispatcher"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+kod-audit = { path = "../kod-audit" }
+kod-policy = { path = "../kod-policy" }
+kod-tracker = { path = "../kod-tracker" }
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+
+[dev-dependencies]
+rusqlite = "0.40"
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }

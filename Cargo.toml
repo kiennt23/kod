@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/kod-audit",
+    "crates/kod-dispatcher",
     "crates/kod-eval",
     "crates/kod-llm-proxy",
     "crates/kod-loop",
