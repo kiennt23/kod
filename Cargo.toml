@@ -1,3 +1,12 @@
 [workspace]
-members = ["crates/kod-audit", "crates/kod-dispatcher", "crates/kod-eval", "crates/kod-llm-proxy", "crates/kod-loop", "crates/kod-policy", "crates/kod-tracker"]
+members = [
+    "crates/kod-audit",
+    "crates/kod-dispatcher",
+    "crates/kod-eval",
+    "crates/kod-llm-proxy",
+    "crates/kod-loop",
+    "crates/kod-policy",
+    "crates/kod-tool-gateway",
+    "crates/kod-tracker",
+]
 resolver = "3"

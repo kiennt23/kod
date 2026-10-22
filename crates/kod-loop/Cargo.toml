@@ -17,5 +17,8 @@ axum = "0.8"
 kod-audit = { path = "../kod-audit" }
 kod-llm-proxy = { path = "../kod-llm-proxy" }
 kod-policy = { path = "../kod-policy" }
+kod-tool-gateway = { path = "../kod-tool-gateway" }
+kod-tracker = { path = "../kod-tracker" }
+rusqlite = "0.40"
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "net"] }

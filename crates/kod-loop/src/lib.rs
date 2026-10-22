@@ -4,6 +4,7 @@
 //! JSONL on stderr, and stdout is one JSON outcome line.
 pub mod api;
 pub mod context;
+pub mod mcp;
 pub mod tools;
 
 use api::{ApiError, Client};
@@ -93,6 +94,16 @@ pub const CUT_OFF: &str =
 pub const CUT_OFF_CALL: &str = "Not run: your reply was cut off at the output token limit, so this call's input may be incomplete. Resend it in smaller steps.";
 
 pub fn run(cfg: &Config, prompt: &str, trace: &mut dyn Write) -> Outcome {
+    run_with(cfg, None, prompt, trace)
+}
+
+/// `run`, with the tool gateway's tools offered beside the local ones.
+pub fn run_with(
+    cfg: &Config,
+    mcp: Option<&mcp::Mcp>,
+    prompt: &str,
+    trace: &mut dyn Write,
+) -> Outcome {
     let client = Client::new(&cfg.base_url);
     // Retries of the current request so far; each one is also a turn.
     let mut retries = 0;
@@ -114,7 +125,7 @@ pub fn run(cfg: &Config, prompt: &str, trace: &mut dyn Write) -> Outcome {
         turns += 1;
         context::elide(&mut messages, cfg.system.len(), cfg.context_bytes);
         let started = Instant::now();
-        let reply = match client.messages(&request(cfg, &messages)) {
+        let reply = match client.messages(&request(cfg, mcp, &messages)) {
             Ok(r) => {
                 retries = 0;
                 r
@@ -206,7 +217,10 @@ pub fn run(cfg: &Config, prompt: &str, trace: &mut dyn Write) -> Outcome {
         for c in &calls {
             let name = c["name"].as_str().unwrap_or("");
             let started = Instant::now();
-            let r = tools::call(&cfg.workspace, cfg.command_timeout, name, &c["input"]);
+            let r = match mcp {
+                Some(m) if m.offers(name) => m.call(name, &c["input"]),
+                _ => tools::call(&cfg.workspace, cfg.command_timeout, name, &c["input"]),
+            };
             let mut e = json!({
                 "event": "tool",
                 "turn": turns,
@@ -246,7 +260,7 @@ pub fn run(cfg: &Config, prompt: &str, trace: &mut dyn Write) -> Outcome {
 
 /// Caches the tools and system prompt, and the conversation up to its last
 /// block. The conversation itself is never changed here.
-fn request(cfg: &Config, messages: &[Value]) -> Value {
+fn request(cfg: &Config, mcp: Option<&mcp::Mcp>, messages: &[Value]) -> Value {
     let mut msgs = messages.to_vec();
     if let Some(last) = msgs.last_mut() {
         if let Some(s) = last["content"].as_str() {
@@ -260,9 +274,17 @@ fn request(cfg: &Config, messages: &[Value]) -> Value {
         "model": cfg.model,
         "max_tokens": cfg.max_tokens,
         "system": [{"type": "text", "text": cfg.system, "cache_control": {"type": "ephemeral"}}],
-        "tools": tools::definitions(),
+        "tools": all_tools(mcp),
         "messages": msgs,
     })
+}
+
+fn all_tools(mcp: Option<&mcp::Mcp>) -> Value {
+    let mut all = tools::definitions();
+    if let (Some(m), Some(list)) = (mcp, all.as_array_mut()) {
+        list.extend(m.definitions().iter().cloned());
+    }
+    all
 }
 
 fn text_of(content: &[Value]) -> String {

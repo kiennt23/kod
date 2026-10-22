@@ -66,3 +66,27 @@ fn version_names_the_binary() {
             .starts_with("kod-loop ")
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn a_non_unicode_mcp_url_is_a_failed_run() {
+    use std::os::unix::ffi::OsStrExt;
+    let sys = tempfile::NamedTempFile::new().unwrap();
+    fs::write(sys.path(), "SYSTEM").unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_kod-loop"))
+        .args(["--model", "m", "--max-turns", "3", "--system-prompt"])
+        .arg(sys.path())
+        .env("ANTHROPIC_BASE_URL", "http://127.0.0.1:1")
+        .env("KOD_MCP_URL", std::ffi::OsStr::from_bytes(b"http://\xff"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let _ = child.stdin.take().unwrap().write_all(b"ticket");
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let o: Outcome = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(o.end_state, EndState::NeedsHuman);
+    assert!(o.error.unwrap().contains("KOD_MCP_URL"));
+}
