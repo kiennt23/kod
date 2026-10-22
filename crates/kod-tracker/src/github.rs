@@ -84,17 +84,16 @@ fn name(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
 }
 
-fn segment(s: &str) -> String {
-    let mut encoded = String::new();
-    for b in s.bytes() {
-        if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) {
-            encoded.push(char::from(b));
-        } else {
-            encoded.push_str(&format!("%{b:02X}"));
-        }
+#[derive(Debug)]
+struct UncertainWrite;
+
+impl std::fmt::Display for UncertainWrite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("GitHub write outcome unknown; reconcile before retry")
     }
-    encoded
 }
+
+impl std::error::Error for UncertainWrite {}
 
 impl GitHub {
     pub fn new(config: Config, mapping: Mapping, token: &str, secret: &str) -> Result<Self> {
@@ -186,20 +185,29 @@ impl GitHub {
     }
 
     fn number(&self, key: &str) -> Result<u64> {
-        let number = key
-            .strip_prefix(&format!("{}#", self.config.repo))
-            .and_then(|s| s.parse::<u64>().ok())
+        let (repo, digits) = key.split_once('#').context("invalid issue key")?;
+        ensure!(
+            repo.eq_ignore_ascii_case(&self.config.repo),
+            "issue key is not in this repository"
+        );
+        let number = digits
+            .parse::<u64>()
+            .ok()
             .filter(|n| *n > 0)
             .context("issue key is not in this repository")?;
-        ensure!(self.key(number) == key, "non-canonical GitHub issue key");
+        ensure!(
+            number.to_string() == digits,
+            "non-canonical GitHub issue key"
+        );
         Ok(number)
     }
 
+    fn repo_url(&self) -> String {
+        format!("{}/repos/{}", self.api, self.config.repo)
+    }
+
     fn issue_url(&self, number: u64) -> String {
-        format!(
-            "https://api.github.com/repos/{}/issues/{number}",
-            self.config.repo
-        )
+        format!("{}/issues/{number}", self.repo_url())
     }
 
     fn request(
@@ -208,6 +216,7 @@ impl GitHub {
         path: &str,
         body: Option<&Value>,
     ) -> Result<(StatusCode, Value)> {
+        let write = method != Method::GET;
         let mut request = self.client.request(
             method,
             format!("{}/repos/{}/{}", self.api, self.config.repo, path),
@@ -215,33 +224,52 @@ impl GitHub {
         if let Some(body) = body {
             request = request.json(body);
         }
-        let mut response = request
-            .send()
-            .map_err(|_| anyhow::anyhow!("GitHub request failed; write outcome may be unknown"))?;
+        let mut response = request.send().map_err(|error| {
+            let error = anyhow::Error::new(error.without_url()).context("GitHub request failed");
+            if write {
+                error.context(UncertainWrite)
+            } else {
+                error
+            }
+        })?;
         let status = response.status();
         if !status.is_success() {
             return Ok((status, Value::Null));
         }
-        let mut bytes = Vec::new();
-        response
-            .by_ref()
-            .take(RESPONSE_LIMIT + 1)
-            .read_to_end(&mut bytes)
-            .context("reading GitHub response")?;
-        ensure!(
-            u64::try_from(bytes.len())? <= RESPONSE_LIMIT,
-            "GitHub response too large"
-        );
-        let value = if bytes.is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_slice(&bytes).context("invalid GitHub response")?
-        };
-        Ok((status, value))
+        let decoded = (|| -> Result<Value> {
+            let mut bytes = Vec::new();
+            response
+                .by_ref()
+                .take(RESPONSE_LIMIT + 1)
+                .read_to_end(&mut bytes)
+                .context("reading GitHub response")?;
+            ensure!(
+                u64::try_from(bytes.len())? <= RESPONSE_LIMIT,
+                "GitHub response too large"
+            );
+            let value = if bytes.is_empty() {
+                Value::Null
+            } else {
+                serde_json::from_slice(&bytes).context("invalid GitHub response")?
+            };
+            Ok(value)
+        })()
+        .map_err(|error| {
+            if write {
+                error.context(UncertainWrite)
+            } else {
+                error
+            }
+        })?;
+        Ok((status, decoded))
     }
 
     fn call(&self, method: Method, path: &str, body: Option<&Value>) -> Result<Value> {
+        let write = method != Method::GET;
         let (status, value) = self.request(method, path, body)?;
+        if write && status.is_server_error() {
+            return Err(anyhow::anyhow!("GitHub returned HTTP {status}").context(UncertainWrite));
+        }
         ensure!(status.is_success(), "GitHub returned HTTP {status}");
         Ok(value)
     }
@@ -277,8 +305,7 @@ impl GitHub {
             number > 0
                 && issue.number == number
                 && issue.id > 0
-                && issue.repository_url
-                    == format!("https://api.github.com/repos/{}", self.config.repo),
+                && issue.repository_url.eq_ignore_ascii_case(&self.repo_url()),
             "GitHub returned another issue or repository"
         );
         ensure!(
@@ -289,6 +316,8 @@ impl GitHub {
     }
 
     fn metadata(&self, body: &str) -> Result<serde_json::Map<String, Value>> {
+        let normalized = body.replace("\r\n", "\n");
+        let body = normalized.as_str();
         let Some((_, tail)) = body.split_once(META_START) else {
             ensure!(
                 !body.contains("<!-- kod:issue"),
@@ -342,6 +371,7 @@ impl GitHub {
         let states: Vec<_> = issue
             .labels
             .iter()
+            .filter(|l| l.name.starts_with("kod:"))
             .filter_map(|l| self.mapping.standard(&l.name))
             .collect();
         ensure!(states.len() <= 1, "ambiguous workflow labels");
@@ -363,7 +393,10 @@ impl GitHub {
         let mut owned = Vec::new();
         for comment in comments {
             ensure!(
-                comment.id > 0 && comment.issue_url == self.issue_url(number),
+                comment.id > 0
+                    && comment
+                        .issue_url
+                        .eq_ignore_ascii_case(&self.issue_url(number)),
                 "comment belongs to another issue"
             );
             if comment.user.id == self.config.comment_author_id
@@ -419,6 +452,9 @@ impl Tracker for GitHub {
         }
         let children: Vec<RawIssue> = self.list(&format!("issues/{number}/sub_issues"))?;
         for child in children {
+            if !child.repository_url.eq_ignore_ascii_case(&self.repo_url()) {
+                continue;
+            }
             self.bind(&child, child.number)?;
             links.insert(self.key(child.number));
         }
@@ -432,7 +468,7 @@ impl Tracker for GitHub {
             );
         }
         Ok(Issue {
-            key: key.into(),
+            key: self.key(number),
             title: raw.title,
             body,
             acceptance_criteria: texts(&object, "acceptance_criteria")?,
@@ -475,16 +511,22 @@ impl Tracker for GitHub {
                 Some(&json!({"labels": [target]})),
             )?;
         }
-        for label in issue
-            .labels
-            .iter()
-            .filter(|l| l.name != target && self.mapping.standard(&l.name).is_some())
-        {
-            let (status, _) = self.request(
-                Method::DELETE,
-                &format!("issues/{number}/labels/{}", segment(&label.name)),
-                None,
-            )?;
+        for label in issue.labels.iter().filter(|l| {
+            l.name != target
+                && l.name.starts_with("kod:")
+                && self.mapping.standard(&l.name).is_some()
+        }) {
+            let mut url =
+                reqwest::Url::parse(&format!("{}/issues/{number}/labels", self.repo_url()))?;
+            url.path_segments_mut()
+                .map_err(|_| anyhow::anyhow!("invalid GitHub API base"))?
+                .push(&label.name);
+            let base = reqwest::Url::parse(&format!("{}/", self.repo_url()))?;
+            let path = url
+                .path()
+                .strip_prefix(base.path())
+                .context("invalid GitHub label path")?;
+            let (status, _) = self.request(Method::DELETE, path, None)?;
             ensure!(
                 status.is_success() || status == StatusCode::NOT_FOUND,
                 "GitHub label removal failed: {status}"
@@ -496,7 +538,7 @@ impl Tracker for GitHub {
             Some(&json!({"state": if state == State::Done { "closed" } else { "open" }})),
         )?;
         ensure!(
-            self.get_issue(key)?.state == state,
+            self.state(&self.raw(number)?)? == state,
             "GitHub transition did not reach requested state"
         );
         Ok(())
@@ -544,8 +586,15 @@ impl Tracker for GitHub {
             fields.text,
             serde_json::to_string_pretty(&metadata)?
         );
-        let raw: RawIssue = serde_json::from_value(self.call(Method::POST, "issues", Some(&json!({"title": format!("Rework for {story}: {}", fields.artifact), "body": body}))).context("issue create outcome may be unknown; reconcile before retry")?)?;
-        self.bind(&raw, raw.number)?;
+        let value = self.call(
+            Method::POST,
+            "issues",
+            Some(
+                &json!({"title": format!("Rework for {story}: {}", fields.artifact), "body": body}),
+            ),
+        )?;
+        let raw: RawIssue = serde_json::from_value(value).context(UncertainWrite)?;
+        self.bind(&raw, raw.number).context(UncertainWrite)?;
         let key = self.key(raw.number);
         self.call(
             Method::POST,
@@ -553,9 +602,17 @@ impl Tracker for GitHub {
             Some(&json!({"sub_issue_id": raw.id})),
         )
         .with_context(|| format!("created {key} but linking failed; reconcile before retry"))?;
+        let children: Vec<RawIssue> = self
+            .list(&format!("issues/{number}/sub_issues"))
+            .with_context(|| {
+                format!("created {key} but link verification failed; reconcile before retry")
+            })?;
         ensure!(
-            self.get_issue(story)?.links.contains(&key),
-            "created rework missing from story; reconcile before retry"
+            children.iter().any(|child| child.id == raw.id
+                && child.number == raw.number
+                && child.repository_url.eq_ignore_ascii_case(&self.repo_url())
+                && child.pull_request.is_none()),
+            "created {key} but rework missing from story; reconcile before retry"
         );
         Ok(key)
     }
@@ -619,18 +676,27 @@ impl Tracker for GitHub {
             "status create outcome unknown; reconcile before retry"
         );
         uncertain.insert(number);
-        let comment: Comment = serde_json::from_value(
-            self.call(
-                Method::POST,
-                &format!("issues/{number}/comments"),
-                Some(&json!({"body": body})),
-            )
-            .context("status create outcome unknown; reconcile before retry")?,
-        )?;
+        let result = self.call(
+            Method::POST,
+            &format!("issues/{number}/comments"),
+            Some(&json!({"body": body})),
+        );
+        let value = match result {
+            Ok(value) => value,
+            Err(error) => {
+                if error.downcast_ref::<UncertainWrite>().is_none() {
+                    uncertain.remove(&number);
+                }
+                return Err(error);
+            }
+        };
+        let comment: Comment = serde_json::from_value(value).context(UncertainWrite)?;
         ensure!(
             comment.user.id == self.config.comment_author_id
                 && comment.user.kind == "Bot"
-                && comment.issue_url == self.issue_url(number),
+                && comment
+                    .issue_url
+                    .eq_ignore_ascii_case(&self.issue_url(number)),
             "created status comment has unexpected owner or issue; reconcile before retry"
         );
         uncertain.remove(&number);
@@ -651,10 +717,7 @@ impl Tracker for GitHub {
             signatures.len() == 1,
             "missing or duplicate webhook signature"
         );
-        let expected: String = hmac_sha256(self.secret.as_bytes(), &request.body)
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
+        let expected = crate::signature::hex(&hmac_sha256(self.secret.as_bytes(), &request.body));
         let signature = signatures[0]
             .1
             .strip_prefix("sha256=")
@@ -670,7 +733,9 @@ impl Tracker for GitHub {
             return Ok(None);
         }
         ensure!(
-            value["repository"]["full_name"].as_str() == Some(&self.config.repo),
+            value["repository"]["full_name"]
+                .as_str()
+                .is_some_and(|repo| repo.eq_ignore_ascii_case(&self.config.repo)),
             "webhook belongs to another repository"
         );
         let issue: RawIssue =
@@ -693,7 +758,9 @@ impl Tracker for GitHub {
                 comment.id > 0
                     && comment.user.id > 0
                     && name(&comment.user.login)
-                    && comment.issue_url == self.issue_url(issue.number),
+                    && comment
+                        .issue_url
+                        .eq_ignore_ascii_case(&self.issue_url(issue.number)),
                 "invalid comment identity"
             );
             TaskEvent::Commented {
@@ -707,7 +774,7 @@ impl Tracker for GitHub {
                     let label = value["label"]["name"]
                         .as_str()
                         .context("missing webhook label")?;
-                    if label != self.mapping.trigger_label {
+                    if label != self.mapping.trigger_label && !label.starts_with("kod:") {
                         return Ok(None);
                     }
                     let sender: User = serde_json::from_value(value["sender"].clone())
@@ -719,7 +786,11 @@ impl Tracker for GitHub {
                         sender.id > 0 && name(&sender.login),
                         "invalid webhook sender"
                     );
-                    if action == "labeled" {
+                    if label.starts_with("kod:") {
+                        TaskEvent::Edited {
+                            issue: self.key(issue.number),
+                        }
+                    } else if action == "labeled" {
                         TaskEvent::Labeled {
                             issue: self.key(issue.number),
                             by: sender.login,

@@ -82,3 +82,21 @@ remain connected acceptance in 6b. See `docs/github-tracker-runbook.md`.
 - Native whole-branch self-review completed; no independent review claimed.
   No live GitHub writes, App provisioning, deployment, or Docker opt-in run
   was performed. Connected write acceptance remains in 6b as described above.
+
+## PR #30 review corrections
+
+The adapter accepts CRLF metadata and case-insensitive repository identities,
+omits foreign native sub-issues, and preserves plain `open`/`closed` labels.
+Transitions verify only the issue's own state; rework link verification reads
+the native relationship without parsing unrelated parent metadata. Workflow
+label changes emit edit events. URL identity checks use the client's API
+base, label paths use the URL encoder, and HMAC hex encoding is shared.
+
+Definite create rejections allow retry. Transport failures, 5xx writes and
+malformed successful responses retain uncertainty; redacted transport causes
+survive, while read failures do not claim an uncertain write. Seven regression
+tests cover these corrections, including failed-create reconciliation.
+
+After the corrections, all 527 workspace tests, workspace Clippy with warnings
+denied, formatting and diff checks passed. The live read-only probe of issue
+#19 succeeded again. Docker opt-in tests and live writes remain unperformed.

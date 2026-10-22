@@ -1,5 +1,9 @@
 use sha2::{Digest, Sha256};
 
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     let mut block = [0u8; 64];
     if key.len() > 64 {

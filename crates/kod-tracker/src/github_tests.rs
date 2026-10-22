@@ -28,9 +28,32 @@ struct Store {
     lose_create: bool,
     hidden_comments: bool,
     fail_link: bool,
+    reject_create: Option<StatusCode>,
+    malformed_create: bool,
 }
 
 type Shared = Arc<Mutex<Store>>;
+
+fn api_identity(value: &mut Value, api: &str) {
+    match value {
+        Value::Object(object) => {
+            for (key, value) in object {
+                if matches!(key.as_str(), "repository_url" | "issue_url") {
+                    if let Some(url) = value
+                        .as_str()
+                        .and_then(|s| s.strip_prefix("https://api.github.com"))
+                    {
+                        *value = format!("{api}{url}").into();
+                    }
+                } else {
+                    api_identity(value, api);
+                }
+            }
+        }
+        Value::Array(values) => values.iter_mut().for_each(|v| api_identity(v, api)),
+        _ => {}
+    }
+}
 
 async fn api(
     AppState(state): AppState<Shared>,
@@ -49,7 +72,13 @@ async fn api(
     };
     let mut s = state.lock().unwrap();
     s.calls.push((method.clone(), path.clone(), body.clone()));
-    let ok = |v| (StatusCode::OK, axum::Json(v));
+    let ok = |mut v| {
+        api_identity(
+            &mut v,
+            &format!("http://{}", headers["host"].to_str().unwrap()),
+        );
+        (StatusCode::OK, axum::Json(v))
+    };
     let missing = || {
         (
             StatusCode::NOT_FOUND,
@@ -70,12 +99,15 @@ async fn api(
         };
     }
     if path == "issues" && method == Method::POST {
+        if let Some(status) = s.reject_create.take() {
+            return (status, axum::Json(Value::Null));
+        }
         let n = s.issues.keys().last().copied().unwrap_or(0) + 1;
         let mut v = issue(n);
         v["title"] = body["title"].clone();
         v["body"] = body["body"].clone();
         s.issues.insert(n, v.clone());
-        return (StatusCode::CREATED, axum::Json(v));
+        return (StatusCode::CREATED, ok(v).1);
     }
     if parts.get(1) == Some(&"comments") && method == Method::PATCH {
         let id = parts.get(2).unwrap().parse::<u64>().unwrap();
@@ -138,14 +170,21 @@ async fn api(
     }
     if parts[2] == "comments" {
         if method == Method::POST {
+            if let Some(status) = s.reject_create.take() {
+                return (status, axum::Json(Value::Null));
+            }
             let id = u64::try_from(s.comments.values().map(Vec::len).sum::<usize>()).unwrap() + 1;
             let comment = json!({"id": id, "body": body["body"], "issue_url": format!("https://api.github.com/repos/{REPO}/issues/{n}"), "user": {"id": 99, "login": "kod[bot]", "type": "Bot"}});
             s.comments.entry(n).or_default().push(comment.clone());
+            if s.malformed_create {
+                s.malformed_create = false;
+                return (StatusCode::CREATED, axum::Json(Value::Null));
+            }
             if s.lose_create {
                 s.lose_create = false;
                 return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(Value::Null));
             }
-            return (StatusCode::CREATED, axum::Json(comment));
+            return (StatusCode::CREATED, ok(comment).1);
         }
         return ok(page(
             if s.hidden_comments {
@@ -222,11 +261,15 @@ impl Harness {
     }
 
     fn webhook(&self, value: &Value) -> Webhook {
-        let body = serde_json::to_vec(value).unwrap();
-        let signature: String = hmac_sha256(b"webhook-secret", &body)
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
+        let mut value = value.clone();
+        if value["repository"]["full_name"]
+            .as_str()
+            .is_some_and(|r| r.eq_ignore_ascii_case(REPO))
+        {
+            api_identity(&mut value, &self.github.api);
+        }
+        let body = serde_json::to_vec(&value).unwrap();
+        let signature = crate::signature::hex(&hmac_sha256(b"webhook-secret", &body));
         Webhook {
             headers: vec![
                 ("X-Hub-Signature-256".into(), format!("sha256={signature}")),
@@ -437,6 +480,153 @@ fn metadata_and_workflow_conflicts_fail_closed() {
     assert!(!h.github.is_team_member("reader").unwrap());
     assert!(!h.github.is_team_member("kod[bot]").unwrap());
     assert!(h.github.is_team_member("outage").is_err());
+}
+
+#[test]
+fn normal_github_data_preserves_metadata_labels_and_local_links() {
+    let h = Harness::new();
+    {
+        let mut s = h.store.lock().unwrap();
+        let parent = s.issues.get_mut(&1).unwrap();
+        parent["body"] = parent["body"]
+            .as_str()
+            .unwrap()
+            .replace('\n', "\r\n")
+            .into();
+        parent["repository_url"] = "https://api.github.com/repos/Acme/App".into();
+        parent["labels"] = json!([{"name":"open"}, {"name":"closed"}]);
+        let mut foreign = issue(2);
+        foreign["repository_url"] = "https://api.github.com/repos/other/repo".into();
+        s.issues.insert(2, foreign);
+        s.children.insert(1, vec![2]);
+    }
+    let issue = h.github.get_issue("Acme/App#1").unwrap();
+    assert_eq!(issue.requirement_id.as_deref(), Some("REQ-7"));
+    assert_eq!(issue.state, State::Ready);
+    assert!(issue.links.is_empty());
+    h.github.transition("acme/app#1", State::Blocked).unwrap();
+    let s = h.store.lock().unwrap();
+    for label in ["open", "closed"] {
+        assert!(
+            s.issues[&1]["labels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v["name"] == label)
+        );
+    }
+}
+
+#[test]
+fn transition_verifies_state_without_reading_metadata_or_children() {
+    let h = Harness::new();
+    h.store.lock().unwrap().issues.get_mut(&1).unwrap()["body"] =
+        "<!-- kod:issue invalid -->".into();
+    h.github
+        .transition("acme/app#1", State::InProgress)
+        .unwrap();
+    assert!(
+        !h.store
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .any(|(_, p, _)| p.ends_with("sub_issues"))
+    );
+}
+
+#[test]
+fn rejected_creates_allow_retry_and_do_not_claim_uncertain_outcomes() {
+    let h = Harness::new();
+    for status in [StatusCode::FORBIDDEN, StatusCode::UNPROCESSABLE_ENTITY] {
+        h.store.lock().unwrap().reject_create = Some(status);
+        let error = h.github.status_comment("acme/app#1", "first").unwrap_err();
+        assert!(!format!("{error:#}").contains("unknown"));
+        h.github.status_comment("acme/app#1", "retry").unwrap();
+        h.store.lock().unwrap().comments.clear();
+    }
+    h.store.lock().unwrap().reject_create = Some(StatusCode::GONE);
+    let error = h
+        .github
+        .create_linked(
+            "acme/app#1",
+            ReworkKind::Question,
+            &Rework {
+                stage: "build".into(),
+                artifact: "design".into(),
+                version: "v1".into(),
+                text: "Clarify limit".into(),
+                evidence: vec![],
+            },
+        )
+        .unwrap_err();
+    assert!(!format!("{error:#}").contains("unknown"));
+}
+
+#[test]
+fn malformed_successful_create_stays_uncertain_until_reconciled() {
+    let h = Harness::new();
+    h.store.lock().unwrap().malformed_create = true;
+    let error = h.github.status_comment("acme/app#1", "first").unwrap_err();
+    assert!(format!("{error:#}").contains("outcome unknown"));
+    h.store.lock().unwrap().hidden_comments = true;
+    assert!(h.github.status_comment("acme/app#1", "retry").is_err());
+    h.store.lock().unwrap().hidden_comments = false;
+    h.github.status_comment("acme/app#1", "reconciled").unwrap();
+    assert_eq!(h.store.lock().unwrap().comments[&1].len(), 1);
+}
+
+#[test]
+fn transport_errors_keep_redacted_causes_and_only_writes_are_uncertain() {
+    let mut h = Harness::new();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    h.github.api = format!("http://{address}");
+    for method in [Method::GET, Method::POST] {
+        let error = h
+            .github
+            .call(method.clone(), "issues/1?secret=do-not-log", None)
+            .unwrap_err();
+        let text = format!("{error:#}");
+        assert_eq!(text.contains("outcome unknown"), method == Method::POST);
+        assert!(error.chain().count() >= 3, "transport cause must survive");
+        assert!(!text.contains("do-not-log"));
+        assert!(!text.contains(&address.to_string()));
+    }
+}
+
+#[test]
+fn workflow_label_paths_encode_spaces_and_percent_signs() {
+    let mut h = Harness::new();
+    let label = "kod:blocked %";
+    let mut mapping: Value = serde_json::from_str(MAPPING).unwrap();
+    mapping["states"]["blocked"] = json!([label]);
+    h.github.mapping = Mapping::parse("encoded label", &mapping.to_string()).unwrap();
+    h.store.lock().unwrap().issues.get_mut(&1).unwrap()["labels"] = json!([{"name":label}]);
+    h.github.transition("acme/app#1", State::Ready).unwrap();
+    assert_eq!(h.store.lock().unwrap().issues[&1]["labels"], json!([]));
+}
+
+#[test]
+fn workflow_label_events_and_mixed_case_repository_identities_are_recognized() {
+    let h = Harness::new();
+    for action in ["labeled", "unlabeled"] {
+        let mut value = payload(action);
+        value["repository"]["full_name"] = "Acme/App".into();
+        value["issue"]["repository_url"] = "https://api.github.com/repos/Acme/App".into();
+        value["label"]["name"] = "kod:blocked".into();
+        assert_eq!(
+            h.github
+                .parse_webhook(&h.webhook(&value))
+                .unwrap()
+                .unwrap()
+                .event,
+            TaskEvent::Edited {
+                issue: "acme/app#1".into()
+            }
+        );
+    }
 }
 
 #[test]

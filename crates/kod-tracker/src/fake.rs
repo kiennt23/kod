@@ -106,10 +106,7 @@ impl FakeTracker {
 
     /// The signature header value for this body.
     pub fn sign(&self, body: &[u8]) -> String {
-        hmac_sha256(self.secret.as_bytes(), body)
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect()
+        crate::signature::hex(&hmac_sha256(self.secret.as_bytes(), body))
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {

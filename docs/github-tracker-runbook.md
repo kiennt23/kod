@@ -33,6 +33,9 @@ namespace is an error. The trigger is outside that namespace. A transition
 preserves unrelated labels, makes separate label/state writes,
 then verifies the resulting state. Serialize trusted writes; concurrent
 human changes can cause a refusal requiring reconciliation.
+Plain labels named `open` or `closed` are unrelated to workflow state and
+are preserved. Human additions/removals in the `kod:` namespace emit an edit
+event so the dispatcher can invalidate a running task.
 
 API calls use GitHub.com HTTPS with a pinned API version, sensitive auth
 headers, disabled redirects, connect/request timeouts and bounded responses.
@@ -58,6 +61,11 @@ Issues API. To supply harness fields, put one block in the raw issue body:
 }
 -->
 ```
+
+Repository identity comparisons ignore ASCII case; returned keys use the
+configured spelling. Metadata accepts LF and CRLF line endings. Native
+sub-issues in other repositories are omitted from the adapter's local links;
+explicit metadata links remain restricted to the configured repository.
 
 The requirement/risk property names come from `mapping.fields`. The other
 keys are fixed. Absence of the block yields absent optional fields and empty
@@ -103,6 +111,11 @@ processes, as required by the status runbook. A create with an uncertain
 response marks that issue uncertain in the adapter instance. A later call
 may update a discovered owned comment, but cannot blindly create a second
 one while uncertainty remains. Duplicate owned comments are an error.
+Definite 4xx rejections clear the in-process create guard and allow a later
+retry. Transport failures, 5xx write responses, and malformed successful
+responses remain uncertain; a server error can follow a committed write.
+Read failures do not claim an uncertain write. Transport causes are retained
+with request URLs removed.
 
 Before restarting/replacing an adapter after an uncertain write, use the
 status intent/outcome audit records and remote comment list to reconcile.
