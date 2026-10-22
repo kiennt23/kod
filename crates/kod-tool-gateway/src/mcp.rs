@@ -106,7 +106,7 @@ impl ServerHandler for Handler {
         // The adapters block; keep them off the async workers.
         let reply = tokio::task::spawn_blocking(move || gateway.call(&token, &name, &args))
             .await
-            .unwrap_or_else(|e| Err(format!("the tool call failed: {e}")));
+            .unwrap_or_else(|e| Err(crate::scrub(&format!("the tool call failed: {e}"))));
         Ok(match reply {
             Ok(v) => CallToolResult::success(vec![ContentBlock::text(v.to_string())]),
             Err(e) => CallToolResult::error(vec![ContentBlock::text(e)]),

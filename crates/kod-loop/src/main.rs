@@ -74,7 +74,8 @@ fn setup(cli: &Cli) -> Result<(Config, String, Option<Mcp>)> {
     // unreachable is a failed run, not a run without the gateway.
     let mcp = match std::env::var("KOD_MCP_URL") {
         Ok(url) => Some(Mcp::connect(&url).context("KOD_MCP_URL: the tool gateway")?),
-        Err(_) => None,
+        Err(std::env::VarError::NotPresent) => None,
+        Err(e) => bail!("KOD_MCP_URL: {e}"),
     };
     Ok((cfg, prompt, mcp))
 }

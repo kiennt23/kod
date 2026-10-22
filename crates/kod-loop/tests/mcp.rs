@@ -175,3 +175,18 @@ fn an_echoed_token_cut_by_the_error_length_limit_does_not_leak() {
     assert!(e.contains("HTTP 500"), "{e}");
     assert!(!e.contains(&TOKEN[..16]), "{e}");
 }
+
+#[test]
+fn a_json_rpc_error_that_echoes_the_path_does_not_leak_the_run_token() {
+    let app = axum::Router::new().fallback(|uri: axum::http::Uri| async move {
+        axum::Json(json!({"jsonrpc": "2.0", "id": 1,
+            "error": {"code": -32000, "message": format!("bad {uri}")}}))
+    });
+    let base = serve(app);
+    let e = Mcp::connect(&format!("{base}/r/{TOKEN}/mcp"))
+        .err()
+        .unwrap();
+    let e = format!("{e:#}");
+    assert!(e.contains("/r/[REDACTED]/mcp"), "{e}");
+    assert!(!e.contains(TOKEN), "{e}");
+}

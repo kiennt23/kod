@@ -119,7 +119,7 @@ impl Mcp {
         let mut r: Value = serde_json::from_str(&text)
             .with_context(|| format!("{method}: the reply is not JSON"))?;
         if !r["error"].is_null() {
-            bail!("{method}: {}", r["error"]);
+            bail!("{method}: {}", scrub(&r["error"].to_string()));
         }
         match r.get_mut("result").map(Value::take) {
             Some(result) if result.is_object() => Ok(result),
