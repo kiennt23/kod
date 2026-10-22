@@ -87,7 +87,7 @@ This implements the control architecture in [*DevSecOps SDLC with AI Agents*](de
 
 **Run identity and lifecycle:**
 
-- A run is keyed by ticket ID and ticket revision. Webhook deliveries are deduplicated by delivery ID, so a retried or duplicate event can't start a second run.
+- A run is keyed by ticket ID and ticket revision. Webhook deliveries are deduplicated by the hash of the signed body, so a retried or duplicate event can't start a second run.
 
 - Admission is atomic: the dispatcher checks the WIP limit and records the run in one transaction.
 
@@ -223,7 +223,7 @@ A richer UI comes later, once the team has used these and knows what it's missin
 
 - Audit store: an append-only table with external checkpoints, nothing bespoke.
 
-- Gateways: one process serving both the tool and model routes until load or isolation needs say otherwise.
+- Gateways: one process serving both the tool and model routes until load or isolation needs say otherwise. Today the LLM gateway runs alone and the tool gateway is a library; sub-plan 6b mounts it.
 
 - Dispatcher: one process with a database table as its queue.
 
@@ -340,7 +340,7 @@ The tracker connects to the harness in two places, so pluggability needs two pie
 | Tools | MCP (remote streamable HTTP, OAuth) | The gateway is one MCP endpoint that every agent points at |
 | Repo instructions | AGENTS.md | Single source of truth. CLAUDE.md contains only @AGENTS.md |
 | Know-how | Agent Skills (SKILL.md) | Check support per agent. Essential rules also go in AGENTS.md |
-| Model access | Our LLM gateway (Anthropic- and OpenAI-compatible API) | In-region routing, zero data retention, budgets and logs in one place. Each agent's base URL points here |
+| Model access | Our LLM gateway (Anthropic Messages API; an OpenAI-compatible route only if a runner needs it) | In-region routing, zero data retention, budgets and logs in one place. Each agent's base URL points here |
 | Traces | OpenTelemetry GenAI conventions | The gateway logs every external call and the sandbox records commands and the final diff, without relying on the agent's own telemetry |
 | Output | Git branch, PR, commit trailers | The PR is the handoff point that works with any agent |
 
@@ -709,6 +709,27 @@ roadmap · 4 phases, gated, not to scale
 - **2 · IDE pairing.** IDE agents read the same AGENTS.md and skills, and their tool calls go through the same gateway and policy. Hooks are per agent, so nothing relies on them. Add the reviewer agent to PRs.
 
 - **3 · Scale out.** Add per-team policy, budgets and self-service onboarding and the read-only workflow status page, with a platform team owning the harness. Only now does multi-team design work start.
+
+## Decisions made during the build
+
+Decisions taken in the phase 1 plans and code that the sections above do not state. Each links to the plan that records it and its reasons.
+
+| Decision | Plan |
+| --- | --- |
+| The audit log is SQLite (WAL, `synchronous=FULL`), one file on the audit host. Writers must be on that host; move to Postgres when one has to run elsewhere. Integrity comes from the external checkpoints, not the database. Retention clears payloads (sets them NULL); the hash chain covers the payload hash, so it still verifies. | [audit](superpowers/plans/2026-10-15-phase1-audit.md) |
+| The dispatcher's queue and run table are SQLite too, one file, one process. The database enforces the rules: one live run per ticket, forward-only state moves. | [dispatcher](superpowers/plans/2026-10-16-phase1-dispatcher.md) |
+| A run reaches the LLM gateway and the tool gateway by a per-run token in the URL (`/r/<token>`, at least 32 lower-case hex characters, kept as its SHA-256). The sandbox holds no key. | [LLM gateway](superpowers/plans/2026-10-15-phase1-llm-gateway.md), [tool gateway](superpowers/plans/2026-10-16-phase1-tool-gateway.md) |
+| Budgets are reserve-then-settle. A request reserves its worst case before it is forwarded and settles to the reported usage when the response ends. A cost above the reservation halts the run. | [LLM gateway](superpowers/plans/2026-10-15-phase1-llm-gateway.md) |
+| The LLM gateway forwards only `/v1/messages` and `/v1/messages/count_tokens`, and refuses request fields, tools and beta headers it cannot price or see. | [LLM gateway](superpowers/plans/2026-10-15-phase1-llm-gateway.md) |
+| Webhook dedup is on the SHA-256 of the signed body, kept across restarts. The tracker adapter keeps no record of delivery IDs. | [dispatcher](superpowers/plans/2026-10-16-phase1-dispatcher.md) |
+| Kill switch: the owner and backup are named in the dispatcher's own config, so their kill works without the policy and without the audit log. Anyone else (a tech lead) goes through the policy. Resume is only the owner or backup, by a signed CLI request (HMAC, 300 s window, single use), never a tracker comment. | [dispatcher](superpowers/plans/2026-10-16-phase1-dispatcher.md), [policy](superpowers/plans/2026-10-15-phase1-policy.md) |
+| A label removal or an edit that changes the ticket revision cancels the live run without a policy decision. The revision is a hash of title, body, acceptance criteria, requirement ID, risk class and approved document versions. | [dispatcher](superpowers/plans/2026-10-16-phase1-dispatcher.md) |
+| Publish is host-only. It is not a tool and not on the MCP endpoint. The change comes from the collector's diff on the host, never from the sandbox; the sandbox has no git credential. | [tool gateway](superpowers/plans/2026-10-16-phase1-tool-gateway.md) |
+| Publish is idempotent: the commit date is the run's start time, so a retry makes the same commit and finds the same PR. After a restart, a run left publishing ends done if its draft PR exists and needs-human otherwise. | [tool gateway](superpowers/plans/2026-10-16-phase1-tool-gateway.md), [dispatcher](superpowers/plans/2026-10-16-phase1-dispatcher.md) |
+| A team name the policy does not know falls back to `not_sole` for requester approval. A team entry that is present but malformed fails the policy load. | [policy](superpowers/plans/2026-10-15-phase1-policy.md) |
+| Logins are GitHub logins, compared lower-cased. Approvals from agents, or without an explicit `agent: false`, deny a merge. | [policy](superpowers/plans/2026-10-15-phase1-policy.md) |
+| The tracker contract has a fake adapter and a contract test; a real adapter is supported once it passes it. | [tracker contract](superpowers/plans/2026-10-15-phase1-tracker-contract.md) |
+| The gate runner and the workflow status view are separate crates. Status is computed on every read from the host's records and the dispatcher database (opened read-only). | [gates](superpowers/plans/2026-10-22-phase1-gates.md), [status](superpowers/plans/2026-10-22-phase1-status.md) |
 
 ## Risks
 

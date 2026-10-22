@@ -5,6 +5,18 @@ Kod is an agent harness for a regulated-industry SDLC. Phase 0 is built: an
 locked-down sandbox and scores the result, before any agent touches a live
 repository.
 
+## Status
+
+Phase 0 is built. The first baseline (real cases, real model) is still to run.
+
+Phase 1 sub-plans 1 to 6, 6a, 7 and 8 are merged. Sub-plan 6c implements the
+GitHub Issues tracker adapter; connected acceptance remains 6b. Sub-plans
+6b (connected integration) and 9 (upstream doc drafting) are not started. The
+per-sub-plan table is in the
+[phase 1 overview](docs/superpowers/plans/2026-10-14-phase1-overview.md).
+The dispatcher and the tool gateway are libraries until 6b wires them into a
+process, so they have no binary yet.
+
 ## Docs
 
 | Doc | What it covers |
@@ -12,6 +24,12 @@ repository.
 | [Kod: an agent harness for our SDLC](docs/kod-harness-design.md) | Harness architecture, PR flow, rework and staleness, pluggable models/trackers/runners, Rust components, policies, roadmap |
 | [DevSecOps SDLC with AI Agents](docs/devsecops-sdlc.md) | Stages, gates, rework loops, stage outputs, agent roster, control architecture, threats, risks, metrics, rollout |
 | [Phase 0 runbook](docs/phase0-runbook.md) | Host setup, pinned images, smoke test, baseline, kill-switch drill, exit criteria |
+| [Phase 1 runbook](docs/phase1-runbook.md) | kod-loop against the baseline: conformance, tuning, held-out comparison |
+| [Phase 1 overview](docs/superpowers/plans/2026-10-14-phase1-overview.md) | Sub-plans, order and status |
+| [Audit log runbook](docs/audit-runbook.md) | Checkpoints, verify, purge, off-host verifier |
+| [Dispatcher runbook](docs/dispatcher-runbook.md) | Webhook setup, kill and resume, recovery |
+| [LLM gateway runbook](docs/llm-gateway-runbook.md) | Runs and prices config, budgets, failure behaviour |
+| [Tool gateway runbook](docs/tool-gateway-runbook.md) | Run tokens, tools, publish, failure behaviour |
 | [Phase 1 gate runner](docs/gates-runbook.md) | Trusted checks, isolated scanners, GitHub rules and activation requirements |
 | [Workflow status](docs/status-runbook.md) | `kod status`, computed story progress and one maintained tracker comment |
 | [GitHub Issues tracker](docs/github-tracker-runbook.md) | First tracker adapter, issue metadata, signed events and status-comment recovery |
@@ -19,12 +37,23 @@ repository.
 | [Pinned versions](evals/VERSIONS.md) | Every version a baseline depends on |
 | [ADR 0001](docs/adr/0001-per-task-execution-mode.md) | How implementation plans are executed and reviewed |
 
+Docs live in this repo as Markdown. A build PR updates the README, the overview status and its runbook (see the PR template).
+
 ## What's in the repo
 
-- `crates/kod-eval`: the `kod-eval` CLI (cases, runs, scoring, reports, kill switch).
-- `crates/kod-llm-proxy`: the only way out of the sandbox. It holds the model key and enforces the allowed models, token cap, request budget and concurrency.
-- `images/sandbox`, `images/proxy`: container images.
-- `crates/kod-loop`: our agent loop, a runner built into every sandbox image (`--runner kod-loop`).
+| Path | What it is |
+| --- | --- |
+| `crates/kod-eval` | The `kod-eval` CLI: cases, runs, scoring, reports, kill switch |
+| `crates/kod-llm-proxy` | The LLM gateway. The only way out of the sandbox; holds the model key and enforces models, token and cost budgets, request count and concurrency |
+| `crates/kod-loop` | Our agent loop, built into every sandbox image (`--runner kod-loop`) |
+| `crates/kod-policy` | Policy engine: Rego rules and data in `policy/`, evaluated in process |
+| `crates/kod-audit` | Hash-chained SQLite audit log and the `kod-audit` CLI |
+| `crates/kod-tracker` | Tracker adapter contract, GitHub Issues adapter, fake adapter and contract tests |
+| `crates/kod-tool-gateway` | MCP tools for a run, and the host-only publish operation (library) |
+| `crates/kod-dispatcher` | Webhooks to runs, kill switch and recovery (library) |
+| `crates/kod-gates` | Trusted check runner for pull requests |
+| `crates/kod-status` | The `kod status` CLI |
+| `images/sandbox`, `images/proxy` | Container images |
 
 How a case runs:
 1. The agent works in a container with no git history and no network except the proxy.
@@ -82,5 +111,3 @@ KOD_API_KEY=dummy KOD_DOCKER_TESTS=1 cargo test -p kod-eval --test docker --test
 ```
 
 Every change goes through a pull request.
-
-Status: phase 0 code complete; the first baseline (real cases, real model) is still to run.
