@@ -1,0 +1,13 @@
+#!/bin/sh
+set -eu
+mkdir /work/src
+tar -xzf /input/source.tar.gz --strip-components=1 -C /work/src --no-same-owner --no-same-permissions
+mkdir /work/cargo
+cp -a /opt/kod/cargo/. /work/cargo/
+export CARGO_HOME=/work/cargo
+export CARGO_TARGET_DIR=/work/target
+export CARGO_NET_OFFLINE=true
+export RUSTUP_TOOLCHAIN=1.99.0
+cd /work/src
+rm -f .gitleaksignore
+exec "$@"
