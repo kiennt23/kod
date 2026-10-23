@@ -9,8 +9,8 @@ repository.
 
 Phase 0 is built. The first baseline (real cases, real model) is still to run.
 
-Phase 1 sub-plans 1 to 6, 6a, 7 and 8 are merged. Sub-plan 6c implements the
-GitHub Issues tracker adapter; connected acceptance remains 6b. Sub-plans
+Phase 1 sub-plans 1 to 6, 6a, 6c, 7 and 8 are merged. The GitHub Issues
+tracker adapter is built; connected acceptance remains 6b. Sub-plans
 6b (connected integration) and 9 (upstream doc drafting) are not started. The
 per-sub-plan table is in the
 [phase 1 overview](docs/superpowers/plans/2026-10-14-phase1-overview.md).
