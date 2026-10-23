@@ -10,8 +10,9 @@ repository.
 Phase 0 is built. The first baseline (real cases, real model) is still to run.
 
 Phase 1 sub-plans 1 to 6, 6a, 6c, 7 and 8 are merged. The GitHub Issues
-tracker adapter is built; connected acceptance remains 6b. Sub-plans
-6b (connected integration) and 9 (upstream doc drafting) are not started. The
+tracker adapter is built. Sub-plan 6b-a adds the real GitHub App broker and
+Forge; the connected host (6b-b) and acceptance (6b-c) remain pending.
+Sub-plan 9 (upstream doc drafting) is not started. The
 per-sub-plan table is in the
 [phase 1 overview](docs/superpowers/plans/2026-10-14-phase1-overview.md).
 The dispatcher and the tool gateway are libraries until 6b wires them into a
