@@ -25,6 +25,7 @@ use std::{
 pub mod broker;
 pub mod docs;
 pub mod forge;
+pub mod github;
 mod mcp;
 
 pub use mcp::router;

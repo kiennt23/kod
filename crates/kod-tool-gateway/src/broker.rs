@@ -24,9 +24,9 @@ impl fmt::Debug for Secret {
     }
 }
 
-/// Mints short-lived credentials that can push agent/* branches and open
-/// draft PRs in one repo, and nothing else. Each belongs to one run, so a
-/// run's end or the kill switch can revoke it before it expires.
+/// Mints short-lived repository credentials belonging to one run, so a run's
+/// end or the kill switch can revoke them. Concrete Forge adapters enforce
+/// exact agent branches; GitHub installation tokens cannot encode that scope.
 pub trait Broker: Send + Sync {
     fn mint(&self, run: &str, repo: &str) -> Result<Secret>;
     /// Revokes every credential minted for the run. Safe to repeat.
