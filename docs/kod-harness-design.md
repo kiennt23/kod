@@ -39,9 +39,7 @@ This doc designs a harness that lets an AI agent take a ticket and hand back a p
 
 ## Architecture overview
 
-![Kod architecture](img/kod-architecture.png)
-
-v1 harness · 6 flow components, 3 support services
+The architecture is drawn as C4 context, container and component diagrams in [architecture.md](architecture.md#level-2-containers).
 
 The sandbox holds no long-lived credentials, and the agent never calls an external system directly. The one named exception is a vendor runner in subscription mode (see Subscription auth for vendor runners). Every external operation (tracker, docs, model, git publish) passes through a gateway, which asks the policy engine, injects a short-lived credential and records the decision. Local work inside the sandbox (shell, builds, tests, file edits) isn't a gateway call; the sandbox contains it (see Trust boundaries). The only write the agent can make to the repo is the gateway's publish operation: a push to its own agent/\<ticket\> branch plus a draft PR, so everything it produces still goes through CI and human review.
 
@@ -610,9 +608,7 @@ Data written into a PR or sent in a model request remains a residual risk, recor
 
 Kod has three zones. A control counts only if it still holds when a runner ignores its instructions and hooks.
 
-![Kod trust boundaries](img/kod-trust-boundaries.png)
-
-trust boundaries · 3 zones
+The three zones are drawn in [architecture.md](architecture.md#level-2-containers) as boundaries around the containers.
 
 Agent code runs only in the top zone. Everything it does outside goes through the gateway, and nothing it builds reaches a release.
 
