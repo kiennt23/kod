@@ -23,6 +23,7 @@ process, so they have no binary yet.
 | --- | --- |
 | [Kod: an agent harness for our SDLC](docs/kod-harness-design.md) | Harness architecture, PR flow, rework and staleness, pluggable models/trackers/runners, Rust components, policies, roadmap |
 | [DevSecOps SDLC with AI Agents](docs/devsecops-sdlc.md) | Stages, gates, rework loops, stage outputs, agent roster, control architecture, threats, risks, metrics, rollout |
+| [Architecture (C4)](docs/architecture.md) | Context, container and component diagrams; trust boundaries; planned vs built |
 | [Phase 0 runbook](docs/phase0-runbook.md) | Host setup, pinned images, smoke test, baseline, kill-switch drill, exit criteria |
 | [Phase 1 runbook](docs/phase1-runbook.md) | kod-loop against the baseline: conformance, tuning, held-out comparison |
 | [Phase 1 overview](docs/superpowers/plans/2026-10-14-phase1-overview.md) | Sub-plans, order and status |
