@@ -208,15 +208,236 @@ fn pr_lost_reply_survives_restart_without_second_post() {
 - [ ] **Step 5 / Commit:** `Reconcile GitHub refs and draft PRs` — Task 4 files.
 
 ### Task 5: Prove compatibility and document activation/recovery
-**Files:** modify `src/github/tests.rs`, `docs/tool-gateway-runbook.md`; add `crates/kod-tool-gateway/tests/github_api.rs` only for a compile-only public API construction test. Closes GAP-1 through GAP-4. Wave 5; depends 4; blocks final verification. No live GitHub resources or model spend are required for merge.
+**Files:** modify `crates/kod-tool-gateway/src/github/tests.rs`, the private fixture module owned by that file (if Task 1 extracted it), and `docs/tool-gateway-runbook.md`; add `crates/kod-tool-gateway/tests/github_api.rs`. Keep all code blocks below in their stated target modules; consolidate duplicate imports when inserting them. Narrow adapter fixes belong in `src/github/{mod,auth,forge}.rs` only when a test below demonstrates the defect. Closes GAP-1 through GAP-4. Wave 5; depends 4; blocks final verification. Keep the Task 1 public API and existing traits unchanged.
 
-**References:** `src/forge.rs:84-135` (shared contract); `tests/publish.rs:141-179,193-234,266-288,336-347` (retry/secrets/cancel/recovery); `tests/common/mod.rs` (gateway harness); `docs/superpowers/plans/2026-10-16-phase1-tool-gateway.md` (original standalone crate boundary).
+**References:** `crates/kod-tool-gateway/src/forge.rs:84-135` (unchanged contract), `src/lib.rs:194-209,476-580` (composition, publish and cleanup), `tests/common/mod.rs:87-157` (real gateway construction), `tests/publish.rs:336-347` (cancellation during ref publication), `src/forge.rs:358-375` (existing workspace fake), `crates/kod-tracker/src/fake.rs:265-284` (seeded tracker). Paths without a crate prefix refer to `crates/kod-tool-gateway/`. [Installation-token revocation](https://docs.github.com/en/rest/apps/installations#revoke-an-installation-access-token) supplies the optional live assertion.
 
-- [ ] **Step 1: Write failing tests** `contract_real_http` registers `RunPermit { run:"contract-run",ticket:"CONTRACT-1",repo:"acme/app",base:fixture_base }`, then calls unchanged `forge::check(&adapter,&adapter,"acme/app",base)`. Add `contract_gateway_cancel_after_ref` using actual `Gateway`, fixture broker/Forge, existing fake tracker/docs/workspace and a stop barrier after remote ref creation. Assert branch absence, zero PRs, and revocation of both publish and cleanup credentials. Do not change fake expectations to hide a real-adapter mismatch.
-- [ ] **Step 2: Run red:** `cargo test -p kod-tool-gateway --lib github::tests::contract_ -- --nocapture`; expect any contract mismatch to fail with request/state evidence. These are additional integration assertions, not new fake adapter behavior.
-- [ ] **Step 3: Implement** only compatibility fixes identified by those tests, retaining all prior safety assertions. Public compile test imports `github::{GitHub,Config,AppCredentials,RunPermit}` and coerces `Arc<GitHub>` to both `Arc<dyn Broker>` and `Arc<dyn Forge>`; its feature-gated case exercises `with_test_api` and rejects a public/non-loopback URL before requests. Document production assembly, pending-lease recovery, the explicit protection shape and metadata restrictions. Optional live broker contract is an ignored `github::tests::live_broker_contract`: load owner-provided config/key paths from `KOD_GITHUB_BROKER_CONFIG`, require `KOD_LIVE_BROKER=1`, mint one token, prove repository access, revoke it, then verify the same token gets 401. It creates no branch/PR and makes no model call; missing inputs fail explicitly, never pass as skipped acceptance.
-- [ ] **Step 4 / Acceptance / QA:** rerun contract command green, then `cargo test -p kod-tool-gateway --test publish --test mcp --test github_api` and `cargo test -p kod-tool-gateway --features test-support --test github_api`. Run once on the final branch: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --all`, `cargo deny check`, `git diff --check`. Each returns zero; inspect executed test counts. Evidence `.omo/evidence/phase1-connected/a-task-5.log` and `a-final-checks.log`.
-- [ ] **Step 5 / Commit:** `Verify the connected GitHub publish contract` — Task 5 files plus narrowly required fixes. Commits are atomic and use the existing plain-message style; do not commit generated evidence or secrets.
+- [ ] **Step 1: Add these failing tests** to `src/github/tests.rs`. Reuse Task 1's `Fixture::start()`, `adapter()`, `permit()`, `config()`, `adapter_with(Config) -> anyhow::Result<GitHub>`, and Task 2's `reopen_adapter()`. The additional fixture methods and Gateway composition are implemented in Step 3, below; no mock `Forge` stands in for `GitHub`.
+```rust
+use super::{AppCredentials, Config, GitHub, RunPermit};
+use crate::{Adapters, Gateway, Run, broker::Broker, docs::FakeDocs};
+use crate::forge::{self, Change, Collected, FakeWorkspace, Identity};
+use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}, mpsc};
+use std::time::Duration;
+
+#[test]
+fn contract_real_http() {
+    let f = Fixture::start(); let a = f.adapter();
+    let base = f.permit().base;
+    a.register_run(RunPermit { run: "contract-run".into(), ticket: "CONTRACT-1".into(),
+        repo: "acme/app".into(), base: base.clone() }).unwrap();
+    forge::check(&a, &a, "acme/app", &base).unwrap();
+    assert!(!f.branch_exists("agent/CONTRACT-1-contract-run"));
+    assert_eq!(f.pr_count(), 1);
+    assert_eq!(f.credential_counts(), (2, 0));
+    assert_eq!(f.requests("DELETE", "/installation/token"), 2);
+}
+
+#[test]
+fn contract_gateway_cancel_after_ref() {
+    let f = Fixture::start(); let a = Arc::new(f.adapter());
+    let dir = tempfile::tempdir().unwrap();
+    let stopped = Arc::new(AtomicBool::new(false));
+    let gw = gateway(&f, a.clone(), dir.path(), stopped.clone());
+    let (created, release) = f.pause_after_ref();
+    let worker = std::thread::spawn(move || gw.publish("run-1"));
+    let reached = created.recv_timeout(Duration::from_secs(10));
+    // Release even on a failed assertion; never strand the fixture thread.
+    stopped.store(true, Ordering::SeqCst);
+    let _ = release.send(());
+    let result = worker.join().unwrap();
+    reached.expect("publish never reached the committed remote ref");
+    assert!(result.unwrap_err().contains("the run was canceled during publish"));
+    assert!(!f.branch_exists("agent/FAKE-1-run-1"));
+    assert_eq!(f.pr_count(), 0);
+    assert_eq!(f.requests("POST", "/repos/acme/app/pulls"), 0);
+    assert_eq!(f.credential_counts(), (2, 0)); // Publish + fresh cleanup token.
+    assert_eq!(f.requests("DELETE", "/installation/token"), 2);
+    assert_eq!(f.requests("DELETE", "/repos/acme/app/git/refs/heads/agent/FAKE-1-run-1"), 1);
+}
+
+#[test]
+fn contract_activation_failure_and_restart_cleanup() {
+    let f = Fixture::start(); let mut wrong = f.config();
+    wrong.base_branch = "wrong-default".into();
+    let refused = f.adapter_with(wrong).unwrap();
+    assert!(refused.verify_repository().is_err());
+    assert_eq!(f.credential_counts(), (1, 0));
+    assert_eq!(f.mutations(), 0); // Git/PR writes; issuance/revocation are not Git mutations.
+    drop(refused);
+    let a = f.adapter(); a.register_run(f.permit()).unwrap();
+    let token = a.mint("run-1", "acme/app").unwrap();
+    drop(a);
+    let restarted = f.reopen_adapter(); restarted.recover().unwrap();
+    assert!(!f.token_is_live(token.expose()));
+    assert_eq!(f.credential_counts(), (2, 0));
+    restarted.verify_repository().unwrap();
+    assert_eq!(f.credential_counts(), (3, 0));
+}
+```
+- [ ] **Step 2 / red:** `cargo test -p kod-tool-gateway --lib github::tests::contract_ -- --nocapture`. First expect missing fixture-helper compilation errors; after adding helpers, record any real contract/activation/cleanup assertion failure. If Tasks 1–4 already satisfy an assertion, retain it as regression coverage; do not manufacture a production defect or weaken `forge::check` to force red.
+
+- [ ] **Step 3: Implement the test boundary and production assembly checks.** These fields extend the private HTTP fixture, never the production adapter. Bind the following storage to the fixture's actual route state: `Fixture.contract: Arc<Mutex<ContractRemote>>`, initialized with `Default::default()` in `Fixture::start()` and cloned into the Axum state. Move the fixture's existing equivalent refs, PRs, and token liveness into this single canonical store; do not maintain a second observational mirror. Keep Task 1–4's JWT, scope, Git-object and failure-injection validation intact. `refs` uses branch names without `refs/heads/`; request counters use percent-decoded paths.
+```rust
+#[derive(Default)]
+struct ContractRemote {
+    refs: std::collections::BTreeMap<String, String>,
+    prs: Vec<serde_json::Value>,
+    issued: std::collections::HashSet<String>,
+    live: std::collections::HashSet<String>,
+    after_ref: Option<Box<dyn FnOnce() + Send>>,
+}
+impl Fixture {
+    fn branch_exists(&self, branch: &str) -> bool {
+        self.contract.lock().unwrap().refs.contains_key(branch)
+    }
+    fn credential_counts(&self) -> (usize, usize) {
+        let s = self.contract.lock().unwrap(); (s.issued.len(), s.live.len())
+    }
+    fn pr_count(&self) -> usize { self.contract.lock().unwrap().prs.len() }
+    fn token_is_live(&self, token: &str) -> bool {
+        self.contract.lock().unwrap().live.contains(token)
+    }
+    fn pause_after_ref(&self) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (made_tx, made_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        self.contract.lock().unwrap().after_ref = Some(Box::new(move || {
+            made_tx.send(()).unwrap();
+            resume_rx.recv_timeout(Duration::from_secs(10)).expect("ref barrier timed out");
+        }));
+        (made_rx, resume_tx)
+    }
+}
+// Call after validation in the fixture POST /repos/acme/app/git/refs handler,
+// before its successful response. This mutates the SAME map GET/DELETE read.
+async fn fixture_create_ref(s: Arc<Mutex<ContractRemote>>, branch: String, sha: String) {
+    let hook = {
+        let mut remote = s.lock().unwrap();
+        remote.refs.insert(branch, sha);
+        remote.after_ref.take()
+    };
+    if let Some(hook) = hook { tokio::task::spawn_blocking(hook).await.unwrap(); }
+}
+```
+The existing fixture ref GET reads `remote.refs.get(branch)` and DELETE executes `remote.refs.remove(branch)`; PR POST appends the validated draft object to `remote.prs` and list reads that same vector. Successful token issuance executes `remote.issued.insert(token.clone()); remote.live.insert(token.clone());`; successful token DELETE executes `remote.live.remove(token)`. Authentication checks `remote.live.contains(token)` together with existing expiry/scope checks. Preserve failure-injection ordering: failed revocation leaves `live` intact; lost issuance/PR replies update provider state before dropping the response. These are the actual handler state transitions, not merely metrics. Remove duplicate helper definitions from earlier tasks when their names already exist.
+
+Implement the concrete gateway helper in the same unit-test module:
+```rust
+fn gateway(f: &Fixture, github: Arc<GitHub>, dir: &std::path::Path,
+           stopped: Arc<AtomicBool>) -> Arc<Gateway> {
+    let (tracker, _) = kod_tracker::fake::sandbox();
+    let mut issue = tracker.issue("FAKE-1").unwrap(); issue.workflow_state = "Doing".into();
+    tracker.add_issue("FAKE-1", issue);
+    let workspace = Arc::new(FakeWorkspace::default());
+    workspace.set("run-1", Collected { changes: vec![Change {
+        path: "contract.txt".into(), content: Some("contract\n".into()) }],
+        test_evidence: "fixture collector: passed".into() });
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let policy = Arc::new(kod_policy::Policy::load(&root.join("policy")).unwrap());
+    let audit = Arc::new(kod_audit::AuditLog::open(&dir.join("audit.db")).unwrap());
+    let base = f.permit().base;
+    github.register_run(RunPermit { run: "run-1".into(), ticket: "FAKE-1".into(),
+        repo: "acme/app".into(), base: base.clone() }).unwrap();
+    let adapters = Adapters { tracker: Arc::new(tracker), docs: Arc::new(FakeDocs::default()),
+        stopped: Arc::new(move |_| Ok(stopped.load(Ordering::SeqCst))),
+        broker: github.clone(), forge: github, workspace };
+    let gw = Arc::new(Gateway::new(policy, audit, adapters, Identity {
+        name: "kod-agent".into(), email: "agent@kod.invalid".into() }).unwrap());
+    gw.start_run(&"a".repeat(64), Run { id: "run-1".into(), ticket: "FAKE-1".into(),
+        repo: "acme/app".into(), base, data_classes: vec!["placeholder".into()],
+        linked_tickets: vec![], started_at: 1_700_000_000 }).unwrap();
+    gw
+}
+```
+Add the **entire** `tests/github_api.rs` below. These tests compile constructor bodies and trait coercions without reading a developer key or contacting GitHub. Keep the negative endpoint runtime assertion in the private fixture suite with a valid generated key; compile-only coverage must not claim it proves runtime validation.
+```rust
+use kod_tool_gateway::{broker::Broker, forge::Forge,
+    github::{AppCredentials, Config, GitHub, RunPermit}};
+use std::{path::Path, sync::Arc};
+fn production(c: Config, k: AppCredentials, leases: &Path, p: RunPermit)
+    -> anyhow::Result<(Arc<dyn Broker>, Arc<dyn Forge>)> {
+    let a = Arc::new(GitHub::new(c, k, leases)?);
+    a.recover()?; a.verify_repository()?; a.register_run(p)?;
+    Ok((a.clone(), a))
+}
+#[test]
+fn public_api_compiles() { let _constructor = production; }
+#[cfg(feature = "test-support")]
+fn loopback(c: Config, k: AppCredentials, leases: &Path)
+    -> anyhow::Result<(Arc<dyn Broker>, Arc<dyn Forge>)> {
+    let a = Arc::new(GitHub::with_test_api(c, k, leases, "http://127.0.0.1:12345",
+        Arc::new(|| 1_700_000_000))?);
+    Ok((a.clone(), a))
+}
+#[cfg(feature = "test-support")]
+#[test]
+fn test_support_api_compiles() { let _constructor = loopback; }
+```
+Add the following private unit test and helper; bind `Fixture.app_id: u64` and `Fixture.key_path: PathBuf` to Task 1's already generated fixture App identity and RSA key. These are private fixture fields, not new production configuration or public test APIs.
+```rust
+impl Fixture {
+    fn app_credentials(&self) -> AppCredentials {
+        AppCredentials { app_id: self.app_id, private_key: self.key_path.clone() }
+    }
+}
+#[test]
+fn test_api_rejects_remote_origins() {
+    let f = Fixture::start();
+    for origin in ["https://api.github.com", "http://example.com:80", "http://192.0.2.1:80"] {
+        let leases = tempfile::tempdir().unwrap();
+        assert!(GitHub::with_test_api(f.config(), f.app_credentials(), leases.path(),
+            origin, Arc::new(|| 1_700_000_000)).is_err());
+    }
+    assert_eq!(f.total_requests(), 0);
+}
+```
+
+Add this ignored **real** broker test to the private unit module. The owner JSON has the exact flat fields declared here; `repo`, IDs, base, guard ruleset and key must describe the explicitly authorized installation. No helper performs hidden provisioning. The total network budget is one mint/protection verification sequence plus two bounded GETs and one revoke sequence; there is no polling or retry loop.
+```rust
+#[test]
+#[ignore = "requires explicit owner authorization and a protected disposable repository"]
+fn live_broker_contract() -> anyhow::Result<()> {
+    anyhow::ensure!(std::env::var("KOD_LIVE_BROKER").as_deref() == Ok("1"),
+        "set KOD_LIVE_BROKER=1 only with owner authorization");
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Owner { repo: String, repository_id: u64, installation_id: u64,
+        base_branch: String, guard_ruleset_id: u64, bot_user_id: u64,
+        app_id: u64, private_key: std::path::PathBuf, leases: std::path::PathBuf,
+        base: String }
+    let path = std::env::var("KOD_GITHUB_BROKER_CONFIG")
+        .map_err(|_| anyhow::anyhow!("KOD_GITHUB_BROKER_CONFIG is required"))?;
+    let o: Owner = serde_json::from_slice(&std::fs::read(path)?)?;
+    let repo = o.repo.clone();
+    let a = GitHub::new(Config { repo: o.repo, repository_id: o.repository_id,
+        installation_id: o.installation_id, base_branch: o.base_branch,
+        guard_ruleset_id: o.guard_ruleset_id, bot_user_id: o.bot_user_id },
+        AppCredentials { app_id: o.app_id, private_key: o.private_key }, &o.leases)?;
+    a.recover()?;
+    a.register_run(RunPermit { run: "live-broker-contract".into(),
+        ticket: "BROKER-1".into(), repo: repo.clone(), base: o.base })?;
+    let client = reqwest::blocking::Client::builder().redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(10)).timeout(Duration::from_secs(30)).build()?;
+    let token = a.mint("live-broker-contract", &repo)?;
+    let get = || -> anyhow::Result<reqwest::StatusCode> {
+        let mut auth = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token.expose()))?;
+        auth.set_sensitive(true);
+        Ok(client.get(format!("https://api.github.com/repos/{repo}"))
+            .header(reqwest::header::AUTHORIZATION, auth).header("User-Agent", "kod-broker-contract")
+            .header("X-GitHub-Api-Version", "2026-03-10").send()?.status())
+    };
+    let before = get(); // Revoke even if the access request fails.
+    let revoked = a.revoke("live-broker-contract");
+    revoked.map_err(|_| anyhow::anyhow!("live revocation failed; retain lease and run recovery"))?;
+    anyhow::ensure!(before? == reqwest::StatusCode::OK, "live repository access failed");
+    anyhow::ensure!(get()? == reqwest::StatusCode::UNAUTHORIZED, "revoked token still usable");
+    Ok(())
+}
+```
+Update the runbook with the compile-checked `production` sequence above and the Gateway `Adapters` assembly shown in `gateway`, replacing fixture inputs with caller-owned tracker/docs/workspace/stopped inputs. State exactly: recover before admission; verification mints/revokes a token and is not a read-only check; register each immutable permit before `start_run`; both trait objects share one `Arc<GitHub>`. Retain leases across restart, recover known tokens, block on unknown issuance until validated expiry, and preserve uncertain PR intent for reconciliation; never delete the lease directory to bypass recovery. Describe the supported active `~ALL` guard with exactly the two agent-ref exclusions, no App/role bypass, regular UTF-8 metadata limits, and the remaining non-atomic trusted-owner ref race. Replace obsolete fake-only and branch-scoped-token claims in the introduction/provider table.
+
+- [ ] **Step 4 / acceptance / QA:** rerun the exact Step 2 command: three `contract_` tests execute and pass; cancellation observes the branch creation barrier, removes the branch, creates zero PRs, and revokes both credentials. Run `cargo test -p kod-tool-gateway --test publish --test mcp --test github_api` (one public API test), then `cargo test -p kod-tool-gateway --features test-support --test github_api` (two public API tests). Run `cargo test -p kod-tool-gateway --lib github::tests::test_api_rejects_remote_origins -- --exact` (one test, three refused inputs, zero HTTP requests). Run `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --all`, `cargo deny check`, and `git diff --check` once on the final branch. Capture `.omo/evidence/phase1-connected/a-task-5.log` and `a-final-checks.log`; zero executed tests is failure. Only when owner-authorized, run `KOD_LIVE_BROKER=1 KOD_GITHUB_BROKER_CONFIG="$CONFIG_FILE" cargo test -p kod-tool-gateway --lib github::tests::live_broker_contract -- --ignored --exact --nocapture`; missing config/flag must fail explicitly. The ignored test is not merge acceptance and never substitutes for connected acceptance.
+- [ ] **Step 5 / commit:** `Verify the connected GitHub publish contract` — Task 5 files and test-proven adapter fixes only; retain the existing plain-message commit style. Do not commit secrets, leases or generated evidence. No live repository/model operation is required for merge.
 
 ## Owner prerequisites for the optional live broker contract
 The owner supplies a disposable repository identity, existing GitHub App/installation and bot user IDs, owner-only RSA key path, exact base ref, active supported guard ruleset, synchronized clock and isolated lease directory. App installation permissions must be contents/write and pull_requests/write with no administration/workflows grant; permissions or protection outside this shape block activation. No implementation task provisions these resources. Once explicitly authorized for that named installation, execute `KOD_LIVE_BROKER=1 KOD_GITHUB_BROKER_CONFIG="$CONFIG_FILE" cargo test -p kod-tool-gateway --lib github::tests::live_broker_contract -- --ignored --exact --nocapture`; unset/missing prerequisites must yield a failing explanatory result. This proves only live broker mint/use/revoke, not connected ticket-to-PR acceptance.
