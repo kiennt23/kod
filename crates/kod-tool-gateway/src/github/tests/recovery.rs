@@ -14,7 +14,7 @@ fn auth_lost_mint_reply_blocks_restart() {
     assert!(a.recover().is_err());
     assert!(a.mint("run-1", "acme/app").is_err());
     assert_eq!(f.requests("POST", "/app/installations/2/access_tokens"), 1);
-    f.clock.fetch_add(3661, Ordering::SeqCst);
+    f.clock.fetch_add(3721, Ordering::SeqCst);
     a.recover().unwrap();
 }
 #[test]

@@ -5,9 +5,12 @@ mod contract;
 mod fixture;
 mod live;
 mod objects;
+mod pr_outcomes_review;
 mod provider;
 mod publication;
 mod recovery;
+mod review_regressions;
+mod storage_review;
 use fixture::Fixture;
 
 #[test]

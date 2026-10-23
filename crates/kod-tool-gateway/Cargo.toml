@@ -13,6 +13,7 @@ anyhow = "1"
 base64 = "0.22"
 chrono = "0.4"
 libc = "0.2"
+ring = "0.17"
 axum = "0.8"
 kod-audit = { path = "../kod-audit" }
 kod-policy = { path = "../kod-policy" }

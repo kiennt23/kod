@@ -14,17 +14,24 @@ mod commit;
 mod config;
 mod forge;
 mod http;
+mod issuance;
+mod operations;
+mod pr_errors;
 mod preflight;
 mod protection;
 mod pulls;
 mod refs;
+mod revocation;
 mod signing;
+mod state;
 mod store;
+use state::State;
 #[cfg(test)]
 mod tests;
 
 pub use config::{AppCredentials, Config, RunPermit};
 use config::{identity, sha, valid_ref};
+const PRUNE_AFTER: i64 = 7 * 24 * 3600;
 pub(super) type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
 #[cfg(any(test, feature = "test-support"))]
 pub type TestClock = Clock;
@@ -37,12 +44,6 @@ pub struct GitHub {
     clock: Clock,
     state: Mutex<State>,
 }
-#[derive(Default)]
-struct State {
-    records: BTreeMap<String, store::Record>,
-    last_time: i64,
-}
-
 impl GitHub {
     pub fn new(config: Config, app: AppCredentials, leases: impl AsRef<Path>) -> Result<Self> {
         Self::build(
@@ -89,7 +90,26 @@ impl GitHub {
         ensure!(app.app_id > 0, "missing App identity");
         signing::validate(&app.private_key)?;
         let store = store::Store::open(leases)?;
-        let records = store.load()?;
+        let mut records = store.load()?;
+        let last_time = records.values().map(|r| r.updated_at).max().unwrap_or(0);
+        // Settled runs (no token, no issuance in doubt, no PR awaiting review) are pruned
+        // so the kill switch does not scan every historical run.
+        // ponytail: startup-only pruning; add a periodic sweep if a gateway lives for weeks.
+        let cutoff = clock().saturating_sub(PRUNE_AFTER);
+        let settled: Vec<String> = records
+            .values()
+            .filter(|r| {
+                r.tokens.is_empty()
+                    && r.pending.is_none()
+                    && r.pr.as_ref().is_none_or(|pr| !pr.blocked)
+                    && r.updated_at < cutoff
+            })
+            .map(|r| r.permit.run.clone())
+            .collect();
+        for run in settled {
+            store.remove(&run)?;
+            records.remove(&run);
+        }
         for r in records.values() {
             ensure!(
                 identity(&r.permit.run)
@@ -112,26 +132,14 @@ impl GitHub {
                 );
             }
         }
-        let last_time = records.values().map(|r| r.updated_at).max().unwrap_or(0);
         Ok(Self {
             config,
             app,
             http: http::Http::new(api)?,
             store,
             clock,
-            state: Mutex::new(State { records, last_time }),
+            state: Mutex::new(State::new(records, last_time)?),
         })
-    }
-    fn lock(&self) -> Result<MutexGuard<'_, State>> {
-        self.state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("GitHub adapter state poisoned"))
-    }
-    fn now(&self, s: &mut State) -> Result<i64> {
-        let now = (self.clock)();
-        ensure!(now > 0 && now >= s.last_time, "GitHub clock rollback");
-        s.last_time = now;
-        Ok(now)
     }
     pub fn register_run(&self, permit: RunPermit) -> Result<()> {
         ensure!(
@@ -153,32 +161,12 @@ impl GitHub {
             return Ok(());
         }
         ensure!(
-            s.records
-                .values()
-                .all(|r| r.permit.branch() != permit.branch()),
+            !s.branches.contains_key(&permit.branch()),
             "GitHub run branch already bound"
         );
         let record = store::Record::new(permit, now);
         self.store.save(&record)?;
-        s.records.insert(record.permit.run.clone(), record);
-        Ok(())
-    }
-    fn authorized<'a>(
-        &self,
-        s: &'a mut State,
-        token: &Secret,
-        repo: &str,
-    ) -> Result<&'a mut store::Record> {
-        ensure!(repo == self.config.repo, "GitHub credential scope mismatch");
-        let now = self.now(s)?;
-        s.records
-            .values_mut()
-            .find(|r| {
-                r.tokens
-                    .iter()
-                    .any(|t| t.usable && t.expires > now && t.secret == token.expose())
-            })
-            .context("GitHub credential unavailable")
+        s.insert(record)
     }
     fn repo_path(&self, tail: &[&str]) -> Vec<String> {
         let mut p = vec!["repos".into()];

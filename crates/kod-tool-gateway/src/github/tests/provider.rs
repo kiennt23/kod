@@ -23,7 +23,10 @@ pub(super) async fn handler(State(state): State<Arc<Mutex<Remote>>>, request: Re
         .unwrap_or("")
         .trim_start_matches("Bearer ")
         .to_owned();
-    let path = uri.path().replace("%2F", "/").replace("%23", "#");
+    if uri.path().to_ascii_lowercase().contains("%2f") {
+        return response(400, json!({}));
+    }
+    let path = uri.path().replace("%23", "#");
     let query = uri.query().unwrap_or("").to_owned();
     let bytes = to_bytes(request.into_body(), 16 << 20).await.unwrap();
     let body: Value = if bytes.is_empty() {
@@ -41,7 +44,8 @@ pub(super) async fn handler(State(state): State<Arc<Mutex<Remote>>>, request: Re
             if s.lost_mint {return response(503,json!({"message":t}));}
             let mut permissions=json!({"contents":"write","pull_requests":"write","metadata":"read"});
             if s.extra_permission {permissions["administration"]=json!("write");}
-            let result=response(201,json!({"token":t,"expires_at":"2027-01-15T09:00:00Z","permissions":permissions,
+            let expires=chrono::DateTime::from_timestamp(1_800_003_600+s.expiry_offset,0).unwrap().to_rfc3339();
+            let result=response(201,json!({"token":t,"expires_at":expires,"permissions":permissions,
                 "repositories":[{"id":if s.widened {99}else{1},"full_name":"acme/app"}]}));
             let hook=s.after_mint.take();drop(s);if let Some(hook)=hook{hook();}return result;
         }
@@ -52,7 +56,10 @@ pub(super) async fn handler(State(state): State<Arc<Mutex<Remote>>>, request: Re
         }
         if method=="GET" && path=="/repos/acme/app" {return response(200,json!({"id":1,"full_name":"acme/app","default_branch":"main"}));}
         if method=="GET" && path=="/repos/acme/app/rulesets/3" {return response(200,json!({"id":3,"target":"branch","enforcement":if s.disabled {"disabled"}else{"active"},"bypass_actors":if s.app_bypass {json!([{"actor_id":5,"actor_type":"Integration","bypass_mode":"always"}])}else{json!([])},"conditions":{"ref_name":{"include":["~ALL"],"exclude":["refs/heads/agent/*","refs/heads/agent/**/*"]}},"rules":[{"type":"creation"},{"type":"update"},{"type":"deletion"}]}));}
-        if path.contains("/git/") && !path.contains("/ref") {return super::objects::handle(&mut s,&method,&path,&body);}
+        if path.contains("/git/") && !path.contains("/ref") {
+            if path.contains("/blobs/") {let hook=s.before_blob.take();drop(s);if let Some(hook)=hook{hook();}s=state2.lock().unwrap();}
+            return super::objects::handle(&mut s,&method,&path,&body);
+        }
         let prefix=if method=="GET" {"/repos/acme/app/git/ref/heads/"}else{"/repos/acme/app/git/refs/heads/"};
         if let Some(branch)=path.strip_prefix(prefix) {
             if method=="GET" {return match s.refs.get(branch) {Some(sha)=>response(200,json!({"ref":format!("refs/heads/{branch}"),"object":{"type":"commit","sha":sha}})),None=>response(404,json!({}))};}
@@ -79,11 +86,18 @@ pub(super) async fn handler(State(state): State<Arc<Mutex<Remote>>>, request: Re
                 return response(200,json!(prs));
             }
             if method=="POST" {
+                if let Some((status,reply))=s.pr_reply.take() {return response(status,reply);}
                 let branch=body["head"].as_str().unwrap();let sha=s.refs.get(branch).unwrap().clone();
                 let pr=json!({"number":1,"html_url":"https://github.com/acme/app/pull/1","state":"open","draft":body["draft"],
                     "user":{"id":4},"head":{"repo":{"id":1},"ref":branch,"sha":sha},"base":{"repo":{"id":1},"ref":body["base"]}});
                 s.prs.push(pr.clone()); return response(if s.lost_pr {503}else{201},pr);
             }
+        }
+        if let Some(number)=path.strip_prefix("/repos/acme/app/pulls/").filter(|_|method=="PATCH") {
+            assert_eq!(body,json!({"state":"closed"}));
+            if s.fail_close>0 {s.fail_close-=1;return response(503,json!({}));}
+            s.prs.retain(|p|p["number"]!=number.parse::<u64>().unwrap());
+            return response(200,json!({"number":number.parse::<u64>().unwrap(),"state":"closed"}));
         }
         response(StatusCode::NOT_FOUND.as_u16(),json!({}))
     }).await.unwrap()

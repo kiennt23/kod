@@ -975,6 +975,7 @@ dependencies = [
  "kod-tracker",
  "libc",
  "reqwest",
+ "ring",
  "rmcp",
  "rusqlite",
  "serde",

@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Token {
     pub secret: String,
@@ -25,11 +25,17 @@ pub(super) struct Intent {
     pub branch: String,
     pub base: String,
     pub url: Option<String>,
+    #[serde(default)]
+    pub created: Option<u64>,
+    #[serde(default)]
+    pub blocked: bool,
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Record {
     pub version: u32,
+    #[serde(default)]
+    pub generation: u64,
     pub permit: RunPermit,
     pub tokens: Vec<Token>,
     pub pending: Option<i64>,
@@ -42,6 +48,7 @@ impl Record {
     pub fn new(permit: RunPermit, now: i64) -> Self {
         Self {
             version: 1,
+            generation: 0,
             permit,
             tokens: vec![],
             pending: None,
@@ -56,23 +63,16 @@ pub(super) struct Store {
     root: PathBuf,
     _lock: File,
 }
-fn owner() -> Result<u32> {
-    let o = std::process::Command::new("id")
-        .arg("-u")
-        .output()
-        .context("cannot determine owner")?;
-    ensure!(o.status.success(), "cannot determine owner");
-    String::from_utf8(o.stdout)?
-        .trim()
-        .parse()
-        .context("invalid owner")
+pub(super) fn owner() -> u32 {
+    // SAFETY: getuid has no preconditions and cannot fail.
+    unsafe { libc::getuid() }
 }
 pub(super) fn checked(path: &Path, directory: bool) -> Result<std::fs::Metadata> {
     let m = std::fs::symlink_metadata(path).context("private path unavailable")?;
     ensure!(
         !m.file_type().is_symlink()
             && (if directory { m.is_dir() } else { m.is_file() })
-            && m.uid() == owner()?
+            && m.uid() == owner()
             && m.mode() & 0o077 == 0,
         "private path must be owner-only and not a symlink"
     );
@@ -85,7 +85,7 @@ pub(super) fn ancestors(path: &Path) -> Result<()> {
         ensure!(
             m.is_dir()
                 && !m.file_type().is_symlink()
-                && (m.uid() == 0 || m.uid() == owner()?)
+                && (m.uid() == 0 || m.uid() == owner())
                 && (m.mode() & 0o022 == 0 || (m.uid() == 0 && m.mode() & 0o1000 != 0)),
             "untrusted private path ancestor"
         );
@@ -125,6 +125,10 @@ impl Store {
             if entry.file_name() == "owner.lock" {
                 continue;
             }
+            if p.extension().is_some_and(|e| e == "pending") {
+                self.remove_pending(&p)?;
+                continue;
+            }
             ensure!(
                 p.extension().is_some_and(|e| e == "json"),
                 "unexpected lease directory entry"
@@ -145,14 +149,14 @@ impl Store {
                         .is_some_and(|f| f == filename(&record.permit.run).as_str())
                     && record.updated_at > 0
                     && record.pending.is_none_or(|until| until > record.updated_at
-                        && until <= record.updated_at.saturating_add(3660))
+                        && until <= record.updated_at.saturating_add(3720))
                     && record.input.as_ref().is_none_or(|hash| hash.len() == 64
                         && hash
                             .bytes()
                             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
                     && record.tokens.iter().all(|t| !t.secret.is_empty()
                         && t.expires > 0
-                        && t.expires <= record.updated_at.saturating_add(3660)),
+                        && t.expires <= record.updated_at.saturating_add(3720)),
                 "invalid GitHub lease identity"
             );
             ensure!(
@@ -161,6 +165,29 @@ impl Store {
             );
         }
         Ok(records)
+    }
+    fn remove_pending(&self, path: &Path) -> Result<()> {
+        ensure!(
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_suffix(".json.pending"))
+                .is_some_and(|hash| hash.len() == 64
+                    && hash
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))),
+            "unexpected lease directory entry"
+        );
+        checked(path, false)?;
+        std::fs::remove_file(path)?;
+        File::open(&self.root)?.sync_all()?;
+        Ok(())
+    }
+    pub fn remove(&self, run: &str) -> Result<()> {
+        let path = self.root.join(filename(run));
+        checked(&path, false)?;
+        std::fs::remove_file(&path)?;
+        File::open(&self.root)?.sync_all()?;
+        Ok(())
     }
     pub fn save(&self, record: &Record) -> Result<()> {
         checked(&self.root, true)?;
@@ -171,6 +198,11 @@ impl Store {
         let tmp = self
             .root
             .join(format!("{}.pending", filename(&record.permit.run)));
+        match std::fs::symlink_metadata(&tmp) {
+            Ok(_) => self.remove_pending(&tmp)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
         let mut f = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -185,7 +217,7 @@ impl Store {
             Ok(())
         })();
         if result.is_err() && tmp.exists() {
-            std::fs::remove_file(tmp)?;
+            self.remove_pending(&tmp)?;
         }
         result.context("cannot persist GitHub lease")
     }

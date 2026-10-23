@@ -14,25 +14,16 @@ struct Target {
     sha: String,
 }
 impl GitHub {
-    pub(super) fn branch_record<'a>(
-        &self,
-        s: &'a mut State,
-        t: &Secret,
-        repo: &str,
-        branch: &str,
-    ) -> Result<&'a mut store::Record> {
-        let r = self.authorized(s, t, repo)?;
-        ensure!(
-            branch == r.permit.branch() && branch != self.config.base_branch,
-            "GitHub branch scope mismatch"
-        );
-        Ok(r)
+    fn ref_path(&self, kind: &str, branch: &str) -> Vec<String> {
+        let mut p = self.repo_path(&["git", kind, "heads"]);
+        p.extend(branch.split('/').map(str::to_owned));
+        p
     }
     fn remote_ref(&self, t: &Secret, branch: &str) -> Result<Option<String>> {
         let reply = self.http.request(
             Method::GET,
             t.expose(),
-            &self.repo_path(&["git", "ref", "heads", branch]),
+            &self.ref_path("ref", branch),
             &[],
             None,
         )?;
@@ -55,66 +46,76 @@ impl GitHub {
         branch: &str,
         sha: &str,
     ) -> Result<()> {
-        let mut s = self.lock()?;
-        let r = self.branch_record(&mut s, t, repo, branch)?;
-        ensure!(
-            r.expected.as_deref() == Some(sha),
-            "GitHub branch SHA mismatch"
-        );
-        if let Some(old) = self.remote_ref(t, branch)? {
-            ensure!(old == sha, "divergent GitHub branch");
-            return Ok(());
-        }
-        let result = self.http.request(
-            Method::POST,
-            t.expose(),
-            &self.repo_path(&["git", "refs"]),
-            &[],
-            Some(&json!({"ref":format!("refs/heads/{branch}"),"sha":sha})),
-        );
-        if let Ok(reply) = &result {
+        self.with_token(t, repo, |r| {
             ensure!(
-                reply.status.is_success()
-                    || reply.status == StatusCode::UNPROCESSABLE_ENTITY
-                    || reply.status.is_server_error(),
-                "GitHub ref creation refused"
+                branch == r.permit.branch() && branch != self.config.base_branch,
+                "GitHub branch scope mismatch"
             );
-        }
-        ensure!(
-            self.remote_ref(t, branch)?.as_deref() == Some(sha),
-            "GitHub ref creation unconfirmed"
-        );
-        Ok(())
+            ensure!(
+                r.expected.as_deref() == Some(sha),
+                "GitHub branch SHA mismatch"
+            );
+            if let Some(old) = self.remote_ref(t, branch)? {
+                ensure!(old == sha, "divergent GitHub branch");
+                return Ok(());
+            }
+            self.ensure_live(t, &r)?;
+            let result = self.http.request(
+                Method::POST,
+                t.expose(),
+                &self.repo_path(&["git", "refs"]),
+                &[],
+                Some(&json!({"ref":format!("refs/heads/{branch}"),"sha":sha})),
+            );
+            if let Ok(reply) = &result {
+                ensure!(
+                    reply.status.is_success()
+                        || reply.status == StatusCode::UNPROCESSABLE_ENTITY
+                        || reply.status.is_server_error(),
+                    "GitHub ref creation refused"
+                );
+            }
+            ensure!(
+                self.remote_ref(t, branch)?.as_deref() == Some(sha),
+                "GitHub ref creation unconfirmed"
+            );
+            Ok(())
+        })
     }
     pub(super) fn remove_branch(&self, t: &Secret, repo: &str, branch: &str) -> Result<()> {
-        let mut s = self.lock()?;
-        let r = self.branch_record(&mut s, t, repo, branch)?;
-        let Some(old) = self.remote_ref(t, branch)? else {
-            return Ok(());
-        };
-        ensure!(
-            r.expected.as_deref() == Some(&old),
-            "divergent GitHub branch"
-        );
-        let result = self.http.request(
-            Method::DELETE,
-            t.expose(),
-            &self.repo_path(&["git", "refs", "heads", branch]),
-            &[],
-            None,
-        );
-        if let Ok(reply) = &result {
+        self.with_token(t, repo, |r| {
             ensure!(
-                reply.status == StatusCode::NO_CONTENT
-                    || reply.status == StatusCode::NOT_FOUND
-                    || reply.status.is_server_error(),
-                "GitHub branch deletion refused"
+                branch == r.permit.branch() && branch != self.config.base_branch,
+                "GitHub branch scope mismatch"
             );
-        }
-        ensure!(
-            self.remote_ref(t, branch)?.is_none(),
-            "GitHub branch deletion unconfirmed"
-        );
-        Ok(())
+            let Some(old) = self.remote_ref(t, branch)? else {
+                return Ok(());
+            };
+            ensure!(
+                r.expected.as_deref() == Some(&old),
+                "divergent GitHub branch"
+            );
+            self.ensure_live(t, &r)?;
+            let result = self.http.request(
+                Method::DELETE,
+                t.expose(),
+                &self.ref_path("refs", branch),
+                &[],
+                None,
+            );
+            if let Ok(reply) = &result {
+                ensure!(
+                    reply.status == StatusCode::NO_CONTENT
+                        || reply.status == StatusCode::NOT_FOUND
+                        || reply.status.is_server_error(),
+                    "GitHub branch deletion refused"
+                );
+            }
+            ensure!(
+                self.remote_ref(t, branch)?.is_none(),
+                "GitHub branch deletion unconfirmed"
+            );
+            Ok(())
+        })
     }
 }

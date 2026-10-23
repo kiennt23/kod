@@ -9,8 +9,7 @@ struct Object {
 }
 impl GitHub {
     pub(super) fn create_commit(&self, t: &Secret, c: &Commit) -> Result<String> {
-        let mut s = self.lock()?;
-        let record = self.authorized(&mut s, t, &c.repo)?;
+        self.with_token(t,&c.repo,|mut record| {
         ensure!(c.base == record.permit.base, "GitHub commit base mismatch");
         let input = super::preflight::local(c)?;
         let digest = format!("{:x}", Sha256::digest(serde_json::to_vec(&input)?));
@@ -20,7 +19,8 @@ impl GitHub {
         );
         let (tree, entries) = self.preflight(t, c)?;
         record.input = Some(digest);
-        self.store.save(record)?;
+        self.publish_state(&record)?;
+        self.ensure_live(t,&record)?;
         let tree: Object = self
             .http
             .request(
@@ -33,6 +33,7 @@ impl GitHub {
             .json()?;
         ensure!(sha(&tree.sha), "invalid GitHub tree SHA");
         let person = input["person"].clone();
+        self.ensure_live(t,&record)?;
         let commit:Object=self.http.request(Method::POST,t.expose(),&self.repo_path(&["git","commits"]),&[],Some(&json!({"tree":tree.sha,"parents":[c.base],"message":c.message,"author":person,"committer":person})))?.json()?;
         ensure!(
             sha(&commit.sha)
@@ -43,7 +44,8 @@ impl GitHub {
             "GitHub commit identity changed"
         );
         record.expected = Some(commit.sha.clone());
-        self.store.save(record)?;
+        self.publish_state(&record)?;
         Ok(commit.sha)
+        })
     }
 }

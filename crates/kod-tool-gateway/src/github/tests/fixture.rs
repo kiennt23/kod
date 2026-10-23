@@ -44,6 +44,10 @@ pub(super) struct Remote {
     pub after_mint: Option<Box<dyn FnOnce() + Send>>,
     pub repo: PathBuf,
     pub public_key: PathBuf,
+    pub expiry_offset: i64,
+    pub before_blob: Option<Box<dyn FnOnce() + Send>>,
+    pub pr_reply: Option<(u16, Value)>,
+    pub fail_close: u32,
 }
 impl Fixture {
     pub fn start() -> Self {

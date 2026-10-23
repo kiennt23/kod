@@ -1,5 +1,5 @@
 use super::*;
-use reqwest::{Method, StatusCode};
+use reqwest::Method;
 use serde_json::json;
 #[derive(Deserialize)]
 struct Repo {
@@ -52,7 +52,7 @@ impl GitHub {
         );
         Ok(())
     }
-    fn lookup_pr(&self, t: &Secret, r: &store::Record) -> Result<Option<String>> {
+    fn lookup_pr(&self, t: &Secret, r: &store::Record) -> Result<Option<Pr>> {
         let path = self.repo_path(&["pulls"]);
         let mut found = None;
         let owner = self
@@ -79,7 +79,7 @@ impl GitHub {
             for p in prs {
                 self.validate_pr(r, &p)?;
                 ensure!(found.is_none(), "ambiguous GitHub PRs");
-                found = Some(p.html_url);
+                found = Some(p);
             }
             if !self.http.next_page(reply.link.as_deref(), &path, page)? {
                 return Ok(found);
@@ -93,9 +93,49 @@ impl GitHub {
         repo: &str,
         branch: &str,
     ) -> Result<Option<String>> {
-        let mut s = self.lock()?;
-        let r = self.branch_record(&mut s, t, repo, branch)?;
-        self.lookup_pr(t, r)
+        self.with_token(t, repo, |r| {
+            ensure!(
+                branch == r.permit.branch() && branch != self.config.base_branch,
+                "GitHub branch outside run permit"
+            );
+            if let Some(number) = r.pr.as_ref().filter(|i| i.blocked).and_then(|i| i.created) {
+                return Err(pr_errors::review_error(number));
+            }
+            Ok(self.lookup_pr(t, &r)?.map(|pr| pr.html_url))
+        })
+    }
+    /// A created PR that failed identity validation is closed rather than left
+    /// orphaned; the intent clears only once GitHub confirms the close.
+    fn close_invalid(&self, t: &Secret, r: &mut store::Record) -> Result<()> {
+        let Some(number) = r.pr.as_ref().filter(|i| i.blocked).and_then(|i| i.created) else {
+            return Ok(());
+        };
+        self.ensure_live(t, r)?;
+        let path = self.repo_path(&["pulls", &number.to_string()]);
+        let closed = self
+            .http
+            .request(
+                Method::PATCH,
+                t.expose(),
+                &path,
+                &[],
+                Some(&json!({"state":"closed"})),
+            )
+            .is_ok_and(|reply| reply.status.is_success());
+        if !closed {
+            return Err(pr_errors::review_error(number));
+        }
+        r.pr = None;
+        self.publish_state(r)
+    }
+    fn remember_pr(&self, r: &mut store::Record, pr: Pr) -> Result<String> {
+        if let Some(intent) = &mut r.pr {
+            intent.url = Some(pr.html_url.clone());
+            intent.created = Some(pr.number);
+            intent.blocked = false;
+            self.publish_state(r)?;
+        }
+        Ok(pr.html_url)
     }
     pub(super) fn create_pr(
         &self,
@@ -109,46 +149,57 @@ impl GitHub {
             identity(title) && !body.contains('\0') && title.len() <= 256 && body.len() <= 65536,
             "invalid GitHub PR text"
         );
-        let mut s = self.lock()?;
-        let r = self.branch_record(&mut s, t, repo, branch)?;
-        if let Some(url) = self.lookup_pr(t, r)? {
-            return Ok(url);
-        }
-        ensure!(
-            r.pr.is_none(),
-            "GitHub PR creation outcome unknown; reconcile before retry"
-        );
-        let expected = r
-            .expected
-            .clone()
-            .context("missing GitHub commit identity")?;
-        r.pr = Some(store::Intent {
-            sha: expected,
-            branch: branch.into(),
-            base: self.config.base_branch.clone(),
-            url: None,
-        });
-        self.store.save(r)?;
-        let reply=self.http.request(Method::POST,t.expose(),&self.repo_path(&["pulls"]),&[],Some(&json!({"head":branch,"base":self.config.base_branch,"title":title,"body":body,"draft":true,"maintainer_can_modify":false})));
-        if let Ok(reply) = &reply {
-            if reply.status.is_success() {
-                let pr: Pr = reply.json()?;
-                self.validate_pr(r, &pr)?;
-                r.pr.as_mut().context("missing PR intent")?.url = Some(pr.html_url.clone());
-                self.store.save(r)?;
-                return Ok(pr.html_url);
+        self.with_token(t, repo, |mut r| {
+            ensure!(branch == r.permit.branch() && branch != self.config.base_branch, "GitHub branch outside run permit");
+            self.close_invalid(t, &mut r)?;
+            if let Some(pr) = self.lookup_pr(t, &r)? {
+                return self.remember_pr(&mut r, pr);
             }
-            if reply.status.is_client_error() && reply.status != StatusCode::UNPROCESSABLE_ENTITY {
+            ensure!(r.pr.is_none(), "GitHub PR creation outcome unknown; reconcile before retry");
+            r.pr = Some(store::Intent {
+                sha: r.expected.clone().context("missing GitHub commit identity")?,
+                branch: branch.into(),
+                base: self.config.base_branch.clone(),
+                url: None,
+                created: None,
+                blocked: false,
+            });
+            self.publish_state(&r)?;
+            self.ensure_live(t, &r)?;
+            let reply = self.http.request(Method::POST, t.expose(), &self.repo_path(&["pulls"]), &[],
+                Some(&json!({"head":branch,"base":self.config.base_branch,"title":title,"body":body,"draft":true,"maintainer_can_modify":false})));
+            let mut refusal = None;
+            if let Ok(reply) = &reply {
+                if reply.status.is_success() {
+                    if let Some(number) = pr_errors::created_number(&reply.body) {
+                        let intent = r.pr.as_mut().context("missing PR intent")?;
+                        intent.created = Some(number);
+                        intent.blocked = true;
+                        intent.url = Some(format!("https://github.com/{}/pull/{number}", self.config.repo));
+                        self.publish_state(&r)?;
+                        if let Some(pr) = reply.json::<Pr>().ok().filter(|pr| self.validate_pr(&r, pr).is_ok()) {
+                            return self.remember_pr(&mut r, pr);
+                        }
+                        self.close_invalid(t, &mut r)?;
+                        anyhow::bail!("GitHub PR #{number} failed identity validation and was closed");
+                    }
+                } else if reply.status.is_client_error() {
+                    // A received 4xx is a definite refusal; 5xx stays uncertain because
+                    // GitHub can create the PR before its edge reports an error.
+                    refusal = Some(pr_errors::definite_rejection(&reply.body).unwrap_or(
+                        "request refused; check GitHub permissions and request parameters",
+                    ));
+                }
+            }
+            if let Some(pr) = self.lookup_pr(t, &r)? {
+                return self.remember_pr(&mut r, pr);
+            }
+            if let Some(cause) = refusal {
                 r.pr = None;
-                self.store.save(r)?;
-                anyhow::bail!("GitHub PR creation refused");
+                self.publish_state(&r)?;
+                anyhow::bail!("GitHub PR creation rejected: {cause}");
             }
-        }
-        if let Some(url) = self.lookup_pr(t, r)? {
-            r.pr.as_mut().context("missing PR intent")?.url = Some(url.clone());
-            self.store.save(r)?;
-            return Ok(url);
-        }
-        anyhow::bail!("GitHub PR creation outcome unknown; reconcile before retry")
+            anyhow::bail!("GitHub PR creation outcome unknown; reconcile before retry")
+        })
     }
 }
