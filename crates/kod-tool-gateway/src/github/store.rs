@@ -151,7 +151,7 @@ impl Store {
                             .bytes()
                             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
                     && record.tokens.iter().all(|t| !t.secret.is_empty()
-                            && t.expires > 0
+                        && t.expires > 0
                         && t.expires <= record.updated_at.saturating_add(3660)),
                 "invalid GitHub lease identity"
             );
