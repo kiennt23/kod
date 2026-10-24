@@ -387,12 +387,11 @@ impl Gateway {
 
     fn read_doc(&self, live: &Live, args: &Value) -> Reply {
         let (run, id) = (&live.run, text(args, "id")?);
-        let issue = self.own_issue(run)?;
         let target = json!({"kind": "doc", "id": id});
         self.allow(json!({
             "action": "read",
             "actor": {"kind": "agent"},
-            "run": {"id": run.id, "ticket": run.ticket, "linked_docs": issue.approved_versions},
+            "run": {"id": run.id, "ticket": run.ticket, "linked_docs": run.pins.values().collect::<Vec<_>>()},
             "target": target,
         }))?;
         let docs = &self.adapters.docs;

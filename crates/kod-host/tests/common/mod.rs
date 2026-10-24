@@ -101,7 +101,7 @@ pub struct Fixture {
     pub executed: Arc<Mutex<Vec<String>>>,
 }
 
-fn config(root: &Path, db: &Path) -> Arc<FsConfig> {
+pub fn config(root: &Path, db: &Path) -> Arc<FsConfig> {
     let p = |s: &str| root.join(s);
     let text = serde_json::json!({
         "paths": {"dispatcher_db": db, "audit_db": p("audit.db"), "policy_dir": "/p",
