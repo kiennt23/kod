@@ -47,8 +47,21 @@ The signed request is `POST /command` with a JSON body and the header `x-kod-sig
 
 ## Recovery
 
+- On open, queued and running executions are atomically ended as `needs_human`, with revoke/stop follow-ups in the same transaction. Cleanup is attempted before interrupted-publication lookups. Old execution never resumes; failed cleanup remains queued for retry.
 - On open, a run left in `publishing` is settled: done if the gateway finds its draft PR, `needs_human` otherwise. No run is left live.
 - Follow-ups (revoke, stop, ticket moves, comments) are stored with the state change and retried until they succeed. Stops go first.
 - A failed global stop is retried. Check the ticket comments if a kill reported an error.
 - If a cancel lands after publish already opened the PR, the ticket says so: close the PR, do not merge it.
 - The database is one SQLite file with a single dispatcher process. Do not run two.
+
+## Connected storage foundations
+
+Sub-plan 6b-b Task 1 adds three tables to the existing dispatcher database: immutable `run_bindings`, per-request `model_requests`, and `tracker_write_intents`. It adds no database or second run-state machine. Migration is transactional, preserves existing runs/deliveries/control/cleanup, enables foreign keys, and records SQLite `user_version=1`. Opening an already migrated store does not acquire a migration write lock. Negative or newer unsupported schema versions are refused. A schema fingerprint test freezes version one; later schema changes require a new versioned migration.
+
+The host will validate the complete execution-binding shape before calling `store::bind_once`; the store requires a version-one JSON object and a real canonical positive `run-N`. Only queued/running runs accept a new binding. Identical retries succeed even after retirement, changed bindings fail, and SQL update/delete of a binding is refused. Binding, reservation and settlement writes join an existing caller transaction, so admission can commit or roll them back together; standalone calls acquire an immediate write transaction.
+
+`reserve_model` records an immutable request reservation before forwarding. Tokens and cost use decimal text to preserve the full unsigned range; cost is in picodollars, matching the model gateway ledger. `model_charge` includes the full reservation until `settle_model` durably records confirmed usage. A failed or missing settlement never releases charge, and a repeated registration/reservation cannot reset it. Ended runs cannot reserve new requests, but an identical reservation retry succeeds and an in-flight request may still settle after cancellation. A retry acknowledges storage only; it does not authorize another provider call.
+
+Confirmed usage above its reservation is retained in full, matching the gateway ledger's overrun accounting. Aggregate charge saturates at `u64::MAX`; callers must treat that value as exhausted, while individual usage records remain lossless. Budget enforcement must halt an overrun rather than reject its settlement. Existing unbound runs with no requests report zero charge; unknown runs, malformed IDs and corrupt request records still fail. These APIs are storage foundations; dynamic proxy registration and its reservation sink are Task 2.
+
+One unresolved status-write intent per story is enforced by a partial unique index. A restart does not clear it; the later host refresh worker must reconcile it before another create. The host process, provider wiring, approved snapshots and connected acceptance are still pending.

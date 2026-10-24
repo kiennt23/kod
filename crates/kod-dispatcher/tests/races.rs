@@ -203,7 +203,6 @@ fn an_inflight_transition_cannot_outlive_its_replacement_or_delay_stops() {
     for fail_transition in [false, true] {
         let h = harness();
         h.flaky.fail_writes.store(true, Ordering::SeqCst);
-        h.running();
         let (gate, entered) = gate();
         let d = open(
             &h,
@@ -215,6 +214,7 @@ fn an_inflight_transition_cannot_outlive_its_replacement_or_delay_stops() {
             }),
             h.gw.clone(),
         );
+        h.running();
         h.flaky.fail_writes.store(false, Ordering::SeqCst);
         gate.armed.store(true, Ordering::SeqCst);
         let worker = d.clone();
