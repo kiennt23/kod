@@ -286,3 +286,35 @@ fn signing_probe_child() {
     fs::set_permissions(&app.private_key, fs::Permissions::from_mode(0o644)).unwrap();
     assert!(signing::jwt(&app, 1_800_000_000).is_err());
 }
+
+#[test]
+fn dropping_store_releases_lock_while_forked_child_has_not_exec_yet() {
+    // Given an open store and a concurrently forked child that still shares its lock file
+    // description (O_CLOEXEC only closes it at exec, as with any parallel Command::spawn).
+    use std::{io::Read, os::fd::AsRawFd, os::unix::process::CommandExt};
+    let dir = directory();
+    let root = dir.path().canonicalize().unwrap();
+    let store = store::Store::open(&root).unwrap();
+    let (mut forked, signal) = std::io::pipe().unwrap();
+    let fd = signal.as_raw_fd();
+    let mut command = std::process::Command::new("true");
+    // SAFETY: the hook only calls async-signal-safe write and nanosleep.
+    unsafe {
+        command.pre_exec(move || {
+            libc::write(fd, b"x".as_ptr().cast(), 1);
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            Ok(())
+        });
+    }
+    let child = std::thread::spawn(move || command.status().unwrap());
+    forked.read_exact(&mut [0]).unwrap();
+
+    // When the owner drops the store and the host restarts immediately.
+    drop(store);
+    let reopened = store::Store::open(&root);
+
+    // Then the lease directory is acquirable without waiting for the child.
+    assert!(reopened.is_ok(), "{:#}", reopened.err().unwrap());
+    drop(signal);
+    assert!(child.join().unwrap().success());
+}
