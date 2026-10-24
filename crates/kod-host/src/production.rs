@@ -76,7 +76,7 @@ pub fn resolve(config: Arc<FsConfig>, s: Sources) -> ResolveAdmission {
             started_at: (s.now)(),
             data_classes,
             pins,
-            linked_tickets: vec![], // Kod-created rework is recorded by the dispatcher after start.
+            linked_tickets: issue.links.clone(), // revision-pinned with the issue
             max_tokens: config.model.run_max_tokens,
             max_cost_micro_usd: config.model.run_max_cost_micro_usd,
             agent_image: config.sandbox.agent_image.clone(),

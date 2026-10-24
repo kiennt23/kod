@@ -35,8 +35,10 @@ fn main() -> Result<()> {
             println!("configuration valid");
             Ok(())
         }
-        Command::Serve { .. } => {
-            bail!("connected serve unavailable until service assembly is implemented")
+        Command::Serve { config } => {
+            kod_host::config::FsConfig::load(&config)?;
+            // ponytail: service::serve is complete; the tracker credential provider is a separate slice.
+            bail!("connected serve needs the tracker credential provider, which is not wired yet")
         }
         Command::Snapshot(Snapshot::Activate { config, manifest }) => {
             let config = kod_host::config::FsConfig::load(&config)?;
