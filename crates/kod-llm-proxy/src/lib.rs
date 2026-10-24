@@ -27,6 +27,9 @@
 //! and the run's spend so far.
 pub mod budget;
 pub mod config;
+mod lifecycle;
+use lifecycle::until_revoked;
+pub use lifecycle::{MODEL_CANCEL_DEADLINE, ReservationSink, RunRegistry};
 
 use axum::{
     Router,
@@ -35,7 +38,8 @@ use axum::{
     http::{HeaderValue, StatusCode},
     response::{IntoResponse, Response},
 };
-use budget::{Ledger, Spend};
+use budget::Ledger;
+pub use budget::Spend;
 use config::{Price, Prices, RunSpec};
 use futures_util::StreamExt;
 use kod_audit::{AuditLog, RUN_AUDIT};
@@ -176,30 +180,28 @@ struct Run {
     requests: AtomicU64,
     in_flight: Arc<Semaphore>,
     ledger: Mutex<Ledger>,
+    cancel: tokio::sync::watch::Sender<bool>,
+    sink: Option<Arc<dyn ReservationSink>>,
 }
 
 struct AppState {
     cfg: Config,
     client: reqwest::Client,
-    runs: HashMap<String, Arc<Run>>,
+    runs: RunRegistry,
 }
 
 pub fn app(cfg: Config) -> Router {
-    let runs = cfg
-        .runs
-        .iter()
-        .map(|(token, spec)| {
-            let run = Run {
-                spec: spec.clone(),
-                requests: AtomicU64::new(0),
-                in_flight: Arc::new(Semaphore::new(cfg.limits.max_concurrent)),
-                ledger: Mutex::new(Ledger::new(spec.budget)),
-            };
-            // Keyed by the token's hash, so lookups take no time that depends
-            // on how much of a guessed token is right.
-            (hex(Sha256::digest(token)), Arc::new(run))
-        })
-        .collect();
+    app_with_registry(cfg).0
+}
+
+pub fn app_with_registry(cfg: Config) -> (Router, RunRegistry) {
+    let runs = RunRegistry::new(cfg.limits.max_concurrent);
+    for (token, spec) in &cfg.runs {
+        // Config's file loader validates these; fail closed (visibly) for invalid direct callers.
+        runs.register(token, spec.clone())
+            .unwrap_or_else(|error| panic!("model registration refused: {error}"));
+    }
+    let registry = runs.clone();
     let state = Arc::new(AppState {
         cfg,
         // The client sends the key, so it never follows a redirect, which could
@@ -214,7 +216,7 @@ pub fn app(cfg: Config) -> Router {
             .expect("building the upstream client"),
         runs,
     });
-    Router::new().fallback(forward).with_state(state)
+    (Router::new().fallback(forward).with_state(state), registry)
 }
 
 /// A refusal: the log event, the status, and the reason kept in the audit log.
@@ -429,12 +431,20 @@ async fn forward(State(st): State<Arc<AppState>>, req: Request) -> Response {
         .strip_prefix("/r/")
         .and_then(|r| r.split_once('/'))
         .and_then(|(token, rest)| {
-            let run = st.runs.get(&hex(Sha256::digest(token)))?;
+            let run = st.runs.lookup(token)?;
             Some((run.clone(), format!("/{rest}")))
         })
     else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
+    until_revoked(run.cancel.subscribe(), async {
+        Ok(forward_run(st, req, run, path).await)
+    })
+    .await
+    .unwrap_or_else(|_| StatusCode::UNAUTHORIZED.into_response())
+}
+
+async fn forward_run(st: Arc<AppState>, req: Request, run: Arc<Run>, path: String) -> Response {
     let id = run.spec.id.as_str();
     let lim = &st.cfg.limits;
     // Every request counts, refused ones too, so a script can neither probe
@@ -543,10 +553,11 @@ async fn forward(State(st): State<Arc<AppState>>, req: Request) -> Response {
     }
     // Releases the reservation on drop, so a client that disconnects while
     // the handler waits does not leak it. The Meter takes it over.
-    let reservation = Reservation {
+    let mut reservation = Reservation {
         run: run.clone(),
         spend: reserved,
         held: true,
+        dispatched: false,
     };
     let prompt = json!({
         "run": id,
@@ -575,7 +586,11 @@ async fn forward(State(st): State<Arc<AppState>>, req: Request) -> Response {
     }
     // Held through settlement and the output audit write, so queued calls
     // see any halt before they can reach the upstream.
-    let Ok(permit) = run.in_flight.clone().acquire_owned().await else {
+    let Ok(permit) = until_revoked(run.cancel.subscribe(), async {
+        Ok(run.in_flight.clone().acquire_owned().await?)
+    })
+    .await
+    else {
         let why = "the run's request limit was closed".into();
         return refuse(
             &st,
@@ -589,13 +604,31 @@ async fn forward(State(st): State<Arc<AppState>>, req: Request) -> Response {
         let why = "the run is halted".into();
         return refuse(&st, id, &path, ("halted", StatusCode::FORBIDDEN, why)).await;
     }
-    match st
-        .client
-        .request(method, url)
-        .headers(headers)
-        .body(checked)
-        .send()
-        .await
+    if *run.cancel.borrow() {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let request_id = format!("{}:{n}", id);
+    if let Some(sink) = &run.sink {
+        let (sink, id, request_id) = (sink.clone(), id.to_owned(), request_id.clone());
+        let result =
+            tokio::task::spawn_blocking(move || sink.reserve(&id, &request_id, reserved)).await;
+        if !matches!(result, Ok(Ok(()))) {
+            run.cancel.send_replace(true);
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    }
+    // Once dispatch may begin, transport loss is an unknown bill, never a refund.
+    reservation.dispatched = true;
+    match until_revoked(run.cancel.subscribe(), async {
+        Ok(st
+            .client
+            .request(method, url)
+            .headers(headers)
+            .body(checked)
+            .send()
+            .await?)
+    })
+    .await
     {
         Ok(up) => {
             log("allow", id, &path, up.status().as_u16());
@@ -610,7 +643,7 @@ async fn forward(State(st): State<Arc<AppState>>, req: Request) -> Response {
                 .get("content-type")
                 .and_then(|v| v.to_str().ok())
                 .is_some_and(|v| v.starts_with("text/event-stream"));
-            let mut meter = Meter {
+            let meter = Meter {
                 sse,
                 usage: Usage::new(sse),
                 head: vec![],
@@ -619,24 +652,40 @@ async fn forward(State(st): State<Arc<AppState>>, req: Request) -> Response {
                 run: run.clone(),
                 audit: st.cfg.audit.clone(),
                 reservation,
+                request_id,
                 price,
                 path: path.clone(),
                 status: up.status().as_u16(),
                 permit: Some(permit),
             };
             // Streamed, so server-sent events reach the runner as they arrive.
-            let stream = up.bytes_stream().map(move |chunk| {
-                if let Ok(c) = &chunk {
-                    meter.feed(c);
-                }
-                chunk
-            });
+            let stream = futures_util::stream::unfold(
+                (up.bytes_stream(), meter),
+                |(mut upstream, mut meter)| async move {
+                    let chunk = until_revoked(meter.run.cancel.subscribe(), async {
+                        Ok(upstream.next().await)
+                    })
+                    .await;
+                    match chunk {
+                        Ok(Some(Ok(bytes))) => {
+                            meter.feed(&bytes);
+                            Some((Ok::<_, std::io::Error>(bytes), (upstream, meter)))
+                        }
+                        Ok(None) | Err(_) => None,
+                        Ok(Some(Err(error))) => {
+                            Some((Err(std::io::Error::other(error)), (upstream, meter)))
+                        }
+                    }
+                },
+            );
             res.body(Body::from_stream(stream))
                 .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
         }
         Err(e) => {
             // Without the URL, which carries a query string the agent chose.
-            let why = e.without_url().to_string();
+            let why = e
+                .downcast_ref::<reqwest::Error>()
+                .map_or_else(|| e.to_string(), |_| "upstream transport failed".to_owned());
             eprintln!("upstream: {why}");
             refuse(
                 &st,
@@ -679,6 +728,7 @@ struct Reservation {
     run: Arc<Run>,
     spend: Spend,
     held: bool,
+    dispatched: bool,
 }
 
 impl Drop for Reservation {
@@ -686,7 +736,11 @@ impl Drop for Reservation {
         if self.held
             && let Ok(mut l) = self.run.ledger.lock()
         {
-            l.release(self.spend);
+            if self.dispatched {
+                l.settle(self.spend, None);
+            } else {
+                l.release(self.spend);
+            }
         }
     }
 }
@@ -703,6 +757,7 @@ struct Meter {
     run: Arc<Run>,
     audit: Arc<AuditLog>,
     reservation: Reservation,
+    request_id: String,
     price: Price,
     path: String,
     status: u16,
@@ -733,33 +788,18 @@ impl Drop for Meter {
         };
         let usage = std::mem::replace(&mut self.usage, Usage::new(false)).finish();
         let ok = (200..300).contains(&self.status);
-        // Error responses are not billed. A success with unknown usage is
-        // charged its whole reservation.
+        // Definite client rejection is unbilled; server failures and unknown
+        // success usage retain the reservation.
         let actual = if ok && self.path == "/v1/messages" {
             budget::cost(&self.price, &usage)
-        } else {
+        } else if (400..500).contains(&self.status) || self.path != "/v1/messages" {
             Some(Spend::default())
+        } else {
+            None
         };
-        let id = self.run.spec.id.clone();
-        let (spent, halted, newly_halted) = match self.run.ledger.lock() {
-            Ok(mut l) => {
-                let was = l.halted();
-                l.settle(self.reservation.spend, actual);
-                self.reservation.held = false;
-                (l.spent(), l.halted(), !was && l.halted())
-            }
-            Err(_) => (Spend::default(), true, false),
-        };
-        if ok && self.path == "/v1/messages" {
-            let mut extra = usage.clone();
-            extra.insert("run_tokens".into(), json!(spent.tokens));
-            extra.insert("run_cost_pico_usd".into(), json!(spent.pico_usd));
-            extra.insert("run_halted".into(), json!(halted));
-            log_with("usage", &id, &self.path, self.status, extra);
-        }
         let sha = hex(std::mem::take(&mut self.sha).finalize());
         let output = json!({
-            "run": id,
+            "run": self.run.spec.id,
             "path": self.path,
             "status": self.status,
             "usage": usage,
@@ -767,9 +807,45 @@ impl Drop for Meter {
         });
         let (run, log, path) = (self.run.clone(), self.audit.clone(), self.path.clone());
         let permit = self.permit.take();
+        let request_id = self.request_id.clone();
+        let reserved = self.reservation.spend;
+        self.reservation.held = false;
+        let status = self.status;
         tokio::task::spawn_blocking(move || {
             let _held = permit;
             let id = &run.spec.id;
+            let actual = match (&run.sink, actual) {
+                (Some(sink), Some(actual)) => match sink.settle(id, &request_id, actual) {
+                    Ok(()) => Some(actual),
+                    Err(error) => {
+                        run.cancel.send_replace(true);
+                        eprintln!("model settlement failed: {error}");
+                        Some(Spend {
+                            tokens: actual.tokens.max(reserved.tokens),
+                            pico_usd: actual.pico_usd.max(reserved.pico_usd),
+                        })
+                    }
+                },
+                (_, actual) => actual,
+            };
+            let (spent, halted, newly_halted) = match run.ledger.lock() {
+                Ok(mut ledger) => {
+                    let was = ledger.halted();
+                    ledger.settle(reserved, actual);
+                    (ledger.spent(), ledger.halted(), !was && ledger.halted())
+                }
+                Err(_) => {
+                    run.cancel.send_replace(true);
+                    (Spend::default(), true, false)
+                }
+            };
+            if ok && path == "/v1/messages" {
+                let mut extra = usage.clone();
+                extra.insert("run_tokens".into(), json!(spent.tokens));
+                extra.insert("run_cost_pico_usd".into(), json!(spent.pico_usd));
+                extra.insert("run_halted".into(), json!(halted));
+                log_with("usage", id, &path, status, extra);
+            }
             if newly_halted {
                 record_halt(&log, id, "a response cost more than its reservation");
             }
