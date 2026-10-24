@@ -897,6 +897,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "kod-host"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "kod-dispatcher",
+ "kod-eval",
+ "kod-gates",
+ "kod-llm-proxy",
+ "kod-policy",
+ "kod-tool-gateway",
+ "kod-tracker",
+ "libc",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "kod-llm-proxy"
 version = "0.1.0"
 dependencies = [

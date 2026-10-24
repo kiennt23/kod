@@ -96,6 +96,32 @@ impl std::fmt::Display for UncertainWrite {
 impl std::error::Error for UncertainWrite {}
 
 impl GitHub {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_test_api(
+        config: Config,
+        mapping: Mapping,
+        token: &str,
+        secret: &str,
+        api: &str,
+    ) -> Result<Self> {
+        let u = reqwest::Url::parse(api)?;
+        let ip = u
+            .host_str()
+            .and_then(|h| h.trim_matches(['[', ']']).parse::<std::net::IpAddr>().ok());
+        ensure!(
+            u.scheme() == "http"
+                && ip.is_some_and(|ip| ip.is_loopback())
+                && u.port().is_some()
+                && u.username().is_empty()
+                && u.password().is_none()
+                && u.path() == "/"
+                && u.query().is_none()
+                && u.fragment().is_none(),
+            "test API must be literal loopback"
+        );
+        Self::with_api(config, mapping, token, secret, api.trim_end_matches('/'))
+    }
+
     pub fn new(config: Config, mapping: Mapping, token: &str, secret: &str) -> Result<Self> {
         Self::with_api(config, mapping, token, secret, "https://api.github.com")
     }

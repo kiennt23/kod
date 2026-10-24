@@ -1,0 +1,74 @@
+{
+  "paths": {
+    "dispatcher_db": "/srv/kod/dispatcher.db",
+    "audit_db": "/srv/kod/audit.db",
+    "policy_dir": "/srv/kod/policy",
+    "run_root": "/srv/kod/runs",
+    "mirror": "/srv/kod/mirror",
+    "approval_manifest": "/srv/kod/snapshots/manifest.json",
+    "credential_dir": "/srv/kod/credentials"
+  },
+  "github": {
+    "product": {
+      "repo": "owner/product",
+      "repository_id": 0,
+      "installation_id": 0,
+      "base_branch": "main",
+      "guard_ruleset_id": 0,
+      "bot_user_id": 0
+    },
+    "app": {
+      "app_id": 0,
+      "private_key": "/srv/kod/secrets/app.pem"
+    },
+    "tracker": {
+      "repo": "owner/tasks",
+      "comment_author_id": 0
+    },
+    "tracker_repository_id": 0,
+    "tracker_installation_id": 0,
+    "mapping": "/srv/kod/github.json",
+    "webhook_secret_file": "/srv/kod/secrets/webhook",
+    "owner_key_file": "/srv/kod/secrets/owner",
+    "backup_key_file": null,
+    "agent_name": "REQUIRED OWNER VALUE",
+    "agent_email": "REQUIRED OWNER VALUE"
+  },
+  "model": {
+    "endpoint_name": "REQUIRED OWNER VALUE",
+    "upstream": "https://api.example.invalid",
+    "api_key_file": "/srv/kod/secrets/model",
+    "models": [
+      "REQUIRED OWNER VALUE"
+    ],
+    "selected_model": "REQUIRED OWNER VALUE",
+    "prices": "/srv/kod/prices.json",
+    "allowed_paths": "/v1/messages,/v1/messages/count_tokens",
+    "max_tokens": 0,
+    "max_body": 0,
+    "max_requests": 0,
+    "max_concurrent": 0,
+    "run_max_tokens": 0,
+    "run_max_cost_micro_usd": 0
+  },
+  "networking": {
+    "ingress_listen": "127.0.0.1:3000",
+    "gateway_listen": "127.0.0.1:3001",
+    "accepted_hosts": [
+      "localhost"
+    ],
+    "sandbox_network": "REQUIRED OWNER VALUE",
+    "sandbox_gateway_url": "http://host.docker.internal:3001"
+  },
+  "sandbox": {
+    "agent_image": "REQUIRED OWNER DIGEST",
+    "collector_image": "REQUIRED OWNER DIGEST",
+    "language": "rust",
+    "memory": "1g",
+    "cpus": 1,
+    "disk": "128m",
+    "max_turns": 0,
+    "wall_seconds": 0
+  },
+  "dispatcher_config": "/srv/kod/dispatcher.json"
+}
