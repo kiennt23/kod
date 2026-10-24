@@ -96,6 +96,8 @@ Follow the existing per-task execution distinction in ADR 0001 (still Proposed),
 
 ## Task 1: Extend dispatcher records and reuse its cleanup outbox
 
+**Implementation checkpoint:** storage APIs and startup retirement are implemented on `feat/connected-host`, with regression coverage in `connected_store`, `connected_accounting` and `connected_migration`. The host binary and Tasks 2–7 remain pending; this checkpoint does not claim the full 6b-b exit criteria.
+
 **Files:** modify `crates/kod-dispatcher/src/{store,lib}.rs`; add `src/bindings.rs` and `tests/connected_store.rs`. Read `src/followup.rs`, `tests/review_edges.rs`, and `tests/gateway_contract.rs` first.
 
 - [ ] Write the failing migration/immutable-binding test. Add `store::bind_once(&Connection, run_id, &serde_json::Value)` and `store::binding(&Connection, run_id)` with these exact retry semantics:

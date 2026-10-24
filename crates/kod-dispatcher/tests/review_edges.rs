@@ -61,7 +61,6 @@ fn with_gateway(h: &Harness, gateway: Arc<dyn Gateway>) -> Arc<Dispatcher> {
 #[test]
 fn a_kill_finishing_after_resume_does_not_stop_new_runs() {
     let h = harness();
-    h.running();
     let (tx, rx) = mpsc::channel();
     let gateway = Arc::new(SlowKill {
         inner: h.gw.clone(),
@@ -70,6 +69,7 @@ fn a_kill_finishing_after_resume_does_not_stop_new_runs() {
         release: (Mutex::new(false), Condvar::new()),
     });
     let d = with_gateway(&h, gateway.clone());
+    h.running();
     let kill_d = d.clone();
     let kill = std::thread::spawn(move || {
         let (body, sig) = cli("kill", "kiennt23", NOW, OWNER_KEY);
@@ -113,7 +113,6 @@ fn a_kill_finishing_after_resume_does_not_stop_new_runs() {
 #[test]
 fn kill_revokes_before_waiting_for_global_stop() {
     let h = harness();
-    h.running();
     let (tx, rx) = mpsc::channel();
     let gateway = Arc::new(SlowKill {
         inner: h.gw.clone(),
@@ -122,6 +121,7 @@ fn kill_revokes_before_waiting_for_global_stop() {
         release: (Mutex::new(false), Condvar::new()),
     });
     let d = with_gateway(&h, gateway.clone());
+    h.running();
     let kill = std::thread::spawn(move || {
         let (body, sig) = cli("kill", "kiennt23", NOW, OWNER_KEY);
         d.signed_command(&body, &sig, NOW)
@@ -164,8 +164,8 @@ impl Gateway for LostPublish {
 #[test]
 fn a_canceled_publish_with_a_lost_response_still_marks_the_pr() {
     let h = harness();
-    h.running();
     let d = with_gateway(&h, Arc::new(LostPublish(h.gw.clone())));
+    h.running();
     let cancel_d = d.clone();
     let tracker = h.tracker.clone();
     *h.gw.on_publish.lock().unwrap() = Some(Box::new(move || {
@@ -300,13 +300,13 @@ impl Gateway for LateStart {
 #[test]
 fn cancellation_during_start_revokes_a_token_registered_after_cancel() {
     let h = harness();
-    h.queued("FAKE-1");
     let gateway = Arc::new(LateStart {
         inner: h.gw.clone(),
         cancel: Mutex::new(None),
         token_live: AtomicBool::new(false),
     });
     let d = with_gateway(&h, gateway.clone());
+    h.queued("FAKE-1");
     let canceled = Arc::downgrade(&d);
     let tracker = h.tracker.clone();
     *gateway.cancel.lock().unwrap() = Some(Box::new(move || {
@@ -456,8 +456,8 @@ fn a_resume_waiting_on_the_audit_log_does_not_delay_a_kill() {
 #[test]
 fn a_kill_during_publish_still_checks_for_the_published_pr() {
     let h = harness();
-    h.running();
     let d = with_gateway(&h, Arc::new(LostPublish(h.gw.clone())));
+    h.running();
     let kill_d = d.clone();
     *h.gw.on_publish.lock().unwrap() = Some(Box::new(move || {
         let (body, sig) = cli("kill", "kiennt23", NOW, OWNER_KEY);
@@ -498,7 +498,6 @@ fn halted_in_store(h: &Harness) -> bool {
 #[test]
 fn a_hung_stop_all_retry_does_not_stop_a_kill_from_committing() {
     let h = harness();
-    h.running();
     h.sql(&format!(
         "INSERT INTO followups(kind,target,arg,next_at) VALUES('stop_all','','0',{NOW})"
     ));
@@ -510,6 +509,7 @@ fn a_hung_stop_all_retry_does_not_stop_a_kill_from_committing() {
         release: (Mutex::new(false), Condvar::new()),
     });
     let d = with_gateway(&h, gateway.clone());
+    h.running();
     let retry_d = d.clone();
     let retry = std::thread::spawn(move || retry_d.work_at(NOW + 1000));
     rx.recv_timeout(Duration::from_secs(5)).unwrap();

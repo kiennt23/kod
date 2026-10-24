@@ -47,8 +47,19 @@ The signed request is `POST /command` with a JSON body and the header `x-kod-sig
 
 ## Recovery
 
+- On open, queued and running executions are atomically ended as `needs_human`, with revoke/stop follow-ups in the same transaction. Cleanup is attempted before interrupted-publication lookups. Old execution never resumes; failed cleanup remains queued for retry.
 - On open, a run left in `publishing` is settled: done if the gateway finds its draft PR, `needs_human` otherwise. No run is left live.
 - Follow-ups (revoke, stop, ticket moves, comments) are stored with the state change and retried until they succeed. Stops go first.
 - A failed global stop is retried. Check the ticket comments if a kill reported an error.
 - If a cancel lands after publish already opened the PR, the ticket says so: close the PR, do not merge it.
 - The database is one SQLite file with a single dispatcher process. Do not run two.
+
+## Connected storage foundations
+
+Sub-plan 6b-b Task 1 adds three tables to the existing dispatcher database: immutable `run_bindings`, per-request `model_requests`, and `tracker_write_intents`. It adds no database or second run-state machine. Migration is transactional, preserves existing runs/deliveries/control/cleanup, enables foreign keys, and records SQLite `user_version=1`. Opening an already migrated store does not acquire a migration write lock. A newer unsupported schema version is refused.
+
+The host will validate the complete execution-binding shape before calling `store::bind_once`; the store requires a version-one JSON object and a real canonical positive `run-N`. Identical retries succeed, changed bindings fail, and SQL update/delete of a binding is refused.
+
+`reserve_model` records an immutable request reservation before forwarding. Tokens and cost use decimal text to preserve the full unsigned range; cost is in picodollars, matching the model gateway ledger. `model_charge` includes the full reservation until `settle_model` durably records confirmed usage. A failed or missing settlement never releases charge, and a repeated registration/reservation cannot reset it. Ended runs cannot reserve new requests, but an in-flight request may still settle after cancellation. These APIs are storage foundations; dynamic proxy registration and its reservation sink are Task 2.
+
+One unresolved status-write intent per story is enforced by a partial unique index. A restart does not clear it; the later host refresh worker must reconcile it before another create. The host process, provider wiring, approved snapshots and connected acceptance are still pending.

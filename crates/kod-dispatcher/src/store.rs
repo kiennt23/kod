@@ -12,9 +12,14 @@
 //! replay with a different unsigned delivery header, is a duplicate. `done`
 //! is 0 while queued, 1 once its effect is committed, and 2 when it failed
 //! `MAX_ATTEMPTS` times (a dead letter, kept with its last error).
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::{path::Path, time::Duration};
+
+pub use crate::bindings::{bind_once, binding};
+pub use crate::model_requests::{
+    ModelCharge, ModelRequest, model_charge, reserve_model, settle_model,
+};
 
 /// How long a write waits for another writer before it fails.
 pub const BUSY_TIMEOUT: Duration = Duration::from_secs(2);
@@ -98,13 +103,26 @@ pub(super) fn requeue_labels(c: &Connection, ticket: &str, delivery: &str) -> Re
 
 /// Opens (creating if needed) the store at `path`.
 pub fn open(path: &Path) -> Result<Connection> {
-    let c = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut c = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
     c.busy_timeout(BUSY_TIMEOUT)?;
     c.pragma_update(None, "synchronous", "FULL")?;
     // So the delete inside INSERT OR REPLACE fires `runs_are_kept`.
     c.pragma_update(None, "recursive_triggers", true)?;
-    c.execute_batch(SCHEMA)
-        .with_context(|| format!("creating the schema in {}", path.display()))?;
+    c.pragma_update(None, "foreign_keys", true)?;
+    let version: i64 = c.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    ensure!(version <= 1, "unsupported dispatcher database version");
+    if version == 0 {
+        let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let version: i64 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        ensure!(version <= 1, "unsupported dispatcher database version");
+        if version == 0 {
+            tx.execute_batch(SCHEMA)
+                .with_context(|| format!("creating the schema in {}", path.display()))?;
+            tx.execute_batch(crate::bindings::SCHEMA)?;
+            tx.pragma_update(None, "user_version", 1)?;
+        }
+        tx.commit()?;
+    }
     Ok(c)
 }
 
@@ -114,7 +132,29 @@ pub fn seq_of(run_id: &str) -> Option<i64> {
     run_id
         .strip_prefix("run-")
         .and_then(|n| n.parse::<i64>().ok())
-        .filter(|seq| format!("run-{seq}") == run_id)
+        .filter(|seq| *seq > 0 && format!("run-{seq}") == run_id)
+}
+
+pub fn retire_active(c: &mut Connection, reason: &str) -> Result<()> {
+    let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let seqs = {
+        let mut statement =
+            tx.prepare("SELECT seq FROM runs WHERE state IN ('queued','running') ORDER BY seq")?;
+        statement
+            .query_map([], |r| r.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for seq in seqs {
+        crate::Dispatcher::end(
+            &tx,
+            seq,
+            crate::RunState::NeedsHuman,
+            reason,
+            &[crate::RunState::Queued, crate::RunState::Running],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 /// Whether the run must stop: it has ended, or there is no such run. The

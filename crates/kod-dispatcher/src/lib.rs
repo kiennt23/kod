@@ -29,8 +29,10 @@ use std::{
 };
 use store::LIVE;
 
+mod bindings;
 mod edits;
 mod followup;
+mod model_requests;
 
 pub mod command;
 pub mod config;
@@ -396,6 +398,11 @@ impl Dispatcher {
     }
 
     fn recover(&self) -> Result<()> {
+        store::retire_active(
+            &mut self.db(),
+            "the dispatcher restarted; execution cannot resume",
+        )?;
+        self.follow_up(now())?;
         let publishing: Vec<RunStart> = {
             let c = self.db();
             let mut s =

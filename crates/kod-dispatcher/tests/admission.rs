@@ -56,8 +56,8 @@ fn a_duplicate_delivery_never_starts_a_second_run() {
     let again = h.reopen();
     assert_eq!(again.receive(&w).unwrap(), Received::Duplicate);
     while again.work_once().unwrap() {}
-    assert_eq!(h.gw.calls(), ["start run-1 FAKE-1 acme/app"]);
-    assert_eq!(h.states().len(), 1);
+    assert_eq!(h.gw.calls(), ["start run-1 FAKE-1 acme/app", "stop run-1"]);
+    assert_eq!(h.states(), [("run-1".to_owned(), "needs_human")]);
 }
 
 #[test]
