@@ -1,4 +1,6 @@
 pub mod case;
+pub mod connected;
+pub mod export;
 pub mod newcase;
 pub mod prompt;
 pub mod report;

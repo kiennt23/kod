@@ -868,6 +868,7 @@ dependencies = [
  "clap",
  "kod-llm-proxy",
  "kod-loop",
+ "libc",
  "roxmltree",
  "serde",
  "serde_json",

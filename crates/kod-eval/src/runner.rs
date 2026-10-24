@@ -35,6 +35,10 @@ impl Runner {
 
     /// Runs as the unprivileged agent user. The prompt arrives on stdin.
     pub fn command(&self, case: &EvalCase) -> Vec<String> {
+        self.command_with_turns(case.budget.max_turns)
+    }
+
+    pub fn command_with_turns(&self, max_turns: u32) -> Vec<String> {
         match self {
             Runner::ClaudeCode { model } => [
                 "claude",
@@ -42,7 +46,7 @@ impl Runner {
                 "--output-format",
                 "json",
                 "--max-turns",
-                &case.budget.max_turns.to_string(),
+                &max_turns.to_string(),
                 "--model",
                 model,
                 // Safe only because the sandbox is the boundary.
@@ -55,7 +59,7 @@ impl Runner {
                 "--model",
                 model,
                 "--max-turns",
-                &case.budget.max_turns.to_string(),
+                &max_turns.to_string(),
                 "--max-tokens",
                 &max_tokens.to_string(),
             ]
