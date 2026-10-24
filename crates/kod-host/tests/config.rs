@@ -229,6 +229,19 @@ fn tracker_test_transport_requires_literal_loopback() {
 }
 
 #[test]
-fn the_example_configuration_does_not_validate() {
-    assert!(FsConfig::load(Path::new("../../config/connected.example.json")).is_err());
+fn the_example_configuration_parses_but_does_not_validate() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/connected.example.json");
+    let path = std::fs::canonicalize(path).unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    assert!(
+        strict_json::<FsConfig>(&bytes).is_ok(),
+        "example must be schema-valid"
+    );
+    let error = format!(
+        "{:#}",
+        FsConfig::load(&path)
+            .err()
+            .expect("example must not validate")
+    );
+    assert!(error.contains("configured path is missing"), "{error}");
 }
