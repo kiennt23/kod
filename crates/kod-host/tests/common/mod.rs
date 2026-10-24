@@ -105,7 +105,7 @@ pub fn config(root: &Path, db: &Path) -> Arc<FsConfig> {
     let p = |s: &str| root.join(s);
     let text = serde_json::json!({
         "paths": {"dispatcher_db": db, "audit_db": p("audit.db"), "policy_dir": "/p",
-            "run_root": p("runs"), "mirror": "/m", "approval_manifest": "/a", "credential_dir": "/c"},
+            "run_root": p("runs"), "mirror": "/m", "approval_manifest": "/a", "gates_config": "/gc", "credential_dir": "/c"},
         "github": {
             "product": {"repo": "acme/app", "repository_id": 1, "installation_id": 1,
                 "base_branch": "main", "guard_ruleset_id": 1, "bot_user_id": 1},

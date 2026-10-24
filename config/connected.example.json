@@ -6,6 +6,7 @@
     "run_root": "/srv/kod/runs",
     "mirror": "/srv/kod/mirror",
     "approval_manifest": "/srv/kod/snapshots/manifest.json",
+    "gates_config": "/etc/kod/gates.json",
     "credential_dir": "/srv/kod/credentials"
   },
   "github": {

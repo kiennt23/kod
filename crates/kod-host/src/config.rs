@@ -26,6 +26,7 @@ pub struct FsPaths {
     pub run_root: PathBuf,
     pub mirror: PathBuf,
     pub approval_manifest: PathBuf,
+    pub gates_config: PathBuf,
     pub credential_dir: PathBuf,
 }
 #[derive(Clone, Deserialize)]

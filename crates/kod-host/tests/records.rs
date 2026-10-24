@@ -284,12 +284,63 @@ fn a_conflicting_artifact_path_fails_before_any_invalidation_or_copy() {
 }
 
 #[test]
-fn the_cli_never_publishes_without_a_live_open_pull_source() {
+fn a_source_error_refuses_publishes_nothing_and_invalidates_nothing() {
+    let w = world();
+    let before = active_text(&w);
+    stage(&w.root.join("staged"), "design-v4", "v4 text");
+    let invalidated = Cell::new(0);
+    let err = records::activate_from(
+        &w.config,
+        &w.root.join("staged/manifest.json"),
+        &|| Err(anyhow::anyhow!("GitHub provider status 502")),
+        &|_| {
+            invalidated.set(invalidated.get() + 1);
+            Ok(())
+        },
+    );
+    assert!(format!("{:#}", err.unwrap_err()).contains("open pull source failed"));
+    assert_eq!((invalidated.get(), active_text(&w)), (0, before));
+    assert!(!w.root.join("active/design-v4.txt").exists());
+}
+
+#[test]
+fn the_live_source_heads_are_invalidated_then_published() {
+    let w = world();
+    stage(&w.root.join("staged"), "design-v4", "v4 text");
+    let seen = std::cell::RefCell::new(vec![]);
+    records::activate_from(
+        &w.config,
+        &w.root.join("staged/manifest.json"),
+        &|| Ok(open()),
+        &|head| {
+            seen.borrow_mut()
+                .push((head.to_owned(), active_text(&w).contains("design-v3")));
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(*seen.borrow(), [("a".repeat(40), true)]);
+    assert!(active_text(&w).contains("design-v4"));
+}
+
+#[test]
+fn run_branches_name_their_story_and_anything_else_is_refused() {
+    assert_eq!(
+        records::story_of_branch("agent/acme/app#7-run-3").unwrap(),
+        "acme/app#7"
+    );
+    for bad in ["feature/x", "agent/acme/app#7", "agent/-run-1"] {
+        assert!(records::story_of_branch(bad).is_err(), "{bad}");
+    }
+}
+
+#[test]
+fn the_cli_refuses_without_a_gates_config_or_token_and_publishes_nothing() {
     let w = world();
     let before = active_text(&w);
     stage(&w.root.join("staged"), "design-v4", "v4 text");
     let err = records::activate_cli(&w.config, &w.root.join("staged/manifest.json"));
-    assert!(format!("{:#}", err.unwrap_err()).contains("nothing was published"));
+    assert!(err.is_err());
     assert_eq!(active_text(&w), before);
     assert!(!w.root.join("active/design-v4.txt").exists());
     // A bad candidate is refused on its own merits first.
