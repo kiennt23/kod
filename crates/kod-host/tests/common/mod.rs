@@ -16,8 +16,43 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-pub const MODEL_TOKEN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-pub const MCP_TOKEN: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+/// Per-run bearer tokens (64 hex), distinct for every run.
+pub fn model_token(run: &str) -> String {
+    hash(&format!("model:{run}"))
+}
+pub fn mcp_token(run: &str) -> String {
+    hash(&format!("mcp:{run}"))
+}
+
+/// A fake `docker` first on PATH for the whole test process, so every thread
+/// (the runtime's workers and the dispatcher's follow-ups included) sees it.
+/// Containers of run-77 never go away and log their argv to `FAKE_ARGV`; all
+/// other runs are absent.
+pub static FAKE_ARGV: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+pub fn init() {
+    FAKE_ARGV.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("kod-fake-docker-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let argv = dir.join("argv");
+        let script = format!(
+            "#!/bin/sh\ncase \"$*\" in\n*run-77*) printf '%s\\n' \"$*\" >> '{}'\n\
+             case $1 in ps) echo container;; inspect) echo run-77;; kill) exit 0;; esac;;\n\
+             *) exit 0;;\nesac\n",
+            argv.display()
+        );
+        let docker = dir.join("docker");
+        std::fs::write(&docker, script).unwrap();
+        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // SAFETY: set once, before any fixture starts a worker thread.
+        unsafe {
+            std::env::set_var(
+                "PATH",
+                format!("{}:{}", dir.display(), std::env::var("PATH").unwrap()),
+            );
+        }
+        argv
+    });
+}
 
 pub fn hash(s: &str) -> String {
     Sha256::digest(s.as_bytes())
@@ -45,12 +80,12 @@ pub fn admitted(root: &Path, start: &RunStart) -> Admitted {
             collector_image: format!("collector@sha256:{}", "e".repeat(64)),
             agent_out: root.join(&start.id).join("agent_out"),
             collect_out: root.join(&start.id).join("collect_out"),
-            model_token_hash: hash(MODEL_TOKEN),
-            mcp_token_hash: hash(MCP_TOKEN),
+            model_token_hash: hash(&model_token(&start.id)),
+            mcp_token_hash: hash(&mcp_token(&start.id)),
         },
         prompt: "do it".into(),
-        model_token: MODEL_TOKEN.into(),
-        mcp_token: MCP_TOKEN.into(),
+        model_token: model_token(&start.id),
+        mcp_token: mcp_token(&start.id),
     }
 }
 
@@ -97,7 +132,15 @@ fn config(root: &Path, db: &Path) -> Arc<FsConfig> {
 impl Fixture {
     /// `execute` is the agent: it receives the admitted run and the spawn gate.
     pub fn start(execute: Execute) -> Self {
-        Self::build(tempfile::tempdir().unwrap(), execute)
+        Self::build(tempfile::tempdir().unwrap(), execute, Arc::new(|_| {}))
+    }
+    /// `on_resolve` runs inside admission, after the run is accepted and
+    /// before the binding is written: a deterministic cancellation barrier.
+    pub fn start_hooked(
+        execute: Execute,
+        on_resolve: Arc<dyn Fn(&RunStart) + Send + Sync>,
+    ) -> Self {
+        Self::build(tempfile::tempdir().unwrap(), execute, on_resolve)
     }
     /// A host restart: fresh in-memory state over the same databases.
     pub fn restart(self, execute: Execute) -> Self {
@@ -113,9 +156,14 @@ impl Fixture {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         drop(runtime);
-        Self::build(dir, execute)
+        Self::build(dir, execute, Arc::new(|_| {}))
     }
-    fn build(dir: tempfile::TempDir, execute: Execute) -> Self {
+    fn build(
+        dir: tempfile::TempDir,
+        execute: Execute,
+        on_resolve: Arc<dyn Fn(&RunStart) + Send + Sync>,
+    ) -> Self {
+        init();
         let root = dir.path().canonicalize().unwrap();
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
         let db = root.join("dispatcher.db");
@@ -200,7 +248,10 @@ impl Fixture {
         let gate = Arc::new(kod_eval::connected::SpawnGate::default());
         let executed = Arc::new(Mutex::new(Vec::new()));
         let run_root = cfg.paths.run_root.clone();
-        let resolve: ResolveAdmission = Arc::new(move |s| Ok(admitted(&run_root, s)));
+        let resolve: ResolveAdmission = Arc::new(move |s| {
+            on_resolve(s);
+            Ok(admitted(&run_root, s))
+        });
         let runtime = Runtime::new(
             cfg,
             RuntimeAdapters {
@@ -258,12 +309,7 @@ impl Fixture {
     }
 }
 
-/// Run `f` with a fake `docker` script and a virtual stop clock.
-pub fn with_fake_docker<T>(script: &str, f: impl FnOnce() -> T) -> T {
-    let dir = tempfile::tempdir().unwrap();
-    let docker = dir.path().join("docker");
-    std::fs::write(&docker, script).unwrap();
-    std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
-    kod_eval::connected::with_docker(&docker, || kod_eval::connected::with_stop_clock(f))
+/// Run `f` with the virtual stop clock (stop deadlines pass instantly).
+pub fn with_clock<T>(f: impl FnOnce() -> T) -> T {
+    kod_eval::connected::with_stop_clock(f)
 }
-pub const DOCKER_ABSENT: &str = "#!/bin/sh\ncase $1 in ps) ;; esac\n";

@@ -27,7 +27,12 @@ kod-status = { path = "../kod-status" }
 kod-audit = { path = "../kod-audit" }
 kod-policy = { path = "../kod-policy" }
 
+[features]
+# Lets tests install a collection; production code cannot forge one.
+test-support = []
+
 [dev-dependencies]
+kod-host = { path = ".", features = ["test-support"] }
 tempfile = "3"
 kod-tracker = { path = "../kod-tracker", features = ["test-support"] }
 kod-eval = { path = "../kod-eval", features = ["connected-test-support"] }

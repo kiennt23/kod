@@ -909,6 +909,7 @@ dependencies = [
  "kod-dispatcher",
  "kod-eval",
  "kod-gates",
+ "kod-host",
  "kod-llm-proxy",
  "kod-loop",
  "kod-policy",

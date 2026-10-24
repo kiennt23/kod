@@ -42,6 +42,10 @@ impl Runtime {
         self.adapters.tool.retire_run_access(run);
         let bound = self.bound(run);
         if matches!(bound, Ok(false)) {
+            // Nothing remote or containerized was ever created for this run.
+            slot.cleanup_confirmed.store(true, Ordering::Release);
+            slot.stop_confirmed.store(true, Ordering::Release);
+            self.clear_confirmed_debt();
             return local;
         }
         self.cleanup_debt.store(true, Ordering::Release);
@@ -53,10 +57,24 @@ impl Runtime {
             poll_cleanup(&slot.cleanup, move || github.revoke(&id))
                 .inspect(|()| slot.cleanup_confirmed.store(true, Ordering::Release))
         };
-        combined([local, bound.map(|_| ()), remote])
+        let result = combined([local, bound.map(|_| ()), remote]);
+        if result.is_ok() {
+            self.clear_confirmed_debt();
+        }
+        result
     }
 
     pub fn revoke_all(&self) -> Result<()> {
+        let github = self.adapters.github.clone();
+        self.revoke_all_with(move || github.revoke_all())
+    }
+
+    /// `revoke_all` with the remote step supplied, so tests can fail it.
+    #[doc(hidden)]
+    pub fn revoke_all_with(
+        &self,
+        remote: impl FnOnce() -> Result<()> + Send + 'static,
+    ) -> Result<()> {
         self.cleanup_debt.store(true, Ordering::Release);
         for slot in self
             .slots
@@ -68,8 +86,11 @@ impl Runtime {
         }
         let local = self.adapters.model.revoke_all();
         self.adapters.tool.retire_all_access();
-        let github = self.adapters.github.clone();
-        let remote = poll_cleanup(&self.global_cleanup, move || github.revoke_all());
+        self.global_confirmed.store(false, Ordering::Release);
+        let remote = poll_cleanup(&self.global_cleanup, remote).inspect(|()| {
+            self.global_confirmed.store(true, Ordering::Release);
+            self.clear_confirmed_debt();
+        });
         combined([local, remote])
     }
 
@@ -77,6 +98,9 @@ impl Runtime {
         let slot = self.slot(run);
         slot.cancel();
         if !self.bound(run)? {
+            slot.cleanup_confirmed.store(true, Ordering::Release);
+            slot.stop_confirmed.store(true, Ordering::Release);
+            self.clear_confirmed_debt();
             return Ok(());
         }
         self.cleanup_debt.store(true, Ordering::Release);
@@ -137,6 +161,7 @@ impl Runtime {
                     && s.stop_confirmed.load(Ordering::Acquire))
         });
         if clean
+            && self.global_confirmed.load(Ordering::Acquire)
             && self
                 .global_cleanup
                 .lock()

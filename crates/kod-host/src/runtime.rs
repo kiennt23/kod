@@ -47,6 +47,8 @@ pub struct Runtime {
     slots: Mutex<HashMap<String, Arc<RunSlot>>>,
     global_cleanup: Mutex<Option<JoinHandle<Result<()>>>>,
     cleanup_debt: AtomicBool,
+    /// False from the first `revoke_all` until a global revocation joined Ok.
+    global_confirmed: AtomicBool,
 }
 
 #[derive(Default)]
@@ -126,6 +128,7 @@ impl Runtime {
             slots: Mutex::default(),
             global_cleanup: Mutex::default(),
             cleanup_debt: AtomicBool::new(false),
+            global_confirmed: AtomicBool::new(true),
         })
     }
     pub fn attach(&self, dispatcher: Weak<Dispatcher>) -> Result<()> {

@@ -77,6 +77,12 @@ impl CollectedWorkspace {
         Ok(())
     }
 }
+#[cfg(feature = "test-support")]
+impl CollectedWorkspace {
+    pub fn insert_for_test(&self, run: &str, collected: Collected) -> Result<()> {
+        self.insert(run, collected)
+    }
+}
 impl Workspace for CollectedWorkspace {
     fn collected(&self, run: &str) -> Result<Collected> {
         self.entries
