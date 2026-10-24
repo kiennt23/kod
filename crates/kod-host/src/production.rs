@@ -30,6 +30,26 @@ fn token() -> Result<String> {
     Ok(b.iter().map(|x| format!("{x:02x}")).collect())
 }
 
+/// Head commit of `branch` in the host mirror; any git failure or non-SHA output is an error.
+pub fn mirror_base(mirror: &std::path::Path, branch: &str) -> Result<String> {
+    ensure!(
+        !branch.is_empty() && !branch.starts_with('-') && !branch.chars().any(char::is_control),
+        "invalid base branch"
+    );
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(mirror)
+        .args(["rev-parse", "--verify", "--end-of-options"])
+        .arg(format!("refs/heads/{branch}^{{commit}}"))
+        .env_remove("GIT_DIR")
+        .output()
+        .context("git unavailable")?;
+    ensure!(out.status.success(), "mirror base unavailable");
+    let sha = String::from_utf8(out.stdout)?.trim().to_owned();
+    kod_gates::validate_sha(&sha)?;
+    Ok(sha)
+}
+
 pub fn resolve(config: Arc<FsConfig>, s: Sources) -> ResolveAdmission {
     Arc::new(move |start| {
         ensure!(

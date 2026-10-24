@@ -106,6 +106,24 @@ mod tests {
     }
 
     #[test]
+    fn a_blocked_write_reports_unresolved_and_leaves_no_second_intent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = open(&dir);
+        assert!(
+            guarded_status_write(&mut c, "s", 1, || Err(WriteFailure::uncertain("lost"))).is_err()
+        );
+        let error = guarded_status_write(&mut c, "s", 2, || Ok(())).unwrap_err();
+        // The explicit check, not the unique index's constraint error, must answer.
+        assert!(format!("{error:#}").contains("unresolved"), "{error:#}");
+        let rows: i64 = c
+            .query_row("SELECT count(*) FROM tracker_write_intents", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    #[test]
     fn rejected_status_allows_retry_and_success_clears_the_guard() {
         let dir = tempfile::tempdir().unwrap();
         let mut c = open(&dir);

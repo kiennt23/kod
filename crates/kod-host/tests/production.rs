@@ -245,3 +245,33 @@ fn forged_or_failed_collection_never_reaches_done_or_a_collected_result() {
         assert!(!collected, "{collect} / {export}");
     }
 }
+
+#[test]
+fn the_mirror_base_is_the_configured_branch_head_and_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["commit", "-q", "--allow-empty", "-m", "one"]);
+    let head = git(&["rev-parse", "HEAD"]);
+    assert_eq!(production::mirror_base(dir.path(), "main").unwrap(), head);
+    assert!(production::mirror_base(dir.path(), "absent").is_err());
+    assert!(production::mirror_base(dir.path(), "--all").is_err());
+    assert!(production::mirror_base(&dir.path().join("missing"), "main").is_err());
+}
