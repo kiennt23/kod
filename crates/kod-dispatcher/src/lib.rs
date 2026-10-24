@@ -32,6 +32,7 @@ use store::LIVE;
 mod bindings;
 mod edits;
 mod followup;
+mod lifecycle;
 mod model_requests;
 
 pub mod command;
@@ -444,7 +445,6 @@ impl Dispatcher {
             "UPDATE followups SET next_at = 0 WHERE kind = 'check_publish' AND done = 0",
             [],
         )?;
-        self.follow_up(now())?;
         self.follow_up(now())
     }
 
@@ -742,47 +742,6 @@ impl Dispatcher {
             tx.commit()?;
         }
         Ok(())
-    }
-
-    /// Ends the run if it is in one of `from`, and queues its stop, the
-    /// ticket's move and a comment. Returns whether the run ended here.
-    fn end(
-        c: &Connection,
-        seq: i64,
-        to: RunState,
-        reason: &str,
-        from: &[RunState],
-    ) -> Result<bool> {
-        let reason = &redact(reason);
-        let from: Vec<String> = from.iter().map(|s| format!("'{}'", s.name())).collect();
-        let ticket: Option<String> = c
-            .query_row(
-                &format!(
-                    "UPDATE runs SET state = ?2, reason = ?3 WHERE seq = ?1 AND state IN ({}) RETURNING ticket",
-                    from.join(", ")
-                ),
-                params![seq, to.name(), reason],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let Some(ticket) = ticket else {
-            return Ok(false);
-        };
-        let state = match to {
-            RunState::Done => State::InReview,
-            RunState::Canceled => State::Ready,
-            _ => State::Blocked,
-        };
-        follow(c, "revoke", &run_id(seq), "")?;
-        follow(c, "stop", &run_id(seq), "")?;
-        follow(c, "transition", &ticket, state.name())?;
-        follow(
-            c,
-            "comment",
-            &ticket,
-            &format!("Kod {} ended {}: {reason}.", run_id(seq), to.name()),
-        )?;
-        Ok(true)
     }
 
     /// Ends the run in its own transaction, then makes the follow-ups.

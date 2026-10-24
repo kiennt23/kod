@@ -17,6 +17,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use std::{path::Path, time::Duration};
 
 pub use crate::bindings::{bind_once, binding};
+pub use crate::lifecycle::retire_active;
 pub use crate::model_requests::{
     ModelCharge, ModelRequest, model_charge, reserve_model, settle_model,
 };
@@ -110,11 +111,17 @@ pub fn open(path: &Path) -> Result<Connection> {
     c.pragma_update(None, "recursive_triggers", true)?;
     c.pragma_update(None, "foreign_keys", true)?;
     let version: i64 = c.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    ensure!(version <= 1, "unsupported dispatcher database version");
+    ensure!(
+        (0..=1).contains(&version),
+        "unsupported dispatcher database version"
+    );
     if version == 0 {
         let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let version: i64 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        ensure!(version <= 1, "unsupported dispatcher database version");
+        ensure!(
+            (0..=1).contains(&version),
+            "unsupported dispatcher database version"
+        );
         if version == 0 {
             tx.execute_batch(SCHEMA)
                 .with_context(|| format!("creating the schema in {}", path.display()))?;
@@ -135,26 +142,18 @@ pub fn seq_of(run_id: &str) -> Option<i64> {
         .filter(|seq| *seq > 0 && format!("run-{seq}") == run_id)
 }
 
-pub fn retire_active(c: &mut Connection, reason: &str) -> Result<()> {
-    let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let seqs = {
-        let mut statement =
-            tx.prepare("SELECT seq FROM runs WHERE state IN ('queued','running') ORDER BY seq")?;
-        statement
-            .query_map([], |r| r.get::<_, i64>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-    };
-    for seq in seqs {
-        crate::Dispatcher::end(
-            &tx,
-            seq,
-            crate::RunState::NeedsHuman,
-            reason,
-            &[crate::RunState::Queued, crate::RunState::Running],
-        )?;
+/// Joins an outer transaction, or takes the write lock before reading.
+/// Callers validate first and perform a single final SQL mutation, so an error
+/// cannot leave partial writes in the caller's transaction.
+pub(crate) fn write(c: &Connection, work: impl FnOnce(&Connection) -> Result<()>) -> Result<()> {
+    if c.is_autocommit() {
+        let tx = rusqlite::Transaction::new_unchecked(c, rusqlite::TransactionBehavior::Immediate)?;
+        work(&tx)?;
+        tx.commit()?;
+        Ok(())
+    } else {
+        work(c)
     }
-    tx.commit()?;
-    Ok(())
 }
 
 /// Whether the run must stop: it has ended, or there is no such run. The
@@ -171,4 +170,19 @@ pub fn stopped(c: &Connection, run_id: &str) -> Result<bool> {
         )
         .optional()?;
     Ok(live != Some(true))
+}
+
+#[cfg(test)]
+mod tests {
+    use sha2::{Digest, Sha256};
+
+    #[test]
+    fn version_one_schema_is_frozen() {
+        // Schema changes need a new versioned migration, not edits to version one.
+        let schema = format!("{}{}", super::SCHEMA, crate::bindings::SCHEMA);
+        assert_eq!(
+            format!("{:x}", Sha256::digest(schema.as_bytes())),
+            "9e430fffd91511aff9d567fd087bd7506ea5014bcfda1159e56a56d4e3b47062"
+        );
+    }
 }

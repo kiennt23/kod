@@ -1,6 +1,6 @@
-use crate::store::seq_of;
+use crate::store::{seq_of, write};
 use anyhow::{Context, Result, ensure};
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 
 pub(super) const SCHEMA: &str = "
@@ -39,14 +39,31 @@ pub fn bind_once(c: &Connection, run: &str, binding: &Value) -> Result<()> {
         binding.is_object() && binding.get("version").and_then(Value::as_u64) == Some(1),
         "invalid binding version"
     );
-    let tx = Transaction::new_unchecked(c, TransactionBehavior::Immediate)?;
-    tx.execute(
-        "INSERT INTO run_bindings(run_seq,binding) VALUES(?1,?2) ON CONFLICT(run_seq) DO NOTHING",
-        params![seq, binding.to_string()],
-    )?;
-    ensure!(self::binding(&tx, run)? == *binding, "run binding changed");
-    tx.commit()?;
-    Ok(())
+    write(c, |c| {
+        let exists: bool = c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM run_bindings WHERE run_seq=?1)",
+            [seq],
+            |r| r.get(0),
+        )?;
+        if exists {
+            ensure!(self::binding(c, run)? == *binding, "run binding changed");
+            return Ok(());
+        }
+        let active: bool = c
+            .query_row(
+                "SELECT state IN ('queued','running') FROM runs WHERE seq=?1",
+                [seq],
+                |r| r.get(0),
+            )
+            .optional()?
+            .context("unknown run")?;
+        ensure!(active, "run is not awaiting execution");
+        c.execute(
+            "INSERT INTO run_bindings(run_seq,binding) VALUES(?1,?2)",
+            params![seq, binding.to_string()],
+        )?;
+        Ok(())
+    })
 }
 
 pub fn binding(c: &Connection, run: &str) -> Result<Value> {
