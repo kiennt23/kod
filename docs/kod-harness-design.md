@@ -608,7 +608,7 @@ Data written into a PR or sent in a model request remains a residual risk, recor
 
 Kod has three zones. A control counts only if it still holds when a runner ignores its instructions and hooks.
 
-The three zones are drawn in [architecture.md](architecture.md#level-2-containers) as boundaries around the containers.
+The three zones are drawn in [architecture.md](architecture.md#level-2a-runtime-path) (runtime path) and [2b](architecture.md#level-2b-control-and-evidence) (control and evidence) as boundaries around the containers.
 
 Agent code runs only in the top zone. Everything it does outside goes through the gateway, and nothing it builds reaches a release.
 

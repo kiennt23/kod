@@ -5,6 +5,9 @@ C4 views of Kod, as Mermaid flowcharts drawn in C4 style. Levels 1 to 3 are here
 ## Level 1: System context
 
 ```mermaid
+---
+title: "Kod: system context"
+---
 flowchart TB
   eng["<b>Engineer / requester</b><br/>Person<br/>Delegates tickets, reviews draft PRs"]
   po["<b>Product owner / approver</b><br/>Person<br/>Approves upstream docs"]
@@ -16,19 +19,17 @@ flowchart TB
   gdocs["<b>Google Docs (planned)</b><br/>External system<br/>Upstream drafts, sub-plan 9"]
   cp["<b>Off-host checkpoint store</b><br/>External system<br/>Write-once audit checkpoints"]
   eng -->|"Labels tickets, reviews PRs"| gh
-  po -->|"Approves docs"| gdocs
+  po -.->|"Approves docs (planned)"| gdocs
   kill -->|"Stop and resume, signed CLI"| kod
   aud -->|"Reads checkpoints"| cp
   gh -->|"Signed webhooks"| kod
   kod -->|"Comments, draft PR, checks"| gh
   kod -->|"Model calls"| llm
-  kod -->|"Read approved docs (planned)"| gdocs
+  kod -.->|"Read approved docs (planned)"| gdocs
   kod -->|"Writes checkpoints"| cp
   classDef person fill:#08427b,stroke:#052e56,color:#fff
   classDef internal fill:#1168bd,stroke:#0b4884,color:#fff
-  classDef component fill:#85bbf0,stroke:#5d82a8,color:#000
-  classDef db fill:#1168bd,stroke:#0b4884,color:#fff
-  classDef ext fill:#999,stroke:#6b6b6b,color:#fff
+  classDef ext fill:#6b6b6b,stroke:#444,color:#fff
   classDef planned stroke-dasharray:5 5,stroke-width:2px
   class eng,po,kill,aud person
   class kod internal
@@ -48,6 +49,9 @@ Split in two views so each stays readable: 2a is the runtime path, 2b is control
 ### Level 2a: Runtime path
 
 ```mermaid
+---
+title: "Kod: containers, runtime path"
+---
 flowchart TB
   eng["<b>Engineer</b><br/>Person<br/>Requester"]
   kill["<b>Owner / backup / tech lead</b><br/>Person<br/>Kill switch"]
@@ -72,21 +76,20 @@ flowchart TB
   eng -->|"Labels, reviews"| gh
   kill -->|"Signed CLI"| disp
   disp -->|"Reads, writes"| dispdb
-  host -->|"Hosts, implements Gateway"| disp
-  host -->|"Mounts"| toolgw
-  host -->|"Mounts"| llmgw
-  host -->|"Starts, stops, opaque tokens"| sandbox
+  host -.->|"Hosts, implements Gateway"| disp
+  host -.->|"Mounts"| toolgw
+  host -.->|"Mounts"| llmgw
+  host -.->|"Starts, stops, opaque tokens"| sandbox
   sandbox -->|"Runs"| runner
   runner -->|"MCP tool calls"| toolgw
   runner -->|"Model calls"| llmgw
-  collector -->|"Patch output"| host
+  collector -.->|"Patch output"| host
   toolgw -->|"Publish, comments"| gh
   llmgw -->|"Upstream calls"| llm
   classDef person fill:#08427b,stroke:#052e56,color:#fff
   classDef internal fill:#1168bd,stroke:#0b4884,color:#fff
-  classDef component fill:#85bbf0,stroke:#5d82a8,color:#000
   classDef db fill:#1168bd,stroke:#0b4884,color:#fff
-  classDef ext fill:#999,stroke:#6b6b6b,color:#fff
+  classDef ext fill:#6b6b6b,stroke:#444,color:#fff
   classDef planned stroke-dasharray:5 5,stroke-width:2px
   class eng,kill person
   class sandbox,runner,collector,host,toolgw,llmgw,disp internal
@@ -102,17 +105,23 @@ Policy (`kod-policy`) and the audit log are not drawn here; policy and audit wir
 ### Level 2b: Control and evidence
 
 ```mermaid
+---
+title: "Kod: containers, control and evidence"
+---
 flowchart TB
   aud["<b>Auditor</b><br/>Person<br/>Verifies audit"]
-  gh["<b>GitHub</b><br/>External system<br/>Required checks"]
+  gh["<b>GitHub</b><br/>External system<br/>Issues, repos, Actions"]
   cp["<b>Checkpoint store</b><br/>External system<br/>Off-host, write-once"]
-  runner["<b>kod-loop / runner</b><br/>[Rust, pluggable]<br/>Agent loop, Claude Code also conforms"]
-  dispdb[("<b>Dispatcher DB</b><br/>[SQLite]<br/>Queue, runs, follow-ups")]
 
-  subgraph enf["Enforcement points"]
+  subgraph untrusted["Untrusted local execution"]
+    runner["<b>kod-loop / runner</b><br/>[Rust, pluggable]<br/>Agent loop, Claude Code also conforms"]
+  end
+
+  subgraph gw["Gateway-mediated external operations"]
     disp["<b>Dispatcher</b><br/>[kod-dispatcher]<br/>Webhook, WIP, run states, kill"]
     toolgw["<b>Tool gateway</b><br/>[kod-tool-gateway, MCP]<br/>Tracker, docs, publish, run tokens"]
     llmgw["<b>LLM gateway</b><br/>[kod-llm-proxy]<br/>Budgets, routing, redacted capture"]
+    dispdb[("<b>Dispatcher DB</b><br/>[SQLite]<br/>Queue, runs, follow-ups")]
   end
 
   subgraph trusted["Trusted zone, no agent code"]
@@ -124,8 +133,8 @@ flowchart TB
     evalh["<b>kod-eval</b><br/>[Offline harness]<br/>Cases, scoring, compare"]
   end
 
-  enf -->|"Checks every action"| policy
-  enf -->|"Appends intent and outcome"| auditdb
+  disp & toolgw & llmgw -->|"Checks"| policy
+  disp & toolgw & llmgw -->|"Appends"| auditdb
   auditdb -->|"Checkpoints"| cp
   verifier -->|"Reads"| cp
   verifier -->|"Verifies"| auditdb
@@ -137,10 +146,8 @@ flowchart TB
   evalh -->|"Runs offline cases"| runner
   classDef person fill:#08427b,stroke:#052e56,color:#fff
   classDef internal fill:#1168bd,stroke:#0b4884,color:#fff
-  classDef component fill:#85bbf0,stroke:#5d82a8,color:#000
   classDef db fill:#1168bd,stroke:#0b4884,color:#fff
-  classDef ext fill:#999,stroke:#6b6b6b,color:#fff
-  classDef planned stroke-dasharray:5 5,stroke-width:2px
+  classDef ext fill:#6b6b6b,stroke:#444,color:#fff
   class aud person
   class runner,disp,toolgw,llmgw,policy,verifier,gates,status,evalh internal
   class dispdb,auditdb db
@@ -148,11 +155,14 @@ flowchart TB
 ```
 
 Trusted zone: gates run on a separate host and never share a sandbox or cache. The audit chain is checked off-host against write-once checkpoints. `kod-status` reads records and has no store of its own; `kod-eval` is offline and not part of the runtime path.
-Not drawn: the owner's and backup's kill switch keeps working when policy or audit is down; there is no third database. Gate scanners run in their own images (`images/gates`).
+Not drawn: the owner's and backup's kill switch path bypasses policy and keeps working when policy or audit is down; there is no third database. Gate scanners run in their own images (`images/gates`).
 
 ## Level 3: Components of kod-host (planned)
 
 ```mermaid
+---
+title: "kod-host components (planned, sub-plan 6b-b)"
+---
 flowchart TB
   disp["<b>Dispatcher</b><br/>[kod-dispatcher]<br/>Queue and run states"]
   toolgw["<b>Tool gateway</b><br/>[kod-tool-gateway]<br/>MCP, broker, publish"]
@@ -164,37 +174,36 @@ flowchart TB
   subgraph khost["kod-host (planned)"]
     cfg["<b>config, deadlines</b><br/>[Rust]<br/>Strict config, fixed defaults"]
     runtime["<b>runtime, binding</b><br/>[Rust]<br/>Implements Gateway, run bindings"]
-    runner["<b>runner, workspace</b><br/>[Rust]<br/>Start sandbox, trusted collection"]
+    hostrunner["<b>runner, workspace</b><br/>[Rust]<br/>Start sandbox, trusted collection"]
     art["<b>artifacts, records</b><br/>[Rust]<br/>Approved doc pins, trusted records"]
     svc["<b>service, refresh</b><br/>[Rust]<br/>Startup, shutdown, status refresh"]
     cred["<b>tracker_credentials</b><br/>[Rust]<br/>Renewable GitHub App token"]
   end
 
-  cfg -->|"Configures"| svc
-  svc -->|"Serves, retires runs on restart"| disp
-  svc -->|"Mounts router"| toolgw
-  svc -->|"Mounts router"| llmgw
-  runtime -->|"Gateway impl"| disp
-  runtime -->|"Bindings, spend, intents"| dispdb
-  runtime -->|"Registers run tokens"| toolgw
-  runtime -->|"Registers, revokes budgets"| llmgw
-  runtime -->|"Launch, stop"| runner
-  runner -->|"Docker, collector"| sandbox
-  art -->|"Admitted doc pins"| toolgw
-  svc -->|"Resolves approvals"| art
-  svc -->|"Token renewal"| cred
-  cred -->|"App JWT, installation token"| gh
-  classDef person fill:#08427b,stroke:#052e56,color:#fff
+  cfg -.->|"Configures"| svc
+  svc -.->|"Serves, retires runs on restart"| disp
+  svc -.->|"Mounts router"| toolgw
+  svc -.->|"Mounts router"| llmgw
+  runtime -.->|"Gateway impl"| disp
+  runtime -.->|"Bindings, spend, intents"| dispdb
+  runtime -.->|"Registers run tokens"| toolgw
+  runtime -.->|"Registers, revokes budgets"| llmgw
+  runtime -.->|"Launch, stop"| hostrunner
+  hostrunner -.->|"Docker, collector"| sandbox
+  art -.->|"Admitted doc pins"| toolgw
+  svc -.->|"Resolves approvals"| art
+  svc -.->|"Token renewal"| cred
+  cred -.->|"App JWT, installation token"| gh
   classDef internal fill:#1168bd,stroke:#0b4884,color:#fff
   classDef component fill:#85bbf0,stroke:#5d82a8,color:#000
   classDef db fill:#1168bd,stroke:#0b4884,color:#fff
-  classDef ext fill:#999,stroke:#6b6b6b,color:#fff
+  classDef ext fill:#6b6b6b,stroke:#444,color:#fff
   classDef planned stroke-dasharray:5 5,stroke-width:2px
   class disp,toolgw,llmgw,sandbox internal
   class dispdb db
   class gh ext
-  class cfg,runtime,runner,art,svc,cred component
-  style khost stroke-dasharray:5 5,stroke-width:2px
+  class cfg,runtime,hostrunner,art,svc,cred component
+  class khost planned
 ```
 
 `kod-host` is an assembly binary, not a new domain service: it reuses the existing routers and libraries and adds concrete adapters. Component names are the planned source files in the 6b-b plan; the plan, not this diagram, is authoritative if they diverge.
