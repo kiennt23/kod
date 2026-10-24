@@ -50,6 +50,7 @@ fn gateway(dir: &std::path::Path) -> (String, PathBuf) {
         repo: "acme/app".into(),
         base: "b".repeat(40),
         data_classes: vec!["placeholder".into()],
+        pins: std::collections::BTreeMap::new(),
         linked_tickets: vec![],
         started_at: 1_700_000_000,
     };

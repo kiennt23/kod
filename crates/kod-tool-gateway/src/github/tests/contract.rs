@@ -77,6 +77,7 @@ fn gateway(f: &Fixture, a: Arc<GitHub>, stopped: Arc<AtomicBool>) -> Arc<Gateway
             repo: "acme/app".into(),
             base,
             data_classes: vec!["placeholder".into()],
+            pins: std::collections::BTreeMap::new(),
             linked_tickets: vec![],
             started_at: 1_700_000_000,
         },
