@@ -55,6 +55,7 @@ impl Runtime {
             drop(c);
             slot.live(&start.id, &stopped)?;
             self.adapters.github.register_run(b.permit())?;
+            self.barrier("github");
             slot.live(&start.id, &stopped)?;
             self.adapters.model.register(
                 &admitted.model_token,
@@ -69,6 +70,7 @@ impl Runtime {
                     },
                 },
             )?;
+            self.barrier("model");
             slot.live(&start.id, &stopped)?;
             self.adapters.tool.start_run(
                 &admitted.mcp_token,
@@ -83,6 +85,7 @@ impl Runtime {
                     started_at: b.started_at,
                 },
             )?;
+            self.barrier("tool");
             slot.live(&start.id, &stopped)?;
             let runtime = self.weak.upgrade().context("runtime detached")?;
             let id = start.id.clone();
@@ -91,6 +94,7 @@ impl Runtime {
             let live: Stopped =
                 Arc::new(move |run| Ok(canceled.canceled.load(Ordering::SeqCst) || stopped(run)?));
             let worker = background(move || {
+                runtime.barrier("worker");
                 let outcome = worker_slot
                     .run_if_live(&id, &live, || {
                         (runtime.adapters.execute)(

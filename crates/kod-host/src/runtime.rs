@@ -29,6 +29,10 @@ pub struct Admitted {
     pub mcp_token: String,
 }
 
+/// Test hook run at registration barriers.
+#[cfg(feature = "test-support")]
+pub type BarrierHook = Arc<dyn Fn(&str) + Send + Sync>;
+
 pub struct RuntimeAdapters {
     pub tool: Arc<kod_tool_gateway::Gateway>,
     pub model: kod_llm_proxy::RunRegistry,
@@ -49,6 +53,9 @@ pub struct Runtime {
     cleanup_debt: AtomicBool,
     /// False from the first `revoke_all` until a global revocation joined Ok.
     global_confirmed: AtomicBool,
+    /// Test hook run at named points between registration and spawn.
+    #[cfg(feature = "test-support")]
+    barrier: Mutex<Option<BarrierHook>>,
 }
 
 #[derive(Default)]
@@ -129,6 +136,8 @@ impl Runtime {
             global_cleanup: Mutex::default(),
             cleanup_debt: AtomicBool::new(false),
             global_confirmed: AtomicBool::new(true),
+            #[cfg(feature = "test-support")]
+            barrier: Mutex::default(),
         })
     }
     pub fn attach(&self, dispatcher: Weak<Dispatcher>) -> Result<()> {
@@ -163,6 +172,23 @@ impl Runtime {
         let b = Binding::load(&self.config.paths.dispatcher_db, run)?;
         b.validate(&self.config.paths.run_root)?;
         Ok(b)
+    }
+    /// Run `hook(point)` at "github", "model", "tool" (after that registration)
+    /// and "worker" (just before the agent would spawn).
+    #[cfg(feature = "test-support")]
+    pub fn set_barrier(&self, hook: BarrierHook) {
+        *self.barrier.lock().unwrap_or_else(|e| e.into_inner()) = Some(hook);
+    }
+    fn barrier(&self, _point: &str) {
+        #[cfg(feature = "test-support")]
+        if let Some(hook) = self
+            .barrier
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
+            hook(_point);
+        }
     }
     pub fn cleanup_pending(&self) -> bool {
         self.cleanup_debt.load(Ordering::Acquire)

@@ -66,15 +66,19 @@ impl Runtime {
 
     pub fn revoke_all(&self) -> Result<()> {
         let github = self.adapters.github.clone();
-        self.revoke_all_with(move || github.revoke_all())
+        self.revoke_all_impl(move || github.revoke_all())
     }
 
     /// `revoke_all` with the remote step supplied, so tests can fail it.
-    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
     pub fn revoke_all_with(
         &self,
         remote: impl FnOnce() -> Result<()> + Send + 'static,
     ) -> Result<()> {
+        self.revoke_all_impl(remote)
+    }
+
+    fn revoke_all_impl(&self, remote: impl FnOnce() -> Result<()> + Send + 'static) -> Result<()> {
         self.cleanup_debt.store(true, Ordering::Release);
         for slot in self
             .slots

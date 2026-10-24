@@ -49,7 +49,7 @@ mod process;
 pub use collection::{collect, export, regular_bytes};
 pub use process::{launch, stop_owned};
 #[cfg(feature = "connected-test-support")]
-pub use process::{with_docker, with_stop_clock};
+pub use process::{use_docker_for_process, with_docker, with_stop_clock};
 
 pub fn names(run: &str) -> Result<Vec<String>> {
     let number = run

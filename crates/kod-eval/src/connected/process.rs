@@ -8,6 +8,14 @@ use std::{
 
 #[cfg(feature = "connected-test-support")]
 thread_local! { static DOCKER: std::cell::RefCell<std::path::PathBuf> = std::cell::RefCell::new("docker".into()); }
+/// Process-wide docker for threads without a `with_docker` scope (workers,
+/// follow-ups). Set once; replaces mutating the process environment.
+#[cfg(feature = "connected-test-support")]
+static PROCESS_DOCKER: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+#[cfg(feature = "connected-test-support")]
+pub fn use_docker_for_process(path: &std::path::Path) {
+    PROCESS_DOCKER.get_or_init(|| path.into());
+}
 #[cfg(feature = "connected-test-support")]
 pub fn with_docker<T>(path: &std::path::Path, action: impl FnOnce() -> T) -> T {
     struct Reset(std::path::PathBuf);
@@ -43,7 +51,11 @@ fn elapsed(start: Instant) -> Duration {
 fn command() -> Command {
     #[cfg(feature = "connected-test-support")]
     {
-        DOCKER.with(|p| Command::new(p.borrow().as_os_str()))
+        let scoped = DOCKER.with(|p| p.borrow().clone());
+        match PROCESS_DOCKER.get() {
+            Some(path) if scoped.as_os_str() == "docker" => Command::new(path),
+            _ => Command::new(scoped),
+        }
     }
     #[cfg(not(feature = "connected-test-support"))]
     {

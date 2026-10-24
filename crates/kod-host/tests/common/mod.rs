@@ -24,7 +24,7 @@ pub fn mcp_token(run: &str) -> String {
     hash(&format!("mcp:{run}"))
 }
 
-/// A fake `docker` first on PATH for the whole test process, so every thread
+/// A fake `docker` installed process-wide (no environment mutation), so every thread
 /// (the runtime's workers and the dispatcher's follow-ups included) sees it.
 /// Containers of run-77 never go away and log their argv to `FAKE_ARGV`; all
 /// other runs are absent.
@@ -35,23 +35,23 @@ pub fn init() {
         std::fs::create_dir_all(&dir).unwrap();
         let argv = dir.join("argv");
         let script = format!(
-            "#!/bin/sh\ncase \"$*\" in\n*run-77*) printf '%s\\n' \"$*\" >> '{}'\n\
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{all}'\ncase \"$*\" in\n*run-77*) printf '%s\\n' \"$*\" >> '{}'\n\
              case $1 in ps) echo container;; inspect) echo run-77;; kill) exit 0;; esac;;\n\
              *) exit 0;;\nesac\n",
-            argv.display()
+            argv.display(),
+            all = dir.join("all").display(),
         );
         let docker = dir.join("docker");
         std::fs::write(&docker, script).unwrap();
         std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
-        // SAFETY: set once, before any fixture starts a worker thread.
-        unsafe {
-            std::env::set_var(
-                "PATH",
-                format!("{}:{}", dir.display(), std::env::var("PATH").unwrap()),
-            );
-        }
+        kod_eval::connected::use_docker_for_process(&docker);
         argv
     });
+}
+
+/// Every docker invocation any thread made (one argv per line).
+pub fn docker_calls() -> String {
+    std::fs::read_to_string(FAKE_ARGV.get().unwrap().with_file_name("all")).unwrap_or_default()
 }
 
 pub fn hash(s: &str) -> String {
@@ -95,6 +95,7 @@ pub struct Fixture {
     pub runtime: Arc<Runtime>,
     pub dispatcher: Arc<Dispatcher>,
     pub registry: RunRegistry,
+    pub tool: Arc<Gateway>,
     pub workspace: Arc<CollectedWorkspace>,
     pub gate: Arc<kod_eval::connected::SpawnGate>,
     pub executed: Arc<Mutex<Vec<String>>>,
@@ -148,9 +149,12 @@ impl Fixture {
             dir,
             runtime,
             dispatcher,
+            tool,
+            registry,
+            workspace,
             ..
         } = self;
-        drop(dispatcher);
+        drop((dispatcher, tool, registry, workspace));
         // Workers hold the runtime until the old agent returns.
         while Arc::strong_count(&runtime) > 1 {
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -255,7 +259,7 @@ impl Fixture {
         let runtime = Runtime::new(
             cfg,
             RuntimeAdapters {
-                tool,
+                tool: tool.clone(),
                 model: registry.clone(),
                 github,
                 workspace: workspace.clone(),
@@ -285,6 +289,7 @@ impl Fixture {
             runtime,
             dispatcher,
             registry,
+            tool,
             workspace,
             gate,
             executed,

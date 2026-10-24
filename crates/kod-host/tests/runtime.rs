@@ -81,6 +81,28 @@ fn start_binds_registers_and_returns_while_agent_runs() {
 }
 
 #[test]
+fn start_returns_while_model_is_blocked() {
+    // The model call is stuck inside the run; start() has long returned.
+    let (entered, ready) = mpsc::channel();
+    let (release, wait) = mpsc::channel::<()>();
+    let wait = std::sync::Mutex::new(wait);
+    let execute: kod_host::runtime::Execute = Arc::new(move |a, _, _, _| {
+        // Registered with the proxy; the "upstream" never answers.
+        entered.send(a.binding.run.clone()).ok();
+        wait.lock().unwrap().recv().ok();
+        Ok(RunState::NeedsHuman)
+    });
+    let f = Fixture::start(execute);
+    f.insert_run(1, RunState::Running);
+    let began = std::time::Instant::now();
+    f.runtime.start(&f.run_start("run-1")).unwrap();
+    assert!(began.elapsed() < Duration::from_secs(5));
+    assert_eq!(ready.recv_timeout(Duration::from_secs(5)).unwrap(), "run-1");
+    assert!(f.tool.run(&mcp_token("run-1")).is_some());
+    release.send(()).ok();
+}
+
+#[test]
 fn recovery_does_not_resume() {
     let (execute, ready, release) = blocked();
     let f = Fixture::start(execute);
@@ -112,6 +134,22 @@ fn recovery_does_not_resume() {
     );
     assert!(f.runtime.start(&f.run_start("run-1")).is_err());
     assert!(ready.recv_timeout(Duration::from_millis(200)).is_err());
+    // Nothing resumed: no container was started, no model request was audited,
+    // and the old token is neither live nor re-registrable (spend cannot reset).
+    assert!(
+        !docker_calls().lines().any(|l| l.starts_with("run ")),
+        "no docker run after restart"
+    );
+    let a = rusqlite::Connection::open(f.dir.path().join("audit.db")).unwrap();
+    let prompts: i64 = a
+        .query_row(
+            "SELECT count(*) FROM audit WHERE record_type='prompts'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(prompts, 0, "no model request after restart");
+    assert!(f.tool.run(&mcp_token("run-1")).is_none());
 }
 
 #[test]
@@ -245,8 +283,29 @@ fn a_trusted_collection_lets_done_reach_publish() {
 fn absent_run_contract() {
     let (execute, _ready, _release) = blocked();
     let f = Fixture::start(execute);
+    let audit_rows = |f: &Fixture| -> i64 {
+        rusqlite::Connection::open(f.dir.path().join("audit.db"))
+            .unwrap()
+            .query_row("SELECT count(*) FROM audit", [], |r| r.get(0))
+            .unwrap()
+    };
+    let before = audit_rows(&f);
+    let leases = || {
+        std::fs::read_dir(f.dir.path().join("leases"))
+            .unwrap()
+            .count()
+    };
+    let leases_before = leases();
     kod_dispatcher::check_absent_run(f.runtime.as_ref(), "run-999").unwrap();
     kod_dispatcher::check_absent_run(f.runtime.as_ref(), "run-999").unwrap();
+    let c = kod_dispatcher::store::open(&f.db).unwrap();
+    let count = |sql: &str| -> i64 { c.query_row(sql, [], |r| r.get(0)).unwrap() };
+    assert_eq!(count("SELECT count(*) FROM run_bindings"), 0, "no binding");
+    assert_eq!(count("SELECT count(*) FROM followups"), 0, "no follow-up");
+    assert_eq!(audit_rows(&f), before, "no audit records");
+    assert!(f.tool.run(&mcp_token("run-999")).is_none(), "no tool entry");
+    assert_eq!(leases(), leases_before, "no forge/provider lease");
+    assert!(!docker_calls().lines().any(|l| l.starts_with("run ")));
 }
 
 #[test]
@@ -304,16 +363,21 @@ fn stop_timeout_stays_pending() {
     // Pending cleanup blocks new admissions.
     f.insert_run(2, RunState::Running);
     assert!(f.runtime.start(&f.run_start("run-2")).is_err());
-    // The unconfirmed stop stays visible as a pending follow-up in the reopened DB.
+    // Restart reopens both databases; the unconfirmed stop is still pending
+    // and was actually attempted by the dispatcher.
+    let (execute, _ready, _release) = blocked();
+    let f = f.restart(execute);
     let c = kod_dispatcher::store::open(&f.db).unwrap();
-    let pending: i64 = c
+    let (pending, attempted): (i64, i64) = c
         .query_row(
-            "SELECT count(*) FROM followups WHERE kind='stop' AND target='run-77' AND done=0",
+            "SELECT count(*), coalesce(sum(attempts > 0 OR error != ''), 0) FROM followups \
+             WHERE kind='stop' AND target='run-77' AND done=0",
             [],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .unwrap();
-    assert!(pending >= 1);
+    assert!(pending >= 1, "stop follow-up still pending after restart");
+    assert!(attempted >= 1, "stop follow-up was attempted");
 }
 
 /// Retry `f` (a dispatcher-style follow-up) until it succeeds; fails the test at the deadline.
@@ -404,4 +468,76 @@ fn a_reaped_failed_global_revocation_never_clears_debt() {
     until_ok("global", || f.runtime.revoke_all_with(|| Ok(())));
     until_ok("stop", || f.runtime.stop("run-1"));
     assert!(!f.runtime.cleanup_pending());
+}
+
+/// Cancel durably at one registration barrier; nothing may spawn and every
+/// credential must be denied afterwards.
+fn cancel_at(point: &'static str) {
+    let (execute, ready, _release) = blocked();
+    let f = Fixture::start(execute);
+    f.insert_run(1, RunState::Running);
+    let db = f.db.clone();
+    f.runtime.set_barrier(Arc::new(move |p| {
+        if p == point {
+            rusqlite::Connection::open(&db)
+                .unwrap()
+                .execute("UPDATE runs SET state='canceled' WHERE seq=1", [])
+                .unwrap();
+        }
+    }));
+    let started = f.runtime.start(&f.run_start("run-1"));
+    if point != "worker" {
+        assert!(started.is_err(), "{point}: start must refuse");
+    }
+    assert!(
+        ready.recv_timeout(Duration::from_millis(300)).is_err(),
+        "{point}: nothing spawned"
+    );
+    until_ok("revoke", || f.runtime.revoke("run-1"));
+    until_ok("stop", || f.runtime.stop("run-1"));
+    let c = rusqlite::Connection::open(&f.db).unwrap();
+    let state: String = c
+        .query_row("SELECT state FROM runs WHERE seq=1", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(state, "canceled", "{point}: durable row stopped");
+    assert!(
+        f.tool.run(&mcp_token("run-1")).is_none(),
+        "{point}: MCP token denied"
+    );
+    assert!(
+        f.registry
+            .register(
+                &model_token("run-1"),
+                kod_llm_proxy::config::RunSpec {
+                    id: "run-1".into(),
+                    ticket: "acme/app#7".into(),
+                    repo: "acme/app".into(),
+                    data_classes: vec!["placeholder".into()],
+                    budget: kod_llm_proxy::config::Budget {
+                        max_tokens: 1,
+                        max_cost_micro_usd: 1
+                    },
+                }
+            )
+            .is_err(),
+        "{point}: model token denied"
+    );
+    assert!(!f.runtime.cleanup_pending());
+}
+
+#[test]
+fn start_cancel_after_github_registration() {
+    cancel_at("github");
+}
+#[test]
+fn start_cancel_after_model_registration() {
+    cancel_at("model");
+}
+#[test]
+fn start_cancel_after_tool_registration() {
+    cancel_at("tool");
+}
+#[test]
+fn start_cancel_after_registration_before_spawn() {
+    cancel_at("worker");
 }
