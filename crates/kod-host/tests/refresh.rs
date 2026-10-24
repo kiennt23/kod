@@ -3,6 +3,7 @@ mod common;
 use axum::{Router, body::Body, extract::State, http::Request, response::Response};
 use kod_host::tracker_credentials::TrackerCredentials;
 use serde_json::{Value, json};
+use sha2::Digest;
 use std::{
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
@@ -95,8 +96,12 @@ async fn handle(State(s): State<Shared>, req: Request<Body>) -> Response {
         ),
         ("GET", "/repos/acme/tasks/issues/1") => json_ok(
             json!({"id": 1001, "number": 1, "repository_url": format!("{base}/repos/acme/tasks"),
-                "title": "Story", "body": "story", "state": "open",
+                "title": "Story", "body": "story\n\n<!-- kod:issue\n{\"requirement_id\":\"REQ-1\",\"risk_class\":\"low\",\"acceptance_criteria\":[\"works\"],\"approved_versions\":[\"design\"],\"links\":[]}\n-->", "state": "open",
                 "user": {"id": 1, "login": "po", "type": "User"}, "labels": []}),
+            200,
+        ),
+        ("GET", "/repos/acme/tasks/collaborators/po/permission") => json_ok(
+            json!({"permission": "write", "user": {"id": 1, "login": "po", "type": "User"}}),
             200,
         ),
         ("GET", "/repos/acme/tasks/issues/1/sub_issues") => json_ok(json!([]), 200),
@@ -213,6 +218,8 @@ fn world() -> World {
     std::fs::write(root.join("key.pem"), KEY).unwrap();
     std::fs::set_permissions(root.join("key.pem"), std::fs::Permissions::from_mode(0o600)).unwrap();
     config.paths.credential_dir = root.join("cred");
+    config.paths.policy_dir = root.join("policy");
+    config.paths.approval_manifest = root.join("snap/manifest.json");
     config.github.app.app_id = 5;
     config.github.tracker.repo = "acme/tasks".into();
     config.github.tracker.comment_author_id = BOT;
@@ -568,4 +575,108 @@ fn serve_with_an_invalid_config_fails_closed() {
         .output()
         .unwrap();
     assert!(!out.status.success());
+}
+
+// ---- production workflow source and the serve loop ----
+
+fn workflow(r: &Rig, open: Vec<&str>) -> kod_host::refresh::WorkflowSource {
+    let c = &r.w.config;
+    drop(kod_dispatcher::store::open(&c.paths.dispatcher_db).unwrap());
+    for d in [
+        &c.paths.policy_dir,
+        c.paths.approval_manifest.parent().unwrap(),
+    ] {
+        std::fs::create_dir_all(d).unwrap();
+        std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    for (n, v) in [
+        ("people.json", json!({"owner": "po", "backup": "bo"})),
+        ("routing.json", json!({"classes": {"design": {}}})),
+    ] {
+        std::fs::write(c.paths.policy_dir.join(n), v.to_string()).unwrap();
+        std::fs::set_permissions(
+            c.paths.policy_dir.join(n),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+    }
+    let m = &c.paths.approval_manifest;
+    let art = m.parent().unwrap().join("v1.txt");
+    std::fs::write(&art, "approved design").unwrap();
+    std::fs::set_permissions(&art, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let entry = json!({"link": "design", "revision": "v1", "path": "v1.txt", "class": "design",
+        "sha256": format!("{:x}", sha2::Sha256::digest("approved design")),
+        "approved_by": "po", "approved_at": "2026-10-24T00:00:00Z", "approval_ref": "S-1"});
+    std::fs::write(m, json!({"version": 1, "artifacts": [entry]}).to_string()).unwrap();
+    std::fs::set_permissions(m, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let scratch = r.w.dir.path().join("scratch");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let open: Vec<String> = open.into_iter().map(String::from).collect();
+    kod_host::refresh::WorkflowSource {
+        tracker: Arc::new(tracker(r)),
+        artifacts: Arc::new(
+            kod_host::artifacts::Artifacts::new(
+                c.paths.approval_manifest.clone(),
+                &c.paths.policy_dir,
+            )
+            .unwrap(),
+        ),
+        dispatcher_db: c.paths.dispatcher_db.clone(),
+        scratch,
+        open: Arc::new(move || Ok(open.clone())),
+    }
+}
+fn go_with(r: &Rig, src: &dyn Source) -> anyhow::Result<()> {
+    let audit = kod_audit::AuditLog::open(&r.w.dir.path().join("audit.log")).unwrap();
+    let mut c = kod_dispatcher::store::open(&r.w.config.paths.dispatcher_db).unwrap();
+    refresh_story(&r.w.config, &tracker(r), src, &audit, &mut c, STORY)
+}
+
+#[test]
+fn an_open_agent_pull_request_makes_the_production_source_fail_closed() {
+    let r = rig();
+    let src = workflow(&r, vec!["agent/acme/tasks#1-run-3"]);
+    let e = go_with(&r, &src).unwrap_err();
+    assert!(
+        format!("{e:#}").contains("evidence is unavailable"),
+        "{e:#}"
+    );
+    assert_eq!(posts(&r), 0);
+}
+
+#[test]
+fn the_production_source_publishes_status_when_no_pull_is_open() {
+    let r = rig();
+    go_with(&r, &workflow(&r, vec!["agent/acme/tasks#2-run-3"])).unwrap();
+    assert_eq!(posts(&r), 1);
+}
+
+#[test]
+fn stories_come_from_dispatcher_runs() {
+    let r = rig();
+    let c = kod_dispatcher::store::open(&r.w.config.paths.dispatcher_db).unwrap();
+    assert!(kod_host::refresh::stories(&c).unwrap().is_empty());
+}
+
+#[test]
+fn stopping_the_refresher_does_not_wait_for_a_stuck_status_call() {
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let e2 = entered.clone();
+    let rf = kod_host::refresh::Refresher::spawn(
+        || vec!["S".into()],
+        move |_| {
+            e2.store(true, Ordering::SeqCst);
+            let _ = rx.recv_timeout(std::time::Duration::from_secs(5));
+            Ok(())
+        },
+        std::time::Duration::from_millis(10),
+    );
+    while !entered.load(Ordering::SeqCst) {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let t = std::time::Instant::now();
+    rf.stop();
+    assert!(t.elapsed() < std::time::Duration::from_millis(100));
+    drop(tx);
 }

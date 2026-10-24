@@ -134,6 +134,7 @@ pub async fn dispatch_worker(
 
 /// Everything `serve` takes from outside the config files. The tracker is
 /// built by the caller because its credentials are not part of the host config.
+#[derive(Clone)]
 pub struct Parts {
     pub tracker: Arc<dyn kod_tracker::Tracker>,
     pub artifacts: Arc<crate::artifacts::Artifacts>,
@@ -484,6 +485,64 @@ pub async fn serve(
     let service = Service::start(config, parts).await?;
     term.await;
     service.shutdown().await
+}
+
+/// `serve` plus the 30 s status refresh: once at startup and then every `RECONCILE`. The loop
+/// is stopped before shutdown begins and never joined, so a stuck status call cannot hold up kill.
+pub async fn serve_refreshing(
+    config: Arc<crate::config::FsConfig>,
+    parts: Parts,
+    tracker: Arc<kod_tracker::github::GitHub>,
+    term: impl std::future::Future<Output = ()>,
+) -> Result<()> {
+    let service = Service::start(config.clone(), parts.clone()).await?;
+    let refresher = start_refresh(&config, &parts, tracker)?;
+    term.await;
+    refresher.stop();
+    service.shutdown().await
+}
+
+fn start_refresh(
+    config: &Arc<crate::config::FsConfig>,
+    parts: &Parts,
+    tracker: Arc<kod_tracker::github::GitHub>,
+) -> Result<crate::refresh::Refresher> {
+    let dir = private_subdir(&config.paths.credential_dir.join("refresh"))?;
+    let scratch = private_subdir(&config.paths.credential_dir.join("refresh-records"))?;
+    let product = Arc::new(kod_tool_gateway::github::GitHub::new(
+        config.github.product.clone(),
+        config.github.app.clone(),
+        &dir,
+    )?);
+    let source = crate::refresh::Timed::production(Arc::new(crate::refresh::WorkflowSource {
+        tracker: parts.tracker.clone(),
+        artifacts: parts.artifacts.clone(),
+        dispatcher_db: config.paths.dispatcher_db.clone(),
+        scratch,
+        open: Arc::new(move || {
+            Ok(product
+                .open_pulls()?
+                .into_iter()
+                .map(|p| p.branch)
+                .collect())
+        }),
+    }));
+    let db = config.paths.dispatcher_db.clone();
+    let (cfg, audit_db) = (config.clone(), config.paths.audit_db.clone());
+    let db2 = db.clone();
+    Ok(crate::refresh::Refresher::spawn(
+        move || {
+            kod_dispatcher::store::open(&db2)
+                .and_then(|c| crate::refresh::stories(&c))
+                .unwrap_or_default()
+        },
+        move |story| {
+            let mut c = kod_dispatcher::store::open(&db)?;
+            let audit = kod_audit::AuditLog::open(&audit_db)?;
+            crate::refresh::refresh_story(&cfg, &tracker, &source, &audit, &mut c, story)
+        },
+        crate::deadlines::RECONCILE,
+    ))
 }
 
 #[cfg(test)]

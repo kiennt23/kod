@@ -48,9 +48,9 @@ fn main() -> Result<()> {
                     creds.token_source(),
                     std::str::from_utf8(&secret)?.trim(),
                 )?;
-                let parts =
-                    kod_host::service::production_parts(&config, std::sync::Arc::new(tracker))?;
-                kod_host::service::serve(config.clone(), parts, async {
+                let tracker = std::sync::Arc::new(tracker);
+                let parts = kod_host::service::production_parts(&config, tracker.clone())?;
+                kod_host::service::serve_refreshing(config.clone(), parts, tracker, async {
                     let mut term =
                         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                             .expect("SIGTERM handler");

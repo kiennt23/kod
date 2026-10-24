@@ -127,6 +127,89 @@ pub fn rework_records(c: &Connection, story: &str) -> Result<Vec<ReworkRecord>> 
     Ok(vec![])
 }
 
+/// What the host can truthfully put in a story's status: tracker facts, the pinned approved
+/// artifacts, dispatcher runs and rework. Pull evidence (team, policy and runner-config versions)
+/// has no host source and the product token cannot read check runs, so a story with an open agent
+/// pull request fails closed rather than rendering "no pull requests". Merged or closed pulls are
+/// not listed by the live source (ponytail: closed-PR history needs a recorded pull table).
+pub struct WorkflowSource {
+    pub tracker: Arc<dyn kod_tracker::Tracker + Send + Sync>,
+    pub artifacts: Arc<crate::artifacts::Artifacts>,
+    pub dispatcher_db: PathBuf,
+    pub scratch: PathBuf,
+    pub open: Arc<dyn Fn() -> Result<Vec<String>> + Send + Sync>,
+}
+
+impl Source for WorkflowSource {
+    fn load(&self, story: &str) -> Result<Records> {
+        for branch in (self.open)()? {
+            if records::story_of_branch(&branch)? == story {
+                bail!("open pull request evidence is unavailable for {story}");
+            }
+        }
+        let mut stages = std::collections::BTreeMap::new();
+        for a in self.artifacts.current_manifest()?.artifacts {
+            let stage: kod_status::Stage = serde_json::from_value(a.class.clone().into())
+                .with_context(|| format!("artifact class {} has no stage", a.class))?;
+            stages.insert(a.link, stage);
+        }
+        let c = Connection::open_with_flags(
+            &self.dispatcher_db,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        c.busy_timeout(kod_dispatcher::store::BUSY_TIMEOUT)?;
+        let snap = records::snapshot(
+            self.tracker.as_ref(),
+            &self.artifacts,
+            story,
+            &|l| {
+                stages
+                    .get(l)
+                    .copied()
+                    .unwrap_or(kod_status::Stage::Requirements)
+            },
+            vec![],
+            rework_records(&c, story)?,
+        )?;
+        let file = self
+            .scratch
+            .join(format!("{}.json", records::story_lock_name(story)?));
+        records::write_atomic(&file, &serde_json::to_vec(&snap)?)?;
+        kod_status::records::HostRecords {
+            snapshot: file,
+            dispatcher: self.dispatcher_db.clone(),
+        }
+        .load(story)
+    }
+}
+
+/// Stories the host owns: every ticket with a dispatcher run.
+pub fn stories(c: &Connection) -> Result<Vec<String>> {
+    c.prepare("SELECT DISTINCT ticket FROM runs ORDER BY ticket")?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()
+        .map_err(Into::into)
+}
+
+/// A detached refresh thread. `stop` only raises the flag: a status call stuck on the network
+/// cannot delay shutdown, and the thread ends at its next poll.
+pub struct Refresher(Arc<AtomicBool>);
+impl Refresher {
+    pub fn spawn(
+        stories: impl Fn() -> Vec<String> + Send + 'static,
+        step: impl Fn(&str) -> Result<()> + Send + 'static,
+        interval: Duration,
+    ) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let s = stop.clone();
+        std::thread::spawn(move || run_loop(stories, step, interval, &s));
+        Self(stop)
+    }
+    pub fn stop(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
 /// A source that fails after `limit` instead of serving anything stale.
 pub struct Timed {
     inner: Arc<dyn Source + Send + Sync>,
