@@ -8,4 +8,5 @@ pub mod refresh;
 pub mod runner;
 pub mod runtime;
 pub mod service;
+pub mod tracker_credentials;
 pub mod workspace;

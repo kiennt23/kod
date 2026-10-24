@@ -26,7 +26,17 @@ pub struct Config {
     pub comment_author_id: u64,
 }
 
+/// Yields the bearer token for each request, so a renewed credential reaches this same instance.
+pub type TokenSource = std::sync::Arc<dyn Fn() -> Result<String> + Send + Sync>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnedStatusComment {
+    pub id: u64,
+    pub body: String,
+}
+
 pub struct GitHub {
+    token: TokenSource,
     config: Config,
     mapping: Mapping,
     client: Client,
@@ -75,6 +85,14 @@ pub struct ReworkMetadata {
     pub story: String,
     pub kind: ReworkKind,
     pub fields: Rework,
+}
+
+fn fixed(token: &str) -> TokenSource {
+    let token = token.to_owned();
+    std::sync::Arc::new(move || {
+        ensure!(!token.is_empty(), "missing GitHub identity or credentials");
+        Ok(token.clone())
+    })
 }
 
 fn name(s: &str) -> bool {
@@ -134,17 +152,52 @@ impl GitHub {
                 && u.fragment().is_none(),
             "test API must be literal loopback"
         );
-        Self::with_api(config, mapping, token, secret, api.trim_end_matches('/'))
+        Self::with_api(
+            config,
+            mapping,
+            fixed(token),
+            secret,
+            api.trim_end_matches('/'),
+        )
+    }
+
+    /// `with_test_api` with a token that is fetched per request.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_test_api_source(
+        config: Config,
+        mapping: Mapping,
+        token: TokenSource,
+        secret: &str,
+        api: &str,
+    ) -> Result<Self> {
+        let probe = Self::with_test_api(config.clone(), mapping.clone(), "probe", secret, api)?;
+        Self::with_api(config, mapping, token, secret, &probe.api)
+    }
+
+    /// Production constructor whose token is renewed by `token` before each request.
+    pub fn with_token_source(
+        config: Config,
+        mapping: Mapping,
+        token: TokenSource,
+        secret: &str,
+    ) -> Result<Self> {
+        Self::with_api(config, mapping, token, secret, "https://api.github.com")
     }
 
     pub fn new(config: Config, mapping: Mapping, token: &str, secret: &str) -> Result<Self> {
-        Self::with_api(config, mapping, token, secret, "https://api.github.com")
+        Self::with_api(
+            config,
+            mapping,
+            fixed(token),
+            secret,
+            "https://api.github.com",
+        )
     }
 
     fn with_api(
         config: Config,
         mapping: Mapping,
-        token: &str,
+        token: TokenSource,
         secret: &str,
         api: &str,
     ) -> Result<Self> {
@@ -154,7 +207,7 @@ impl GitHub {
             "invalid GitHub repository"
         );
         ensure!(
-            config.comment_author_id > 0 && !token.is_empty() && !secret.is_empty(),
+            config.comment_author_id > 0 && !secret.is_empty(),
             "missing GitHub identity or credentials"
         );
         ensure!(
@@ -192,10 +245,6 @@ impl GitHub {
             "GitHub workflow labels must use the reserved kod: namespace"
         );
         let mut headers = HeaderMap::new();
-        let mut auth = HeaderValue::from_str(&format!("Bearer {token}"))
-            .context("invalid GitHub credential")?;
-        auth.set_sensitive(true);
-        headers.insert(reqwest::header::AUTHORIZATION, auth);
         headers.insert(
             reqwest::header::ACCEPT,
             HeaderValue::from_static("application/vnd.github+json"),
@@ -212,6 +261,7 @@ impl GitHub {
             .timeout(Duration::from_secs(30))
             .build()?;
         Ok(Self {
+            token,
             config,
             mapping,
             client,
@@ -219,6 +269,21 @@ impl GitHub {
             secret: secret.into(),
             writes: Mutex::default(),
         })
+    }
+
+    /// The bound issue's unique bot-owned status comment, if any. Read-only; more than one
+    /// owned comment is an error, and an empty result is not proof that a create did not land.
+    pub fn owned_status_comment(&self, key: &str) -> Result<Option<OwnedStatusComment>> {
+        let number = self.number(key)?;
+        self.raw(number)?;
+        Ok(self
+            .status_comments(number)?
+            .into_iter()
+            .next()
+            .map(|c| OwnedStatusComment {
+                id: c.id,
+                body: c.body,
+            }))
     }
 
     fn key(&self, number: u64) -> String {
@@ -258,10 +323,16 @@ impl GitHub {
         body: Option<&Value>,
     ) -> Result<(StatusCode, Value)> {
         let write = method != Method::GET;
-        let mut request = self.client.request(
-            method,
-            format!("{}/repos/{}/{}", self.api, self.config.repo, path),
-        );
+        let mut auth = HeaderValue::from_str(&format!("Bearer {}", (self.token)()?))
+            .context("invalid GitHub credential")?;
+        auth.set_sensitive(true);
+        let mut request = self
+            .client
+            .request(
+                method,
+                format!("{}/repos/{}/{}", self.api, self.config.repo, path),
+            )
+            .header(reqwest::header::AUTHORIZATION, auth);
         if let Some(body) = body {
             request = request.json(body);
         }

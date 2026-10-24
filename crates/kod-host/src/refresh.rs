@@ -1,6 +1,17 @@
 //! The durable guard around the audited status write.
-use anyhow::{Result, bail};
+use crate::{config::FsConfig, deadlines, records};
+use anyhow::{Context, Result, bail};
+use kod_status::records::{Records, ReworkRecord, Source};
+use kod_tracker::github::GitHub;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 pub struct WriteFailure {
     not_applied: bool,
@@ -70,6 +81,126 @@ pub fn guarded_status_write(
                 )?;
             }
             bail!("{}", failure.message)
+        }
+    }
+}
+
+/// Resolves an unresolved status intent from the one owned remote comment. Zero or duplicate
+/// owned comments leave it unresolved: an empty list never proves a create did not land.
+pub fn reconcile_status(
+    c: &mut Connection,
+    story: &str,
+    owned: impl FnOnce() -> Result<Option<kod_tracker::github::OwnedStatusComment>>,
+) -> Result<()> {
+    let pending: Option<String> = c
+        .query_row(
+            "SELECT operation_id FROM tracker_write_intents WHERE story=?1 AND kind='status' AND outcome IS NULL",
+            [story],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(operation) = pending else {
+        return Ok(());
+    };
+    let comment = owned()?.context("status write unresolved; no owned comment found")?;
+    c.execute(
+        "UPDATE tracker_write_intents SET outcome='reconciled', remote_id=?2 WHERE operation_id=?1",
+        params![operation, comment.id.to_string()],
+    )?;
+    Ok(())
+}
+
+/// The dispatcher's rework records for a story. The dispatcher keeps no resolved rework
+/// records yet, so an empty table is a real "none"; any row (an unresolved or resolved create)
+/// cannot be rendered and fails the refresh, as does an unreadable table. Never `vec![]` by default.
+pub fn rework_records(c: &Connection, story: &str) -> Result<Vec<ReworkRecord>> {
+    let n: i64 = c
+        .query_row(
+            "SELECT count(*) FROM tracker_write_intents WHERE story=?1 AND kind='rework'",
+            [story],
+            |r| r.get(0),
+        )
+        .context("rework records unavailable")?;
+    if n > 0 {
+        bail!("rework records unavailable; reconcile {n} rework create(s) for {story}");
+    }
+    Ok(vec![])
+}
+
+/// A source that fails after `limit` instead of serving anything stale.
+pub struct Timed {
+    inner: Arc<dyn Source + Send + Sync>,
+    limit: Duration,
+}
+
+impl Timed {
+    pub fn new(inner: Arc<dyn Source + Send + Sync>, limit: Duration) -> Self {
+        Self { inner, limit }
+    }
+    pub fn production(inner: Arc<dyn Source + Send + Sync>) -> Self {
+        Self::new(inner, deadlines::SOURCE)
+    }
+}
+
+impl Source for Timed {
+    fn load(&self, story: &str) -> Result<Records> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (inner, story) = (self.inner.clone(), story.to_owned());
+        std::thread::spawn(move || {
+            let _ = tx.send(inner.load(&story));
+        });
+        rx.recv_timeout(self.limit)
+            .map_err(|_| anyhow::anyhow!("workflow source timed out"))?
+    }
+}
+
+/// One audited, serialized refresh: the gates lock and the story lock are held from load through
+/// write, so it cannot interleave with `records::activate`.
+pub fn refresh_story(
+    config: &FsConfig,
+    tracker: &GitHub,
+    source: &dyn Source,
+    audit: &kod_audit::AuditLog,
+    c: &mut Connection,
+    story: &str,
+) -> Result<()> {
+    let suffix = |s: &str| {
+        let mut p = config.paths.audit_db.as_os_str().to_owned();
+        p.push(s);
+        PathBuf::from(p)
+    };
+    let _gates = records::lock(suffix(".gates.lock"))?;
+    let _story = records::lock(suffix(&format!(
+        ".refresh.{}.lock",
+        records::story_lock_name(story)?
+    )))?;
+    reconcile_status(c, story, || tracker.owned_status_comment(story))?;
+    kod_status::refresh_with_writer(source, tracker, audit, story, |key, text, intent| {
+        use kod_tracker::Tracker;
+        guarded_status_write(c, story, intent, || {
+            tracker
+                .status_comment(key, text)
+                .map_err(WriteFailure::from_tracker)
+        })
+    })?;
+    Ok(())
+}
+
+/// Recomputes at once and then every `interval` until `stop`. One story failing never stops the
+/// others or the loop; the next pass retries it.
+pub fn run_loop(
+    stories: impl Fn() -> Vec<String>,
+    step: impl Fn(&str) -> Result<()>,
+    interval: Duration,
+    stop: &AtomicBool,
+) {
+    while !stop.load(Ordering::SeqCst) {
+        for s in stories() {
+            let _ = step(&s);
+        }
+        let until = std::time::Instant::now() + interval;
+        while !stop.load(Ordering::SeqCst) && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10).min(interval));
         }
     }
 }

@@ -297,3 +297,28 @@ fn the_cli_never_publishes_without_a_live_open_pull_source() {
     let err = records::activate_cli(&w.config, &w.root.join("bad/manifest.json"));
     assert!(format!("{:#}", err.unwrap_err()).contains("immutable artifact revision changed"));
 }
+
+#[test]
+fn a_rework_ticket_is_shown_once_as_rework_never_also_as_an_ordinary_ticket() {
+    use kod_status::{Stage, records::ReworkRecord};
+    use kod_tracker::State;
+    let w = world();
+    let t = tracker();
+    let artifacts = kod_host::artifacts::Artifacts::new(
+        w.config.paths.approval_manifest.clone(),
+        &w.config.paths.policy_dir,
+    )
+    .unwrap();
+    let rework = vec![ReworkRecord {
+        key: "T-1".into(),
+        kind: kod_tracker::ReworkKind::Amendment,
+        target: Stage::Design,
+        state: State::Ready,
+    }];
+    let s = records::snapshot(&t, &artifacts, "S-1", &|_| Stage::Design, vec![], rework).unwrap();
+    assert!(
+        s.tickets.is_empty(),
+        "T-1 is rework, so it is not also a ticket"
+    );
+    assert_eq!(s.rework.len(), 1);
+}

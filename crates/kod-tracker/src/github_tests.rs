@@ -247,7 +247,7 @@ impl Harness {
                 comment_author_id: 99,
             },
             Mapping::parse("fixture", MAPPING).unwrap(),
-            "test-token",
+            fixed("test-token"),
             "webhook-secret",
             &api,
         )

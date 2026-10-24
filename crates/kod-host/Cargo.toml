@@ -38,3 +38,4 @@ kod-tracker = { path = "../kod-tracker", features = ["test-support"] }
 kod-eval = { path = "../kod-eval", features = ["connected-test-support"] }
 tower = { version = "0.5", features = ["util"] }
 tokio = { version = "1", features = ["test-util"] }
+futures-util = "0.3"

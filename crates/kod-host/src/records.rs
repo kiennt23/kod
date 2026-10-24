@@ -122,7 +122,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn lock(path: PathBuf) -> Result<std::fs::File> {
+pub(crate) fn lock(path: PathBuf) -> Result<std::fs::File> {
     let f = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -132,6 +132,19 @@ fn lock(path: PathBuf) -> Result<std::fs::File> {
         .open(path)?;
     f.lock()?;
     Ok(f)
+}
+
+/// The file-name form of a story key: `[A-Za-z0-9_-]` stay, every other byte becomes `%XX`, so
+/// `acme/app#1` can never escape the directory and activation and refresh agree on the name.
+pub(crate) fn story_lock_name(story: &str) -> Result<String> {
+    ensure!(!story.is_empty(), "unsafe story key");
+    Ok(story
+        .bytes()
+        .map(|b| match b {
+            b if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' => (b as char).to_string(),
+            b => format!("%{b:02X}"),
+        })
+        .collect())
 }
 
 /// An open PR whose checks depend on the active approvals.
@@ -161,13 +174,10 @@ pub fn activate(
     let stories: BTreeSet<_> = open.iter().map(|o| o.story.as_str()).collect();
     let mut _held = vec![];
     for s in stories {
-        ensure!(
-            !s.is_empty()
-                && s.bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
-            "unsafe story key"
-        );
-        _held.push(lock(suffix(&format!(".refresh.{s}.lock")))?);
+        _held.push(lock(suffix(&format!(
+            ".refresh.{}.lock",
+            story_lock_name(s)?
+        )))?);
     }
     let (from, to) = (
         candidate.parent().context("no staged directory")?,
