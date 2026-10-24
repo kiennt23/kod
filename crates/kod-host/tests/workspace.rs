@@ -31,3 +31,18 @@ fn process_evidence_and_collection_cannot_be_forged_by_outcome() {
     assert!(ready_to_collect(true, Some("0"), Some("1")).is_err());
     assert!(ready_to_collect(true, Some("1"), Some("0")).is_err());
 }
+#[test]
+fn supported_add_and_delete_patches_pass() {
+    assert!(
+        supported_patch(
+            b"diff --git a/n b/n\nnew file mode 100644\nindex 0000000..bbb\n--- /dev/null\n+++ b/n\n@@ -0,0 +1 @@\n+new\n"
+        )
+        .is_ok()
+    );
+    for mode in ["100644", "100755"] {
+        let patch = format!(
+            "diff --git a/d b/d\ndeleted file mode {mode}\nindex aaa..0000000\n--- a/d\n+++ /dev/null\n@@ -1 +0,0 @@\n-old\n"
+        );
+        assert!(supported_patch(patch.as_bytes()).is_ok());
+    }
+}

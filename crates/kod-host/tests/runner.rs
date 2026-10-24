@@ -223,3 +223,160 @@ fn eval_stop_deadlines_equal_host_deadlines() {
     );
     assert_eq!(kod_eval::connected::ABSENCE, kod_host::deadlines::ABSENCE);
 }
+
+/// Drives `runner::run` against a fake Docker whose collector/exporter bodies
+/// are shell snippets run in the run directory. Returns (run result, whether
+/// the workspace holds a collected result).
+fn drive(collect: &str, export: &str) -> (anyhow::Result<kod_dispatcher::RunState>, bool) {
+    use kod_tool_gateway::forge::Workspace;
+    use std::{fs, os::unix::fs::PermissionsExt, process::Command};
+    let root = tempfile::tempdir().unwrap();
+    let mirror = root.path().join("mirror");
+    fs::create_dir(&mirror).unwrap();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&mirror)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        String::from_utf8(out.stdout).unwrap()
+    };
+    git(&["init", "-q"]);
+    fs::write(mirror.join("a"), "a\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "base"]);
+    let base = git(&["rev-parse", "HEAD"]).trim().to_owned();
+    let dir = root.path().join("run");
+    fs::create_dir(&dir).unwrap();
+    let docker = root.path().join("docker");
+    fs::write(
+        &docker,
+        format!(
+            r#"#!/bin/sh
+[ "$1" = run ] || exit 0
+for a in "$@"; do case $a in kod-agent-*) k=agent;; kod-collect-*) k=collect;; kod-export-*) k=export;; esac; done
+cd '{dir}'
+BASE='{base}'
+case $k in
+agent) printf 0 > agent_out/exit_code; printf 0 > agent_out/agent_procs; echo '{{"end_state":"done"}}' > agent_out/agent.json;;
+collect) cd collect_out; {collect};;
+export) cd export_out; {export};;
+esac
+"#,
+            dir = dir.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+    let spec = kod_eval::connected::ConnectedSpec {
+        run: "run-1".into(),
+        base: base.clone(),
+        mirror,
+        dir,
+        agent_image: "agent".into(),
+        collector_image: "collector".into(),
+        network: "internal".into(),
+        model: "m".into(),
+        max_tokens: 10,
+        budget: kod_eval::case::Budget {
+            max_turns: 2,
+            timeout_secs: 30,
+            memory: "1g".into(),
+            disk: "128m".into(),
+            cpus: 1.0,
+        },
+        prompt: "issue".into(),
+        model_url: "http://model/r/x".into(),
+        mcp_url: "http://tools/r/x".into(),
+    };
+    let workspace = kod_host::workspace::CollectedWorkspace::default();
+    let result = kod_eval::connected::with_docker(&docker, || {
+        kod_host::runner::run(&spec, &SpawnGate::default(), &|| Ok(false), &workspace)
+    });
+    (result, workspace.collected("run-1").is_ok())
+}
+const PATCH_OK: &str = "touch collect_ok; printf 'diff --git a/a b/a\\nindex aaa..bbb 100644\\n--- a/a\\n+++ b/a\\n@@ -1 +1 @@\\n-a\\n+b\\n' > diff.patch";
+const EXPORT_OK: &str = r#"touch export_ok; printf '{"version":1,"base":"%s","files":[{"path":"a","mode":"100644","blob":0}]}' "$BASE" > manifest.json; printf 'b\n' > 0"#;
+#[test]
+fn run_collects_only_through_the_complete_trusted_sequence() {
+    let (result, collected) = drive(PATCH_OK, EXPORT_OK);
+    assert_eq!(result.unwrap(), kod_dispatcher::RunState::Done);
+    assert!(collected);
+}
+#[test]
+fn any_failed_stage_leaves_no_collected_result() {
+    let rename = "touch collect_ok; printf 'diff --git a/a b/b\\nrename from a\\nrename to b\\n' > diff.patch";
+    for (collect, export) in [
+        // missing and symlinked collector markers
+        ("printf x > diff.patch", EXPORT_OK),
+        (
+            "ln -s /etc/passwd collect_ok; printf '' > diff.patch",
+            EXPORT_OK,
+        ),
+        ("touch collect_ok", EXPORT_OK),
+        ("exit 3", EXPORT_OK),
+        // unsupported patch intent
+        (rename, EXPORT_OK),
+        // missing and symlinked export markers
+        (PATCH_OK, "true"),
+        (
+            PATCH_OK,
+            "ln -s /etc/passwd export_ok; cp /dev/null manifest.json",
+        ),
+        // forged base and exporter failure
+        (
+            PATCH_OK,
+            r#"touch export_ok; printf '{"version":1,"base":"wrong","files":[]}' > manifest.json"#,
+        ),
+        (PATCH_OK, "exit 3"),
+    ] {
+        let (result, collected) = drive(collect, export);
+        assert!(result.is_err(), "{collect} / {export}");
+        assert!(!collected, "{collect} / {export}");
+    }
+}
+
+fn stop_with(script: &str) -> bool {
+    use std::{fs, os::unix::fs::PermissionsExt, time::Duration};
+    let dir = tempfile::tempdir().unwrap();
+    let docker = dir.path().join("docker");
+    let state = dir.path().join("gone");
+    fs::write(
+        &docker,
+        script.replace("GONE", &state.display().to_string()),
+    )
+    .unwrap();
+    fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+    kod_eval::connected::with_docker(&docker, || {
+        kod_eval::connected::with_stop_clock(|| {
+            kod_eval::connected::stop_owned(
+                "run-1",
+                &["kod-agent-run-1".into()],
+                Duration::from_secs(5),
+                Duration::from_secs(10),
+            )
+            .is_ok()
+        })
+    })
+}
+#[test]
+fn container_that_exits_by_itself_during_stop_is_stopped() {
+    // inspect and kill fail "No such object", and ps no longer lists it.
+    let ps = "case $1 in ps) [ -f GONE ] || echo container;; inspect) touch GONE; exit 1;; kill) exit 1;; esac\n";
+    assert!(stop_with(&format!("#!/bin/sh\n{ps}")));
+    // inspect succeeds, TERM kill fails because it just exited.
+    let kill = "case $1 in ps) [ -f GONE ] || echo container;; inspect) echo run-1;; kill) touch GONE; exit 1;; esac\n";
+    assert!(stop_with(&format!("#!/bin/sh\n{kill}")));
+}
+#[test]
+fn failing_inspect_or_kill_on_a_listed_container_is_an_error() {
+    assert!(!stop_with(
+        "#!/bin/sh\ncase $1 in ps) echo container;; inspect) exit 1;; esac\n"
+    ));
+    assert!(!stop_with(
+        "#!/bin/sh\ncase $1 in ps) echo container;; inspect) echo run-1;; kill) exit 1;; esac\n"
+    ));
+}

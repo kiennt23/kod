@@ -141,25 +141,35 @@ fn stop_process(
                 continue;
             }
             remaining = true;
-            ensure!(
-                query(
-                    &[
-                        "inspect",
-                        "--format",
-                        "{{ index .Config.Labels \"kod.run\" }}",
-                        name
-                    ],
-                    deadline
-                )?
-                .trim()
-                    == run,
-                "container owner mismatch"
-            );
-            if signaled.insert(name) {
-                query(&["kill", "--signal", "TERM", name], deadline)?;
+            // The container may exit on its own (--rm) between ps and inspect/kill. A
+            // failed call is fine only if a successful ps then proves absence.
+            let owner = match query(
+                &[
+                    "inspect",
+                    "--format",
+                    "{{ index .Config.Labels \"kod.run\" }}",
+                    name,
+                ],
+                deadline,
+            ) {
+                Ok(owner) => owner,
+                Err(e) => {
+                    ensure!(!present(name, deadline).map_err(|_| e)?, "inspect failed");
+                    continue;
+                }
+            };
+            ensure!(owner.trim() == run, "container owner mismatch");
+            if signaled.insert(name)
+                && query(&["kill", "--signal", "TERM", name], deadline).is_err()
+            {
+                ensure!(!present(name, deadline)?, "TERM failed");
+                continue;
             }
-            if elapsed >= term && killed.insert(name) {
-                query(&["kill", "--signal", "KILL", name], deadline)?;
+            if elapsed >= term
+                && killed.insert(name)
+                && query(&["kill", "--signal", "KILL", name], deadline).is_err()
+            {
+                ensure!(!present(name, deadline)?, "KILL failed");
             }
         }
         let joined = match child.as_mut() {
