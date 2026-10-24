@@ -542,6 +542,7 @@ fn rejected_creates_allow_retry_and_do_not_claim_uncertain_outcomes() {
         h.store.lock().unwrap().reject_create = Some(status);
         let error = h.github.status_comment("acme/app#1", "first").unwrap_err();
         assert!(!format!("{error:#}").contains("unknown"));
+        assert_eq!(write_outcome(&error), WriteOutcome::NotApplied);
         h.github.status_comment("acme/app#1", "retry").unwrap();
         h.store.lock().unwrap().comments.clear();
     }
@@ -569,6 +570,7 @@ fn malformed_successful_create_stays_uncertain_until_reconciled() {
     h.store.lock().unwrap().malformed_create = true;
     let error = h.github.status_comment("acme/app#1", "first").unwrap_err();
     assert!(format!("{error:#}").contains("outcome unknown"));
+    assert_eq!(write_outcome(&error), WriteOutcome::Uncertain);
     h.store.lock().unwrap().hidden_comments = true;
     assert!(h.github.status_comment("acme/app#1", "retry").is_err());
     h.store.lock().unwrap().hidden_comments = false;

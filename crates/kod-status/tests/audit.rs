@@ -175,3 +175,56 @@ fn an_outcome_audit_failure_is_explicit_after_a_remote_attempt() {
         assert_eq!(tracker.inner.comments("FAKE-1").len(), usize::from(!failed));
     }
 }
+
+#[test]
+fn the_writer_hook_runs_after_the_intent_and_replaces_the_tracker_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("audit.db");
+    let audit = AuditLog::open(&path).unwrap();
+    let (tracker, _) = sandbox();
+    let seen = std::cell::Cell::new(None);
+    kod_status::refresh_with_writer(
+        &Memory(common::snapshot()),
+        &tracker,
+        &audit,
+        "FAKE-1",
+        |story, _text, intent| {
+            assert_eq!(story, "FAKE-1");
+            seen.set(Some(intent));
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(seen.get(), Some(1));
+    assert!(tracker.comments("FAKE-1").is_empty());
+    let kinds: Vec<_> = events(&path)
+        .iter()
+        .map(|r| r["kind"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            "workflow_status_comment_intent",
+            "workflow_status_comment_posted"
+        ]
+    );
+}
+
+#[test]
+fn a_refused_writer_records_a_failure_not_a_posted_comment() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("audit.db");
+    let audit = AuditLog::open(&path).unwrap();
+    let (tracker, _) = sandbox();
+    let error = kod_status::refresh_with_writer(
+        &Memory(common::snapshot()),
+        &tracker,
+        &audit,
+        "FAKE-1",
+        |_, _, _| anyhow::bail!("status write unresolved"),
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("unresolved"));
+    assert!(tracker.comments("FAKE-1").is_empty());
+    assert_eq!(events(&path)[1]["kind"], "workflow_status_comment_failed");
+}

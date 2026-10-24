@@ -84,16 +84,31 @@ fn name(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
 }
 
-#[derive(Debug)]
-struct UncertainWrite;
+/// Whether a failed GitHub write may have changed the remote. Carried as an error context; an
+/// untagged failure is `Uncertain`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteOutcome {
+    NotApplied,
+    Uncertain,
+}
 
-impl std::fmt::Display for UncertainWrite {
+impl std::fmt::Display for WriteOutcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("GitHub write outcome unknown; reconcile before retry")
+        f.write_str(match self {
+            Self::NotApplied => "GitHub write was not applied",
+            Self::Uncertain => "GitHub write outcome unknown; reconcile before retry",
+        })
     }
 }
 
-impl std::error::Error for UncertainWrite {}
+impl std::error::Error for WriteOutcome {}
+
+pub fn write_outcome(error: &anyhow::Error) -> WriteOutcome {
+    error
+        .downcast_ref::<WriteOutcome>()
+        .copied()
+        .unwrap_or(WriteOutcome::Uncertain)
+}
 
 impl GitHub {
     #[cfg(any(test, feature = "test-support"))]
@@ -253,7 +268,7 @@ impl GitHub {
         let mut response = request.send().map_err(|error| {
             let error = anyhow::Error::new(error.without_url()).context("GitHub request failed");
             if write {
-                error.context(UncertainWrite)
+                error.context(WriteOutcome::Uncertain)
             } else {
                 error
             }
@@ -282,7 +297,7 @@ impl GitHub {
         })()
         .map_err(|error| {
             if write {
-                error.context(UncertainWrite)
+                error.context(WriteOutcome::Uncertain)
             } else {
                 error
             }
@@ -294,9 +309,18 @@ impl GitHub {
         let write = method != Method::GET;
         let (status, value) = self.request(method, path, body)?;
         if write && status.is_server_error() {
-            return Err(anyhow::anyhow!("GitHub returned HTTP {status}").context(UncertainWrite));
+            return Err(
+                anyhow::anyhow!("GitHub returned HTTP {status}").context(WriteOutcome::Uncertain)
+            );
         }
-        ensure!(status.is_success(), "GitHub returned HTTP {status}");
+        if !status.is_success() {
+            let error = anyhow::anyhow!("GitHub returned HTTP {status}");
+            return Err(if write && status.is_client_error() {
+                error.context(WriteOutcome::NotApplied)
+            } else {
+                error
+            });
+        }
         Ok(value)
     }
 
@@ -619,8 +643,9 @@ impl Tracker for GitHub {
                 &json!({"title": format!("Rework for {story}: {}", fields.artifact), "body": body}),
             ),
         )?;
-        let raw: RawIssue = serde_json::from_value(value).context(UncertainWrite)?;
-        self.bind(&raw, raw.number).context(UncertainWrite)?;
+        let raw: RawIssue = serde_json::from_value(value).context(WriteOutcome::Uncertain)?;
+        self.bind(&raw, raw.number)
+            .context(WriteOutcome::Uncertain)?;
         let key = self.key(raw.number);
         self.call(
             Method::POST,
@@ -686,7 +711,11 @@ impl Tracker for GitHub {
         let longest = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
         let fence = "`".repeat(3.max(longest + 1));
         let body = format!("{STATUS}\n\n{fence}text\n{text}\n{fence}");
-        ensure!(body.len() <= 60_000, "status comment too large");
+        if body.len() > 60_000 {
+            return Err(
+                anyhow::anyhow!("status comment too large").context(WriteOutcome::NotApplied)
+            );
+        }
         let comments = self.status_comments(number)?;
         if let Some(existing) = comments.first() {
             self.call(
@@ -710,13 +739,13 @@ impl Tracker for GitHub {
         let value = match result {
             Ok(value) => value,
             Err(error) => {
-                if error.downcast_ref::<UncertainWrite>().is_none() {
+                if write_outcome(&error) == WriteOutcome::NotApplied {
                     uncertain.remove(&number);
                 }
                 return Err(error);
             }
         };
-        let comment: Comment = serde_json::from_value(value).context(UncertainWrite)?;
+        let comment: Comment = serde_json::from_value(value).context(WriteOutcome::Uncertain)?;
         ensure!(
             comment.user.id == self.config.comment_author_id
                 && comment.user.kind == "Bot"

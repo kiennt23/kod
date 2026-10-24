@@ -365,6 +365,7 @@ pub struct Dispatcher {
     tracker_transitions: Mutex<()>,
     /// The signed CLI's keys, by login.
     cli_keys: HashMap<String, Vec<u8>>,
+    admission_guard: Arc<dyn Fn() -> bool + Send + Sync>,
 }
 
 impl Dispatcher {
@@ -389,6 +390,7 @@ impl Dispatcher {
             global_stop: Mutex::new(()),
             tracker_transitions: Mutex::new(()),
             cli_keys: HashMap::new(),
+            admission_guard: Arc::new(|| true),
         };
         d.recover()?;
         Ok(d)
@@ -489,6 +491,15 @@ impl Dispatcher {
         self.work_at(now())
     }
 
+    pub fn with_admission_guard(mut self, guard: Arc<dyn Fn() -> bool + Send + Sync>) -> Self {
+        self.admission_guard = guard;
+        self
+    }
+
+    pub fn work_once_with_admission(&self, allow: bool) -> Result<bool> {
+        self.work_at_with_admission(now(), allow)
+    }
+
     /// Handles the next due delivery, makes the due follow-ups, then starts
     /// queued runs. Returns whether there was a delivery. Deliveries that can
     /// stop a run go first and never wait; a ticket's labels keep their
@@ -496,15 +507,20 @@ impl Dispatcher {
     /// fails is retried with backoff, without holding up other tickets, and
     /// after `MAX_ATTEMPTS` it is a dead letter, reported on its ticket.
     pub fn work_at(&self, now: i64) -> Result<bool> {
+        self.work_at_with_admission(now, true)
+    }
+
+    fn work_at_with_admission(&self, now: i64, allow: bool) -> Result<bool> {
+        let allow = allow && (self.admission_guard)();
         let next: Option<(String, String, String, i64)> = self
             .db()
             .query_row(
                 "SELECT id, ticket, event, attempts FROM deliveries d
-                 WHERE done = 0 AND next_at <= ?1 AND (d.priority = 0 OR NOT EXISTS (
+                 WHERE done = 0 AND next_at <= ?1 AND (?2 OR d.priority = 0) AND (d.priority = 0 OR NOT EXISTS (
                      SELECT 1 FROM deliveries e
                      WHERE e.done = 0 AND e.ticket = d.ticket AND e.rowid < d.rowid))
                  ORDER BY priority, rowid LIMIT 1",
-                [now],
+                params![now, allow],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?;
@@ -538,7 +554,9 @@ impl Dispatcher {
             }
         }
         self.follow_up(now)?;
-        self.start_queued()?;
+        if allow {
+            self.start_queued()?;
+        }
         self.follow_up(now)?;
         Ok(next.is_some())
     }
@@ -607,6 +625,9 @@ impl Dispatcher {
         }
         let mut c = self.db();
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !(self.admission_guard)() {
+            return Ok(());
+        }
         let pending: bool = tx.query_row(
             "SELECT done = 0 FROM deliveries WHERE id = ?1",
             [delivery],
@@ -705,7 +726,7 @@ impl Dispatcher {
             let claimed = {
                 let mut c = self.db();
                 let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                if Self::halted(&tx)? {
+                if Self::halted(&tx)? || !(self.admission_guard)() {
                     return Ok(());
                 }
                 let claimed = tx.execute(
