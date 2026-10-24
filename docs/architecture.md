@@ -43,14 +43,16 @@ Google Docs is planned (sub-plan 9, not started). Until then approved documents 
 
 ## Level 2: Containers
 
+Split in two views so each stays readable: 2a is the runtime path, 2b is control and evidence.
+
+### Level 2a: Runtime path
+
 ```mermaid
 flowchart TB
   eng["<b>Engineer</b><br/>Person<br/>Requester"]
   kill["<b>Owner / backup / tech lead</b><br/>Person<br/>Kill switch"]
-  aud["<b>Auditor</b><br/>Person<br/>Verifies audit"]
   gh["<b>GitHub</b><br/>External system<br/>Issues, repos, Actions"]
   llm["<b>Model providers</b><br/>External system"]
-  cp["<b>Checkpoint store</b><br/>External system<br/>Off-host, write-once"]
 
   subgraph untrusted["Untrusted local execution"]
     sandbox["<b>Run sandbox</b><br/>[Docker, gVisor planned]<br/>Agent, shell, builds, tests, no secrets"]
@@ -66,17 +68,9 @@ flowchart TB
     dispdb[("<b>Dispatcher DB</b><br/>[SQLite]<br/>Queue, runs, follow-ups")]
   end
 
-  subgraph trusted["Trusted zone, no agent code"]
-    policy["<b>kod-policy</b><br/>[In-process lib, Rego]<br/>Allow or deny, default deny"]
-    auditdb[("<b>Audit log</b><br/>[SQLite, hash chain]<br/>Append-only evidence")]
-    verifier["<b>Audit verifier</b><br/>[kod-audit, off-host]<br/>verify, checkpoint capture"]
-    gates["<b>Gate runner</b><br/>[kod-gates, separate host]<br/>Tests, scans, required checks"]
-    status["<b>kod-status</b><br/>[CLI]<br/>Computed story status"]
-    evalh["<b>kod-eval</b><br/>[Offline harness]<br/>Cases, scoring, compare"]
-  end
-
   gh -->|"Signed webhooks, HTTPS"| disp
   eng -->|"Labels, reviews"| gh
+  kill -->|"Signed CLI"| disp
   disp -->|"Reads, writes"| dispdb
   host -->|"Hosts, implements Gateway"| disp
   host -->|"Mounts"| toolgw
@@ -88,12 +82,50 @@ flowchart TB
   collector -->|"Patch output"| host
   toolgw -->|"Publish, comments"| gh
   llmgw -->|"Upstream calls"| llm
-  disp -->|"Checks"| policy
-  toolgw -->|"Checks"| policy
-  llmgw -->|"Checks"| policy
-  disp -->|"Appends"| auditdb
-  toolgw -->|"Appends"| auditdb
-  llmgw -->|"Appends"| auditdb
+  classDef person fill:#08427b,stroke:#052e56,color:#fff
+  classDef internal fill:#1168bd,stroke:#0b4884,color:#fff
+  classDef component fill:#85bbf0,stroke:#5d82a8,color:#000
+  classDef db fill:#1168bd,stroke:#0b4884,color:#fff
+  classDef ext fill:#999,stroke:#6b6b6b,color:#fff
+  classDef planned stroke-dasharray:5 5,stroke-width:2px
+  class eng,kill person
+  class sandbox,runner,collector,host,toolgw,llmgw,disp internal
+  class dispdb db
+  class gh,llm ext
+  class host planned
+```
+
+Untrusted zone: only the sandbox, runner and collector run agent or repo code. They get opaque gateway tokens, no GitHub or model keys, no host filesystem or Docker socket, and an egress allowlist. Today the offline harness (`kod-eval`) starts them; `kod-host` taking over that role is planned.
+Gateway zone: every external write passes policy, then an audit intent, then the call. Policy is a library inside each gateway and the dispatcher, not a service. The tool and LLM gateways exist today and run in one process; `kod-host` (planned, 6b-b) is the composition binary, and 6b-a adds the GitHub broker and forge to the tool gateway.
+Policy (`kod-policy`) and the audit log are not drawn here; policy and audit wiring: see 2b.
+
+### Level 2b: Control and evidence
+
+```mermaid
+flowchart TB
+  aud["<b>Auditor</b><br/>Person<br/>Verifies audit"]
+  gh["<b>GitHub</b><br/>External system<br/>Required checks"]
+  cp["<b>Checkpoint store</b><br/>External system<br/>Off-host, write-once"]
+  runner["<b>kod-loop / runner</b><br/>[Rust, pluggable]<br/>Agent loop, Claude Code also conforms"]
+  dispdb[("<b>Dispatcher DB</b><br/>[SQLite]<br/>Queue, runs, follow-ups")]
+
+  subgraph enf["Enforcement points"]
+    disp["<b>Dispatcher</b><br/>[kod-dispatcher]<br/>Webhook, WIP, run states, kill"]
+    toolgw["<b>Tool gateway</b><br/>[kod-tool-gateway, MCP]<br/>Tracker, docs, publish, run tokens"]
+    llmgw["<b>LLM gateway</b><br/>[kod-llm-proxy]<br/>Budgets, routing, redacted capture"]
+  end
+
+  subgraph trusted["Trusted zone, no agent code"]
+    policy["<b>kod-policy</b><br/>[In-process lib, Rego]<br/>Allow or deny, default deny"]
+    auditdb[("<b>Audit log</b><br/>[SQLite, hash chain]<br/>Append-only evidence")]
+    verifier["<b>Audit verifier</b><br/>[kod-audit, off-host]<br/>verify, checkpoint capture"]
+    gates["<b>Gate runner</b><br/>[kod-gates, separate host]<br/>Tests, scans, required checks"]
+    status["<b>kod-status</b><br/>[CLI]<br/>Computed story status"]
+    evalh["<b>kod-eval</b><br/>[Offline harness]<br/>Cases, scoring, compare"]
+  end
+
+  enf -->|"Checks every action"| policy
+  enf -->|"Appends intent and outcome"| auditdb
   auditdb -->|"Checkpoints"| cp
   verifier -->|"Reads"| cp
   verifier -->|"Verifies"| auditdb
@@ -102,7 +134,6 @@ flowchart TB
   gates -->|"Appends"| auditdb
   status -->|"Reads"| dispdb
   status -->|"Reads"| auditdb
-  kill -->|"Signed CLI"| disp
   evalh -->|"Runs offline cases"| runner
   classDef person fill:#08427b,stroke:#052e56,color:#fff
   classDef internal fill:#1168bd,stroke:#0b4884,color:#fff
@@ -110,15 +141,12 @@ flowchart TB
   classDef db fill:#1168bd,stroke:#0b4884,color:#fff
   classDef ext fill:#999,stroke:#6b6b6b,color:#fff
   classDef planned stroke-dasharray:5 5,stroke-width:2px
-  class eng,kill,aud person
-  class sandbox,runner,collector,host,toolgw,llmgw,disp,policy,verifier,gates,status,evalh internal
+  class aud person
+  class runner,disp,toolgw,llmgw,policy,verifier,gates,status,evalh internal
   class dispdb,auditdb db
-  class gh,llm,cp ext
-  class host planned
+  class gh,cp ext
 ```
 
-Untrusted zone: only the sandbox, runner and collector run agent or repo code. They get opaque gateway tokens, no GitHub or model keys, no host filesystem or Docker socket, and an egress allowlist. Today the offline harness (`kod-eval`) starts them; `kod-host` taking over that role is planned.
-Gateway zone: every external write passes policy, then an audit intent, then the call. Policy is a library inside each gateway and the dispatcher, not a service. The tool and LLM gateways exist today and run in one process; `kod-host` (planned, 6b-b) is the composition binary, and 6b-a adds the GitHub broker and forge to the tool gateway.
 Trusted zone: gates run on a separate host and never share a sandbox or cache. The audit chain is checked off-host against write-once checkpoints. `kod-status` reads records and has no store of its own; `kod-eval` is offline and not part of the runtime path.
 Not drawn: the owner's and backup's kill switch keeps working when policy or audit is down; there is no third database. Gate scanners run in their own images (`images/gates`).
 
