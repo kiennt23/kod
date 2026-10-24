@@ -61,7 +61,15 @@ impl Record {
 }
 pub(super) struct Store {
     root: PathBuf,
-    _lock: File,
+    lock: File,
+}
+impl Drop for Store {
+    fn drop(&mut self) {
+        // flock belongs to the open file description, which a concurrently forked child
+        // shares until its exec closes the O_CLOEXEC fd; closing ours alone would leave the
+        // lease held. Unlocking releases it for every holder of the description.
+        let _ = self.lock.unlock();
+    }
 }
 pub(super) fn owner() -> u32 {
     // SAFETY: getuid has no preconditions and cannot fail.
@@ -113,7 +121,7 @@ impl Store {
             .context("GitHub lease directory already owned")?;
         Ok(Self {
             root: root.to_owned(),
-            _lock: lock,
+            lock,
         })
     }
     pub fn load(&self) -> Result<BTreeMap<String, Record>> {
