@@ -176,46 +176,124 @@ fn evidence_comes_from_the_binding_and_the_returned_pull_identity() {
     );
 }
 
-#[test]
-fn status_snapshot_pins_current_revisions_and_fails_on_source_errors() {
-    let w = world();
-    let snap = w.root.join("gate.json");
-    put(
-        &w.root,
-        "gate.json",
-        &json!({"story": "S-1", "requester": "ann", "required": ["design"], "current": {}})
-            .to_string(),
+fn tracker() -> kod_tracker::fake::FakeTracker {
+    use kod_tracker::fake::{FAKE_MAPPING, FakeIssue, FakeTracker};
+    let t = FakeTracker::new(
+        kod_tracker::mapping::Mapping::parse("m", FAKE_MAPPING).unwrap(),
+        "s",
     );
-    let tracker = kod_gates::records::HostRecords(snap);
+    let issue = |reporter: &str, links: &[&str]| FakeIssue {
+        title: "t".into(),
+        body: "b".into(),
+        acceptance_criteria: vec![],
+        reporter: reporter.into(),
+        workflow_state: "Backlog".into(),
+        fields: Default::default(),
+        approved_versions: vec!["design".into()],
+        links: links.iter().map(|l| l.to_string()).collect(),
+    };
+    t.add_member("ann");
+    t.add_issue("S-1", issue("ann", &["T-1", "T-2"]));
+    t.add_issue("T-1", issue("ann", &[]));
+    t.add_issue("T-2", issue("mallory", &[]));
+    t.add_issue("S-2", issue("mallory", &[]));
+    t
+}
+fn snap(
+    w: &World,
+    t: &dyn kod_tracker::Tracker,
+    story: &str,
+) -> anyhow::Result<kod_status::records::Snapshot> {
     let artifacts = kod_host::artifacts::Artifacts::new(
         w.config.paths.approval_manifest.clone(),
         &w.config.paths.policy_dir,
-    )
-    .unwrap();
-    let s = records::snapshot(
-        &tracker,
+    )?;
+    records::snapshot(
+        t,
         &artifacts,
-        "S-1",
+        story,
         &|_| kod_status::Stage::Design,
         vec![],
+        vec![],
     )
-    .unwrap();
+}
+
+#[test]
+fn status_snapshot_pins_current_revisions_and_fails_on_source_errors() {
+    let w = world();
+    let t = tracker();
+    let s = snap(&w, &t, "S-1").unwrap();
     assert_eq!(s.artifacts[0].approved.as_deref(), Some("design-v3"));
-    assert!(s.rework.is_empty());
     let out = w.root.join("records.json");
     records::write_atomic(&out, &serde_json::to_vec(&s).unwrap()).unwrap();
     assert_eq!(
         std::fs::metadata(&out).unwrap().permissions().mode() & 0o777,
         0o600
     );
+    assert!(snap(&w, &t, "S-3").is_err(), "unknown story");
+    // A linked ticket the tracker cannot read fails the whole snapshot.
+    let mut broken = t.issue("S-1").unwrap();
+    broken.links.push("T-404".into());
+    t.add_issue("S-1", broken);
+    assert!(snap(&w, &t, "S-1").is_err());
+    // An approved link missing from the manifest fails closed.
+    let mut unknown = t.issue("S-1").unwrap();
+    unknown.links.pop();
+    unknown.approved_versions = vec!["removed".into()];
+    t.add_issue("S-1", unknown);
+    assert!(snap(&w, &t, "S-1").is_err());
+}
+
+#[test]
+fn the_status_snapshot_respects_the_tracker_audience() {
+    let w = world();
+    let t = tracker();
+    let s = snap(&w, &t, "S-1").unwrap();
+    let keys: Vec<_> = s.tickets.iter().map(|i| i.key.as_str()).collect();
+    assert_eq!(keys, ["T-1"], "a ticket from outside the team is left out");
     assert!(
-        records::snapshot(
-            &tracker,
-            &artifacts,
-            "S-2",
-            &|_| kod_status::Stage::Design,
-            vec![]
-        )
-        .is_err()
+        snap(&w, &t, "S-2").is_err(),
+        "a story from outside the team is refused"
     );
+}
+
+#[test]
+fn a_conflicting_artifact_path_fails_before_any_invalidation_or_copy() {
+    let w = world();
+    let before = active_text(&w);
+    // The staged v4 file collides with different content already in the active directory.
+    put(&w.root.join("active"), "design-v4.txt", "squatter");
+    stage(&w.root.join("staged"), "design-v4", "v4 text");
+    let called = Cell::new(false);
+    let err = records::activate(
+        &w.config,
+        &w.root.join("staged/manifest.json"),
+        &open(),
+        &|_| {
+            called.set(true);
+            Ok(())
+        },
+    );
+    assert!(format!("{:#}", err.unwrap_err()).contains("already holds other content"));
+    assert!(!called.get(), "nothing was invalidated");
+    assert_eq!(active_text(&w), before);
+    assert_eq!(
+        std::fs::read_to_string(w.root.join("active/design-v4.txt")).unwrap(),
+        "squatter"
+    );
+}
+
+#[test]
+fn the_cli_never_publishes_without_a_live_open_pull_source() {
+    let w = world();
+    let before = active_text(&w);
+    stage(&w.root.join("staged"), "design-v4", "v4 text");
+    let err = records::activate_cli(&w.config, &w.root.join("staged/manifest.json"));
+    assert!(format!("{:#}", err.unwrap_err()).contains("nothing was published"));
+    assert_eq!(active_text(&w), before);
+    assert!(!w.root.join("active/design-v4.txt").exists());
+    // A bad candidate is refused on its own merits first.
+    stage(&w.root.join("bad"), "design-v3", "other text");
+    let err = records::activate_cli(&w.config, &w.root.join("bad/manifest.json"));
+    assert!(format!("{:#}", err.unwrap_err()).contains("immutable artifact revision changed"));
 }

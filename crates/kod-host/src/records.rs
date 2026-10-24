@@ -4,7 +4,7 @@ use anyhow::{Context, Result, ensure};
 use kod_gates::Evidence;
 use kod_status::{
     Stage,
-    records::{Artifact as StatusArtifact, Pull, Snapshot},
+    records::{Artifact as StatusArtifact, Pull, ReworkRecord, Snapshot},
 };
 use kod_tracker::Tracker;
 use std::{
@@ -56,21 +56,37 @@ pub fn evidence(
 }
 
 /// Fresh tracker reads; any required source error fails the whole snapshot.
-/// Rework stays empty (unknown) because the tracker cannot report its kind or target.
+/// Audience is the tracker team: a story whose reporter is outside it is refused, and an
+/// out-of-audience linked ticket is left out (unknown to the status view).
+/// `rework` comes from the dispatcher's records: kod-status renders an empty list as "none"
+/// (kod-status/src/lib.rs:160-161), so this function never invents one.
+/// Artifact `draft` and `in_review` are unknown here, not "none"; the snapshot carries the
+/// approved revision only.
 pub fn snapshot(
     tracker: &dyn Tracker,
     artifacts: &Artifacts,
     story: &str,
     stage_of: &dyn Fn(&str) -> Stage,
     pulls: Vec<Pull>,
+    rework: Vec<ReworkRecord>,
 ) -> Result<Snapshot> {
     let issue = tracker.get_issue(story)?;
     ensure!(issue.key == story, "tracker returned another story");
-    let tickets = issue
+    ensure!(
+        tracker.is_team_member(&issue.reporter)?,
+        "story reporter is outside the tracker audience"
+    );
+    let mut tickets = vec![];
+    for key in issue
         .links
         .iter()
-        .map(|k| tracker.get_issue(k))
-        .collect::<Result<Vec<_>>>()?;
+        .filter(|k| !rework.iter().any(|r| &r.key == *k))
+    {
+        let t = tracker.get_issue(key)?;
+        if tracker.is_team_member(&t.reporter)? {
+            tickets.push(t);
+        }
+    }
     let (pins, _) = artifacts.pins(&issue.approved_versions)?;
     let artifacts = pins
         .into_iter()
@@ -87,7 +103,7 @@ pub fn snapshot(
         tickets,
         artifacts,
         pulls,
-        rework: vec![],
+        rework,
     })
 }
 
@@ -153,20 +169,24 @@ pub fn activate(
         );
         _held.push(lock(suffix(&format!(".refresh.{s}.lock")))?);
     }
-    for o in open {
-        invalidate(&o.head)?;
-    }
     let (from, to) = (
         candidate.parent().context("no staged directory")?,
         active.parent().context("no active directory")?,
     );
+    // Refuse conflicting destinations before any check is invalidated or any file copied.
+    for a in &manifest.artifacts {
+        let dest = to.join(&a.path);
+        ensure!(
+            !dest.exists() || std::fs::read(&dest)? == std::fs::read(from.join(&a.path))?,
+            "artifact path already holds other content"
+        );
+    }
+    for o in open {
+        invalidate(&o.head)?;
+    }
     for a in &manifest.artifacts {
         let dest = to.join(&a.path);
         if dest.exists() {
-            ensure!(
-                std::fs::read(&dest)? == std::fs::read(from.join(&a.path))?,
-                "artifact path already holds other content"
-            );
             continue;
         }
         if let Some(dir) = dest.parent() {
@@ -178,4 +198,18 @@ pub fn activate(
     }
     write_atomic(active, &std::fs::read(candidate)?)?;
     Ok(())
+}
+
+/// The CLI entry. Open PR heads must come from a live provider read, which Task 7's assembly
+/// provides; without one, activation cannot prove stale checks are invalidated, so it validates
+/// the staged directory and refuses. It never publishes.
+pub fn activate_cli(config: &FsConfig, candidate: &Path) -> Result<()> {
+    Artifacts::new(
+        config.paths.approval_manifest.clone(),
+        &config.paths.policy_dir,
+    )?
+    .validate(candidate)?;
+    anyhow::bail!(
+        "snapshot activation requires a live open-pull source from the connected service assembly; nothing was published"
+    )
 }

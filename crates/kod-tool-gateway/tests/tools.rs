@@ -249,3 +249,19 @@ fn a_doc_outside_the_runs_admitted_classes_is_not_returned() {
     let result = h.gw.call(TOKEN, "read_doc", &json!({"id": LINKED_DOC}));
     assert!(result.is_err(), "{result:?}");
 }
+
+#[test]
+fn a_run_pinned_to_v3_cannot_read_an_approved_but_unpinned_revision() {
+    let h = harness();
+    // v4 is a real, approved doc and the issue lists it, but this run was admitted at v3.
+    let v4 = "https://docs.example/brief?rev=4";
+    h.docs.add(v4, "the newer brief");
+    let mut issue = h.tracker.issue("FAKE-1").unwrap();
+    issue.approved_versions.push(v4.into());
+    h.tracker.add_issue("FAKE-1", issue);
+    let e =
+        h.gw.call(TOKEN, "read_doc", &json!({"id": v4}))
+            .unwrap_err();
+    assert!(e.starts_with("refused by policy"), "{e}");
+    assert!(!e.contains("newer brief"));
+}
