@@ -1,5 +1,8 @@
 name: ci
-on: [push, pull_request]
+on:
+  push:
+    branches: [main]
+  pull_request:
 permissions:
   contents: read
 jobs:
@@ -33,3 +36,20 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: docker build -t kod-gates-test --build-arg RUST_VERSION=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml) -f images/gates/Dockerfile .
       - run: KOD_GATE_TEST_IMAGE=$(docker image inspect kod-gates-test --format '{{.Id}}') KOD_DOCKER_BIN=$(command -v docker) cargo test -p kod-gates
+  connected:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    needs: check
+    env:
+      KOD_DOCKER_TESTS: "1"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: rustup show
+      - run: docker build -t kod-connected-sandbox --build-arg RUST_VERSION=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml) -f images/sandbox/Dockerfile .
+      # The host requires an exact sha256 digest reference; a local registry gives the image a real RepoDigest.
+      - run: |
+          docker run -d --name reg -p 5000:5000 registry:2
+          docker tag kod-connected-sandbox localhost:5000/kod-connected-sandbox
+          until docker push localhost:5000/kod-connected-sandbox; do sleep 2; done
+          echo "KOD_CONNECTED_IMAGE=$(docker inspect --format '{{index .RepoDigests 0}}' localhost:5000/kod-connected-sandbox)" >> "$GITHUB_ENV"
+      - run: KOD_ACCEPTANCE_STOP_IMAGE=kod-connected-sandbox cargo test -p kod-host --features connected-test-support --test connected_docker --test connected_lifecycle -- --include-ignored --test-threads=1

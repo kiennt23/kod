@@ -8,6 +8,14 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
+    Accept {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        evidence: PathBuf,
+        #[arg(long, value_enum)]
+        mode: kod_host::acceptance::Mode,
+    },
     Check {
         #[arg(long)]
         config: PathBuf,
@@ -30,6 +38,28 @@ enum Snapshot {
 }
 fn main() -> Result<()> {
     match Cli::parse().command {
+        Command::Accept {
+            config,
+            evidence,
+            mode,
+        } => {
+            let result = (|| -> Result<i32> {
+                let config = kod_host::config::FsConfig::parse(&config)?;
+                let runtime = tokio::runtime::Runtime::new()?;
+                let report = runtime.block_on(kod_host::acceptance::run(&config, &evidence, mode));
+                // A stuck blocking task must not keep the process alive after the report exists.
+                runtime.shutdown_timeout(std::time::Duration::from_secs(5));
+                Ok(report?.exit_code())
+            })();
+            let code = match result {
+                Ok(code) => code,
+                Err(_) => {
+                    eprintln!("acceptance blocked: configuration or evidence unavailable");
+                    2
+                }
+            };
+            std::process::exit(code);
+        }
         Command::Check { config } => {
             kod_host::config::FsConfig::load(&config)?;
             println!("configuration valid");

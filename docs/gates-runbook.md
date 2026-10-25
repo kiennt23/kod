@@ -8,6 +8,11 @@ head. This branch does not change live GitHub rules or install a host.
 
 ## Build and host isolation
 
+The connected host merged in #40. Its [acceptance runbook](connected-runbook.md)
+distinguishes local fixture evidence from live App-bound checks. Gate scanners
+still require their own host/daemon and caches; composing the gateways in
+`kod-host` does not move scanners into the sandbox host.
+
 Build the binary from reviewed main, never from the PR being checked:
 
 ```sh

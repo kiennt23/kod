@@ -48,6 +48,9 @@ impl FsConfig {
     }
     pub fn validate_local(&self) -> Result<()> {
         self.validate_paths()?;
+        if let Some(acceptance) = &self.acceptance {
+            acceptance.validate(self)?;
+        }
         let p = &self.paths;
         let policy = canonical(&p.policy_dir)?;
         let g = &self.github;

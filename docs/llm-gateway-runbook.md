@@ -1,6 +1,6 @@
 # LLM gateway runbook
 
-`kod-llm-proxy` is the LLM gateway: the only way out of a sandbox, and the only holder of the model key. It serves the Anthropic Messages API on two paths, `/v1/messages` and `/v1/messages/count_tokens`. Today `kod-eval run` starts one gateway container per case; the binary itself is a long-running service that serves every run listed in `runs.json`. It is built by `images/proxy/Dockerfile` (see the README).
+`kod-llm-proxy` is the LLM gateway: the only holder of the model key. It serves the Anthropic Messages API on `/v1/messages` and `/v1/messages/count_tokens`. Offline `kod-eval run` starts one gateway container per case using static `runs.json`; the standalone binary is built by `images/proxy/Dockerfile`. Connected [`kod-host`](kod-host-runbook.md) embeds the same router with dynamic registration, irreversible revocation and durable reservation/settlement callbacks to the dispatcher store. [Connected acceptance](connected-runbook.md) verifies the composed path.
 
 ## What you configure
 
@@ -37,7 +37,7 @@ Take the numbers from the provider's price page. A model without a price stops t
                  "data_classes": ["placeholder"], "max_tokens": 2000000,
                  "max_cost_micro_usd": 5000000}}
 
-Both budgets must be above zero. The file is read at start, so a new run needs a gateway start; `kod-eval` writes it for you from `--prices`, `--run-max-tokens` and `--run-max-cost-micro-usd`.
+Both budgets must be above zero. The standalone binary reads this file at start; `kod-eval` writes it from `--prices`, `--run-max-tokens` and `--run-max-cost-micro-usd`. Connected runs use the host-only `RunRegistry` instead: identical registrations preserve spend, changed or tombstoned IDs are refused, and no registration HTTP route is exposed. Local revocation cancels queued and active forwarding; it cannot promise that a remote provider immediately stops billing. Unknown dispatched usage retains the full reservation.
 
 ## How a run reaches it
 

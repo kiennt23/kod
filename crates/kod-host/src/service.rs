@@ -255,6 +255,44 @@ fn private_subdir(path: &std::path::Path) -> Result<std::path::PathBuf> {
     Ok(path.to_owned())
 }
 
+#[derive(Clone)]
+enum AdapterOrigin {
+    Production,
+    #[cfg(feature = "connected-test-support")]
+    Loopback(String, Option<Arc<crate::acceptance::SuiteBudget>>),
+}
+impl AdapterOrigin {
+    /// Acceptance only: the suite-wide ledger every model request must reserve against.
+    fn suite(&self) -> Option<Arc<crate::acceptance::SuiteBudget>> {
+        match self {
+            Self::Production => None,
+            #[cfg(feature = "connected-test-support")]
+            Self::Loopback(_, suite) => suite.clone(),
+        }
+    }
+    fn open(
+        &self,
+        config: &crate::config::FsConfig,
+        dir: &std::path::Path,
+    ) -> Result<kod_tool_gateway::github::GitHub> {
+        match self {
+            Self::Production => kod_tool_gateway::github::GitHub::new(
+                config.github.product.clone(),
+                config.github.app.clone(),
+                dir,
+            ),
+            #[cfg(feature = "connected-test-support")]
+            Self::Loopback(api, _) => kod_tool_gateway::github::GitHub::with_test_api(
+                config.github.product.clone(),
+                config.github.app.clone(),
+                dir,
+                api,
+                Arc::new(system_now),
+            ),
+        }
+    }
+}
+
 struct Assembled {
     runtime: Arc<crate::runtime::Runtime>,
     registry: kod_llm_proxy::RunRegistry,
@@ -267,7 +305,11 @@ struct Assembled {
 }
 
 /// Blocking: GitHub's HTTP client owns a runtime that must not be built or dropped on an async thread.
-fn assemble(config: &Arc<crate::config::FsConfig>, parts: Parts) -> Result<Assembled> {
+fn assemble(
+    config: &Arc<crate::config::FsConfig>,
+    parts: Parts,
+    origin: &AdapterOrigin,
+) -> Result<Assembled> {
     use anyhow::Context;
     let p = &config.paths;
     let m = &config.model;
@@ -300,14 +342,15 @@ fn assemble(config: &Arc<crate::config::FsConfig>, parts: Parts) -> Result<Assem
         policy: policy.clone(),
         audit: audit.clone(),
     });
-    registry.set_reservation_sink(Arc::new(crate::runtime::model_sink::DurableSink(
+    let durable = Arc::new(crate::runtime::model_sink::DurableSink(
         p.dispatcher_db.clone(),
-    )))?;
-    let github = Arc::new(kod_tool_gateway::github::GitHub::new(
-        config.github.product.clone(),
-        config.github.app.clone(),
-        private_subdir(&p.credential_dir.join("publish"))?,
-    )?);
+    ));
+    registry.set_reservation_sink(match origin.suite() {
+        Some(budget) => Arc::new(crate::acceptance::SuiteSink::new(budget, durable)),
+        None => durable,
+    })?;
+    let github =
+        Arc::new(origin.open(config, &private_subdir(&p.credential_dir.join("publish"))?)?);
     let workspace = Arc::new(crate::workspace::CollectedWorkspace::default());
     let gate = Arc::new(kod_eval::connected::SpawnGate::default());
     let tool = Arc::new(kod_tool_gateway::Gateway::new(
@@ -386,6 +429,25 @@ impl Service {
         Self::start_locked(config, parts, lock).await
     }
 
+    /// Acceptance-only origin selection. The real adapter validates literal loopback.
+    #[cfg(feature = "connected-test-support")]
+    pub async fn start_connected_fixture(
+        config: Arc<crate::config::FsConfig>,
+        parts: Parts,
+        api: &str,
+        suite: Option<Arc<crate::acceptance::SuiteBudget>>,
+    ) -> Result<Service> {
+        use anyhow::Context;
+        let origin = AdapterOrigin::Loopback(api.to_owned(), suite);
+        let root = config
+            .paths
+            .dispatcher_db
+            .parent()
+            .context("dispatcher_db has no parent")?;
+        let lock = instance_lock(root)?;
+        Self::start_inner(config, parts, lock, origin).await
+    }
+
     /// `start` for a caller that already holds the instance lock (see `prepare`).
     pub async fn start_locked(
         config: Arc<crate::config::FsConfig>,
@@ -394,7 +456,7 @@ impl Service {
     ) -> Result<Service> {
         // The lock stays held (dup shares the flock) while a failed start cleans up durable runs.
         let held = lock.try_clone()?;
-        match Self::start_inner(config.clone(), parts, lock).await {
+        match Self::start_inner(config.clone(), parts, lock, AdapterOrigin::Production).await {
             Ok(s) => Ok(s),
             Err(cause) => {
                 let cleaned = tokio::task::spawn_blocking(move || safety_cleanup(&config)).await;
@@ -412,6 +474,7 @@ impl Service {
         config: Arc<crate::config::FsConfig>,
         parts: Parts,
         lock: std::fs::File,
+        origin: AdapterOrigin,
     ) -> Result<Service> {
         use anyhow::Context;
         let trace = parts.trace.clone();
@@ -421,7 +484,8 @@ impl Service {
             trace: trace.clone(),
             ..parts
         };
-        let asm = tokio::task::spawn_blocking(move || assemble(&cfg, parts2))
+        let assembly_origin = origin.clone();
+        let asm = tokio::task::spawn_blocking(move || assemble(&cfg, parts2, &assembly_origin))
             .await
             .context("assembly panicked")??;
         let Assembled {
@@ -446,9 +510,11 @@ impl Service {
         // Unconfirmed revocation refuses the start, so admission never opens. The live publish
         // GitHub owns its dir lock and is recovered by runtime cleanup.
         let leased = config.clone();
-        tokio::task::spawn_blocking(move || recover_leases(&leased, &LEASE_DIRS[1..]))
-            .await
-            .context("lease recovery panicked")??;
+        tokio::task::spawn_blocking(move || {
+            recover_leases_with(&leased, &LEASE_DIRS[1..], &|dir| origin.open(&leased, dir))
+        })
+        .await
+        .context("lease recovery panicked")??;
         let (db, tracker, gateway) = (p.dispatcher_db.clone(), parts_tracker, runtime.clone());
         let tr = trace.clone();
         let dispatcher = recover_and_attach(runtime.clone(), move || {

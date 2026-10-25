@@ -183,7 +183,7 @@ impl DockerScanner {
         Ok(args)
     }
 
-    fn container_args(&self, container: &str, preparing: bool) -> Result<Vec<String>> {
+    pub fn container_args(&self, container: &str, preparing: bool) -> Result<Vec<String>> {
         let path = self.archive.canonicalize()?;
         let path = path.to_str().context("non-UTF-8 archive path")?;
         if path.contains([',', '\n', '\r']) {

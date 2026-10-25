@@ -140,6 +140,11 @@ impl Runtime {
             barrier: Mutex::default(),
         })
     }
+    /// Acceptance/test hook: the trusted collected-result store.
+    #[cfg(feature = "test-support")]
+    pub fn workspace(&self) -> &Arc<CollectedWorkspace> {
+        &self.adapters.workspace
+    }
     /// The tool gateway the runtime registers MCP run tokens with.
     pub fn tool(&self) -> &Arc<kod_tool_gateway::Gateway> {
         &self.adapters.tool
@@ -194,7 +199,15 @@ impl Runtime {
             hook(_point);
         }
     }
+    /// Whether credential revocation or a container stop is unconfirmed. A global revoke that
+    /// failed (say, during a forge outage) is retried here on each call, because a lifted kill
+    /// abandons its follow-up and admission stays closed until the debt is confirmed paid.
     pub fn cleanup_pending(&self) -> bool {
+        if self.cleanup_debt.load(Ordering::Acquire)
+            && !self.global_confirmed.load(Ordering::Acquire)
+        {
+            let _ = self.revoke_all();
+        }
         self.cleanup_debt.load(Ordering::Acquire)
     }
     pub fn quiesce(&self) -> Result<()> {

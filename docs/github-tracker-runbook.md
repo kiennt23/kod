@@ -4,7 +4,10 @@
 mapping is `registry/trackers/github.json`; construction takes a trusted
 `Config { repo, comment_author_id }`, the parsed mapping, an installation
 token and a webhook secret. The service wires this instance into the
-dispatcher and tool gateway in sub-plan 6b. This change installs no service.
+dispatcher and tool gateway through the merged [`kod-host`](kod-host-runbook.md).
+The host renews tracker credentials on the same adapter instance, preserving
+uncertain-create guards. [Connected acceptance](connected-runbook.md) remains
+the boundary for live ticket-to-PR proof.
 
 ## GitHub setup
 

@@ -86,6 +86,8 @@ pub struct FsSandbox {
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FsConfig {
+    #[serde(default)]
+    pub acceptance: Option<crate::acceptance::AcceptanceConfig>,
     pub paths: FsPaths,
     pub github: FsGithub,
     pub model: FsModel,

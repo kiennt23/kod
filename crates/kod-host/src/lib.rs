@@ -1,3 +1,4 @@
+pub mod acceptance;
 pub mod artifacts;
 pub mod binding;
 pub mod config;

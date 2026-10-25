@@ -470,6 +470,33 @@ fn a_reaped_failed_global_revocation_never_clears_debt() {
     assert!(!f.runtime.cleanup_pending());
 }
 
+#[test]
+fn a_failed_global_revocation_is_retried_until_debt_clears() {
+    let execute: kod_host::runtime::Execute = Arc::new(|_, _, _, _| Ok(RunState::NeedsHuman));
+    let f = Fixture::start(execute);
+    f.insert_run(1, RunState::Running);
+    f.runtime.start(&f.run_start("run-1")).unwrap();
+    wait_left_running(&f, 1);
+    until_ok("revoke", || f.runtime.revoke("run-1"));
+    loop {
+        let e = f
+            .runtime
+            .revoke_all_with(|| anyhow::bail!("remote down"))
+            .unwrap_err();
+        if format!("{e:#}").contains("remote down") {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    until_ok("stop", || f.runtime.stop("run-1"));
+    // The dependency recovered; the worker's own polling must pay the debt, no restart needed.
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while f.runtime.cleanup_pending() {
+        assert!(std::time::Instant::now() < end, "debt never cleared");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 /// Cancel durably at one registration barrier; nothing may spawn and every
 /// credential must be denied afterwards.
 fn cancel_at(point: &'static str) {
