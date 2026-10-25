@@ -177,7 +177,11 @@ flowchart TB
     art["<b>artifacts, records</b><br/>[Rust]<br/>Approved doc pins, trusted records"]
     svc["<b>service, refresh</b><br/>[Rust]<br/>Startup, shutdown, status refresh"]
     cred["<b>tracker_credentials</b><br/>[Rust]<br/>Renewable GitHub App token"]
+    prod["<b>production</b><br/>[Rust]<br/>Admission and execution adapters"]
+    mainbin["<b>main</b><br/>[Rust]<br/>CLI: serve, snapshot activate"]
   end
+  trk["<b>Tracker</b><br/>[kod-tracker]<br/>GitHub issues adapter"]
+  stat["<b>Status</b><br/>[kod-status]<br/>Story status records"]
 
   cfg -.->|"Configures"| svc
   svc -.->|"Serves, retires runs on restart"| disp
@@ -193,18 +197,25 @@ flowchart TB
   svc -.->|"Resolves approvals"| art
   svc -.->|"Token renewal"| cred
   cred -.->|"App JWT, installation token"| gh
+  mainbin -.->|"Starts"| svc
+  prod -.->|"Admission, execution"| runtime
+  prod -.->|"Reads issues and links"| trk
+  svc -.->|"Status comments"| trk
+  svc -.->|"Renders story status"| stat
+  svc -.->|"Ingress: webhook, command. Internal: tool, model"| disp
   classDef internal fill:#1168bd,stroke:#0b4884,color:#fff
   classDef component fill:#85bbf0,stroke:#5d82a8,color:#000
   classDef db fill:#1168bd,stroke:#0b4884,color:#fff
   classDef ext fill:#6b6b6b,stroke:#444,color:#fff
   classDef planned stroke-dasharray:5 5,stroke-width:2px
-  class disp,toolgw,llmgw,sandbox internal
+  class disp,toolgw,llmgw,sandbox,trk,stat internal
   class dispdb db
   class gh ext
-  class cfg,runtime,hostrunner,art,svc,cred component
+  class cfg,runtime,hostrunner,art,svc,cred,prod,mainbin component
 ```
 
 `kod-host` is an assembly binary, not a new domain service: it reuses the existing routers and libraries and adds concrete adapters. Component names are the source files in `crates/kod-host/src`.
+Route split: `service` mounts only the webhook and signed command routes on `ingress_listen`; the per-run tool (`/r/{token}/mcp`) and model routes are mounted only on `gateway_listen` (sandbox network).
 Enforced here: the dispatcher row is the sole durable stop flag; revocation starts before waiting for stop; no execution resumes after restart (active runs become NeedsHuman, `publishing` resolves only if the exact draft PR exists).
 Also enforced: collection runs only after the process is quiescent, and refuses binary files, symlinks, renames and mode changes before any forge write. Admitted document revisions are pinned and a live issue edit cannot widen them.
 The additive tables (`run_bindings`, `model_requests`, `tracker_write_intents`) live in the existing dispatcher database.
