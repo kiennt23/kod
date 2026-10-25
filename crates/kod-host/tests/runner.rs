@@ -313,7 +313,7 @@ fn any_failed_stage_leaves_no_collected_result() {
         // missing and symlinked collector markers
         ("printf x > diff.patch", EXPORT_OK),
         (
-            "ln -s /etc/passwd collect_ok; printf '' > diff.patch",
+            "ln -s /etc/passwd collect_ok; printf 'diff --git a/a b/a\\nindex aaa..bbb 100644\\n--- a/a\\n+++ b/a\\n@@ -1 +1 @@\\n-a\\n+b\\n' > diff.patch",
             EXPORT_OK,
         ),
         ("touch collect_ok", EXPORT_OK),
@@ -324,7 +324,7 @@ fn any_failed_stage_leaves_no_collected_result() {
         (PATCH_OK, "true"),
         (
             PATCH_OK,
-            "ln -s /etc/passwd export_ok; cp /dev/null manifest.json",
+            r#"ln -s /etc/passwd export_ok; printf '{"version":1,"base":"%s","files":[{"path":"a","mode":"100644","blob":0}]}' "$BASE" > manifest.json; printf 'b\n' > 0"#,
         ),
         // forged base and exporter failure
         (

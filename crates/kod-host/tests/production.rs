@@ -221,7 +221,7 @@ fn forged_or_failed_collection_never_reaches_done_or_a_collected_result() {
     for (collect, export) in [
         ("printf x > diff.patch", EXPORT_OK),
         (
-            "ln -s /etc/passwd collect_ok; printf '' > diff.patch",
+            "ln -s /etc/passwd collect_ok; printf 'diff --git a/a b/a\\nindex aaa..bbb 100644\\n--- a/a\\n+++ b/a\\n@@ -1 +1 @@\\n-a\\n+b\\n' > diff.patch",
             EXPORT_OK,
         ),
         ("exit 3", EXPORT_OK),
@@ -229,7 +229,7 @@ fn forged_or_failed_collection_never_reaches_done_or_a_collected_result() {
         (PATCH_OK, "true"),
         (
             PATCH_OK,
-            "ln -s /etc/passwd export_ok; cp /dev/null manifest.json",
+            r#"ln -s /etc/passwd export_ok; printf '{"version":1,"base":"%s","files":[{"path":"a","mode":"100644","blob":0}]}' "$BASE" > manifest.json; printf 'b\n' > 0"#,
         ),
         (
             PATCH_OK,
