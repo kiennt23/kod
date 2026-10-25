@@ -76,7 +76,7 @@ pub fn resolve(config: Arc<FsConfig>, s: Sources) -> ResolveAdmission {
             started_at: (s.now)(),
             data_classes,
             pins,
-            linked_tickets: issue.links.clone(), // revision-pinned with the issue
+            linked_tickets: vec![], // issue.links is editable and unhashed; only rework records may grant
             max_tokens: config.model.run_max_tokens,
             max_cost_micro_usd: config.model.run_max_cost_micro_usd,
             agent_image: config.sandbox.agent_image.clone(),
@@ -119,7 +119,7 @@ pub fn spec(config: &FsConfig, a: &Admitted) -> ConnectedSpec {
         collector_image: b.collector_image.clone(),
         network: config.networking.sandbox_network.clone(),
         model: config.model.selected_model.clone(),
-        max_tokens: b.max_tokens,
+        max_tokens: config.model.max_tokens, // per request, not the run budget
         budget: kod_eval::case::Budget {
             max_turns: config.sandbox.max_turns,
             timeout_secs: config.sandbox.wall_seconds,

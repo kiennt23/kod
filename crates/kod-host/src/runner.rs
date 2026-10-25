@@ -24,6 +24,11 @@ pub fn run(
     workspace: &CollectedWorkspace,
 ) -> Result<RunState> {
     let names = connected::names(&spec.run)?;
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        // Exclusive and private: a leftover or planted run directory is refused, not reused.
+        std::fs::DirBuilder::new().mode(0o700).create(&spec.dir)?;
+    }
     for name in ["seed", "in", "agent_out"] {
         std::fs::create_dir(spec.dir.join(name))?;
     }

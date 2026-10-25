@@ -13,7 +13,15 @@ use std::{
     },
 };
 
-const KEY: &str = include_str!("fixtures/app-key.pem");
+/// A throwaway RSA key generated per call; no private key is committed.
+fn test_key() -> Vec<u8> {
+    let out = std::process::Command::new("openssl")
+        .args(["genrsa", "-traditional", "2048"])
+        .output()
+        .expect("openssl is required to generate the test key");
+    assert!(out.status.success());
+    out.stdout
+}
 const BOT: u64 = 4242;
 
 #[derive(Default)]
@@ -215,7 +223,7 @@ fn world() -> World {
     let root = dir.path().to_path_buf();
     std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
     let mut config = (*common::config(&root, &root.join("dispatcher.db"))).clone();
-    std::fs::write(root.join("key.pem"), KEY).unwrap();
+    std::fs::write(root.join("key.pem"), test_key()).unwrap();
     std::fs::set_permissions(root.join("key.pem"), std::fs::Permissions::from_mode(0o600)).unwrap();
     config.paths.credential_dir = root.join("cred");
     config.paths.policy_dir = root.join("policy");
@@ -579,6 +587,9 @@ fn serve_with_an_invalid_config_fails_closed() {
 // ---- production workflow source and the serve loop ----
 
 fn workflow(r: &Rig, open: Vec<&str>) -> kod_host::refresh::WorkflowSource {
+    workflow_class(r, open, "design")
+}
+fn workflow_class(r: &Rig, open: Vec<&str>, class: &str) -> kod_host::refresh::WorkflowSource {
     let c = &r.w.config;
     drop(kod_dispatcher::store::open(&c.paths.dispatcher_db).unwrap());
     for d in [
@@ -590,7 +601,7 @@ fn workflow(r: &Rig, open: Vec<&str>) -> kod_host::refresh::WorkflowSource {
     }
     for (n, v) in [
         ("people.json", json!({"owner": "po", "backup": "bo"})),
-        ("routing.json", json!({"classes": {"design": {}}})),
+        ("routing.json", json!({"classes": {class: {}}})),
     ] {
         std::fs::write(c.paths.policy_dir.join(n), v.to_string()).unwrap();
         std::fs::set_permissions(
@@ -603,7 +614,7 @@ fn workflow(r: &Rig, open: Vec<&str>) -> kod_host::refresh::WorkflowSource {
     let art = m.parent().unwrap().join("v1.txt");
     std::fs::write(&art, "approved design").unwrap();
     std::fs::set_permissions(&art, std::fs::Permissions::from_mode(0o600)).unwrap();
-    let entry = json!({"link": "design", "revision": "v1", "path": "v1.txt", "class": "design",
+    let entry = json!({"link": "design", "revision": "v1", "path": "v1.txt", "class": class,
         "sha256": format!("{:x}", sha2::Sha256::digest("approved design")),
         "approved_by": "po", "approved_at": "2026-10-24T00:00:00Z", "approval_ref": "S-1"});
     std::fs::write(m, json!({"version": 1, "artifacts": [entry]}).to_string()).unwrap();
@@ -763,6 +774,14 @@ fn another_storys_publish_attempt_does_not_block_this_story() {
     )
     .unwrap();
     drop(c);
+    go_with(&r, &src).unwrap();
+    assert_eq!(posts(&r), 1);
+}
+
+#[test]
+fn a_data_classification_is_not_parsed_as_a_workflow_stage() {
+    let r = rig();
+    let src = workflow_class(&r, vec![], "placeholder");
     go_with(&r, &src).unwrap();
     assert_eq!(posts(&r), 1);
 }

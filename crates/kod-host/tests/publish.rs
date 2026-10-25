@@ -183,7 +183,7 @@ fn production_world(collect: &str, export: &str) -> World {
     let root = dir.path().canonicalize().unwrap();
     let base = mirror(&root);
     let rundir = root.join("runs").join(format!("run-{seq}"));
-    fs::create_dir_all(&rundir).unwrap();
+    fs::create_dir_all(root.join("runs")).unwrap(); // the runner creates run-N itself
     common::docker_case(
         &format!("run-{seq}"),
         &format!(

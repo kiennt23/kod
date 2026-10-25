@@ -162,12 +162,6 @@ impl Source for WorkflowSource {
         if published {
             bail!("pull request evidence is unavailable for {story}: a run entered publishing");
         }
-        let mut stages = std::collections::BTreeMap::new();
-        for a in self.artifacts.current_manifest()?.artifacts {
-            let stage: kod_status::Stage = serde_json::from_value(a.class.clone().into())
-                .with_context(|| format!("artifact class {} has no stage", a.class))?;
-            stages.insert(a.link, stage);
-        }
         let c = Connection::open_with_flags(
             &self.dispatcher_db,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -178,10 +172,8 @@ impl Source for WorkflowSource {
             &self.artifacts,
             story,
             &|l| {
-                stages
-                    .get(l)
-                    .copied()
-                    .unwrap_or(kod_status::Stage::Requirements)
+                // The workflow stage is the approved link; `class` is a data classification.
+                serde_json::from_value(l.into()).unwrap_or(kod_status::Stage::Requirements)
             },
             vec![],
             rework_records(&c, story)?,

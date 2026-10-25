@@ -310,8 +310,10 @@ async fn sigterm_closes_admission_then_cleans_then_exits() {
     }
     tx.send(()).unwrap();
     h.await.unwrap().unwrap();
+    let mut t = w.trace.lock().unwrap()[5..].to_vec();
+    t[3..5].sort(); // revoke and stop run concurrently
     assert_eq!(
-        w.trace.lock().unwrap()[5..],
+        t,
         [
             "close-admission",
             "stop-worker",

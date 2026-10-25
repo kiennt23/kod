@@ -250,7 +250,6 @@ fn drive(collect: &str, export: &str) -> (anyhow::Result<kod_dispatcher::RunStat
     git(&["commit", "-qm", "base"]);
     let base = git(&["rev-parse", "HEAD"]).trim().to_owned();
     let dir = root.path().join("run");
-    fs::create_dir(&dir).unwrap();
     let docker = root.path().join("docker");
     fs::write(
         &docker,

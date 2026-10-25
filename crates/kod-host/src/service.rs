@@ -15,13 +15,24 @@ pub fn recover_then_open<T>(
     open()
 }
 
-/// Runs every phase in order even when an earlier one failed.
+/// Quiesces first, then runs revoke and stop concurrently; every phase runs even if another failed.
 pub fn cleanup_all(
     quiesce: impl FnOnce() -> Result<()>,
-    revoke: impl FnOnce() -> Result<()>,
-    stop: impl FnOnce() -> Result<()>,
+    revoke: impl FnOnce() -> Result<()> + Send,
+    stop: impl FnOnce() -> Result<()> + Send,
 ) -> Result<()> {
-    let outcomes = [quiesce(), revoke(), stop()];
+    // Revocation and container stop run side by side so a failing revoke never delays the stop.
+    let q = quiesce();
+    let (r, s) = std::thread::scope(|sc| {
+        let r = sc.spawn(revoke);
+        let s = stop();
+        (
+            r.join()
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("revoke panicked"))),
+            s,
+        )
+    });
+    let outcomes = [q, r, s];
     let errors: Vec<String> = outcomes
         .into_iter()
         .filter_map(Result::err)
@@ -994,23 +1005,45 @@ mod tests {
 
     #[test]
     fn shutdown_attempts_stop_even_when_quiesce_and_revoke_fail() {
-        let events = RefCell::new(Vec::new());
+        let events = std::sync::Mutex::new(Vec::new());
         let result = cleanup_all(
             || {
-                events.borrow_mut().push("quiesce");
+                events.lock().unwrap().push("quiesce");
                 anyhow::bail!("store unavailable")
             },
             || {
-                events.borrow_mut().push("revoke");
+                events.lock().unwrap().push("revoke");
                 anyhow::bail!("provider unavailable")
             },
             || {
-                events.borrow_mut().push("stop");
+                events.lock().unwrap().push("stop");
                 Ok(())
             },
         );
         assert!(result.is_err());
-        assert_eq!(*events.borrow(), ["quiesce", "revoke", "stop"]);
+        let mut seen = events.lock().unwrap().clone();
+        seen.sort();
+        assert_eq!(seen, ["quiesce", "revoke", "stop"]);
+    }
+
+    #[test]
+    fn stop_starts_at_once_while_revocation_keeps_failing() {
+        let t = std::time::Instant::now();
+        let stopped_at = std::sync::Mutex::new(None);
+        let result = cleanup_all(
+            || Ok(()),
+            || {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                anyhow::bail!("provider unavailable")
+            },
+            || {
+                *stopped_at.lock().unwrap() = Some(t.elapsed());
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        let at = stopped_at.lock().unwrap().unwrap();
+        assert!(at < std::time::Duration::from_millis(500), "{at:?}");
     }
 
     #[test]

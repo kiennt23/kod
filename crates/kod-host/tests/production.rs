@@ -175,8 +175,8 @@ fn drive(collect: &str, export: &str) -> (anyhow::Result<RunState>, bool) {
     git(&["add", "-A"]);
     git(&["commit", "-qm", "base"]);
     let base = git(&["rev-parse", "HEAD"]).trim().to_owned();
-    let dir = w.config.paths.run_root.join("run-1");
-    fs::create_dir_all(&dir).unwrap();
+    fs::create_dir_all(&w.config.paths.run_root).unwrap(); // config validation makes the root
+    let dir = w.config.paths.run_root.join("run-1"); // fresh: the runner must create it
     let docker = root.join("docker");
     fs::write(&docker, format!(r#"#!/bin/sh
 [ "$1" = run ] || exit 0
@@ -274,4 +274,77 @@ fn the_mirror_base_is_the_configured_branch_head_and_fails_closed() {
     assert!(production::mirror_base(dir.path(), "absent").is_err());
     assert!(production::mirror_base(dir.path(), "--all").is_err());
     assert!(production::mirror_base(&dir.path().join("missing"), "main").is_err());
+}
+
+#[test]
+fn request_token_limit_is_the_per_request_cap_not_the_run_budget() {
+    let w = world();
+    let a = common::admitted(&w.config.paths.run_root, &start(&w, "rev".into()));
+    let mut a = a;
+    a.binding.max_tokens = 999_999;
+    let s = production::spec(&w.config, &a);
+    assert_eq!(s.max_tokens, w.config.model.max_tokens);
+}
+
+/// A tracker whose issue links were edited by someone outside the trusted rework flow.
+struct Edited(kod_gates::records::HostRecords);
+impl kod_tracker::Tracker for Edited {
+    fn name(&self) -> &str {
+        "edited"
+    }
+    fn get_issue(&self, key: &str) -> anyhow::Result<kod_tracker::Issue> {
+        let mut i = self.0.get_issue(key)?;
+        i.links = vec!["OTHER-9".into()];
+        Ok(i)
+    }
+    fn comment(&self, _: &str, _: &str) -> anyhow::Result<()> {
+        unimplemented!()
+    }
+    fn transition(&self, _: &str, _: kod_tracker::State) -> anyhow::Result<()> {
+        unimplemented!()
+    }
+    fn link_pr(&self, _: &str, _: &str) -> anyhow::Result<()> {
+        unimplemented!()
+    }
+    fn create_linked(
+        &self,
+        _: &str,
+        _: kod_tracker::ReworkKind,
+        _: &kod_tracker::Rework,
+    ) -> anyhow::Result<String> {
+        unimplemented!()
+    }
+    fn is_team_member(&self, _: &str) -> anyhow::Result<bool> {
+        unimplemented!()
+    }
+    fn parse_webhook(
+        &self,
+        _: &kod_tracker::Webhook,
+    ) -> anyhow::Result<Option<kod_tracker::Delivery>> {
+        unimplemented!()
+    }
+}
+
+#[test]
+fn an_edited_issue_link_grants_no_tool_access() {
+    use kod_tracker::Tracker;
+    let w = world();
+    let tracker = Arc::new(Edited(kod_gates::records::HostRecords(w.gate.clone())));
+    let rev = kod_dispatcher::revision(&tracker.get_issue("T-1").unwrap());
+    let artifacts = Artifacts::new(
+        w.config.paths.approval_manifest.clone(),
+        &w.config.paths.policy_dir,
+    )
+    .unwrap();
+    let a = production::resolve(
+        w.config.clone(),
+        production::Sources {
+            tracker,
+            artifacts: Arc::new(artifacts),
+            base: Arc::new(|| Ok("c".repeat(40))),
+            now: Arc::new(|| 1_800_000_000),
+        },
+    )(&start(&w, rev))
+    .unwrap();
+    assert!(a.binding.linked_tickets.is_empty());
 }
