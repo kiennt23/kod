@@ -1,6 +1,6 @@
 # Tool gateway runbook
 
-`kod-tool-gateway` is the MCP endpoint a run's sandbox uses for tracker and docs tools, and the host-side publish operation. **It is a library with a router; there is no binary yet.** It includes a real GitHub App broker and Forge. Sub-plan 6b-b supplies the host process; 6b-c supplies Docker and live connected acceptance. The adapter's offline tests use a loopback HTTP provider and real Git objects; they do not establish deployment readiness.
+`kod-tool-gateway` supplies the MCP endpoint and host-side publish operation mounted by [`kod-host`](kod-host-runbook.md). The GitHub App broker/Forge (#33) and host composition (#40) are merged. [6b-c acceptance](connected-runbook.md) supplies real-container and live connected proofs; the adapter's loopback HTTP tests and real Git objects alone do not establish deployment readiness.
 
 ## GitHub App activation and recovery
 

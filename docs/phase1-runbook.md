@@ -25,7 +25,7 @@ carries kod-loop, built with `RUST_VERSION` from `rust-toolchain.toml`.
 | 6. Model traffic goes through the LLM gateway | `tests/kod_loop.rs` (proxy token counts), `kod-loop` `tests/proxy.rs` |
 | 8. Right end state for block and over-budget | `tests/kod_loop.rs` (block and loop cases), block and over-budget eval cases |
 | 9. Runs the full eval set next to the other agents | the runs below |
-| 2, 4, 7 | Need the tool gateway, audit log and publish (phase 1 sub-plans 3 to 5) |
+| 2, 4, 7 | Components and host are merged; composed Docker and live proofs belong to [6b-c acceptance](connected-runbook.md) |
 
 ## The AGENTS.md eval case
 
@@ -78,8 +78,9 @@ proxy tokens next to the baseline's.
   kod-loop becomes the default runner for offline evals. Claude Code stays
   available for comparison.
 - kod-loop becomes the default for the connected pilot only after phase 1
-  sub-plan 5 adds its MCP client and conformance items 2, 4 and 7 pass in
-  the connected integration step (overview sub-plan 6b).
+  conformance items 2, 4 and 7 and the live cancellation/restart/kill drills
+  pass in [connected acceptance](connected-runbook.md). Sub-plan 5's MCP
+  client and the 6b-b host are merged; that alone does not enable cutover.
 - Otherwise, Claude Code keeps running. File what lost, fix it against dev
   cases, and rerun the held-out comparison as a new run.
 

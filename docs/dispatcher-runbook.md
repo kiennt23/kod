@@ -1,6 +1,6 @@
 # Dispatcher runbook
 
-`kod-dispatcher` takes tracker webhooks, queues them in SQLite, admits or refuses runs, and starts them through the tool gateway. **It is a library with an axum router; there is no binary and no CLI client yet.** Sub-plan 6b builds the process around it with the real tracker adapter and gateway. What follows is what the code accepts, so the wiring and your commands match it.
+`kod-dispatcher` takes tracker webhooks, queues them in SQLite, admits or refuses runs, and starts them through the tool gateway. It is a library mounted by the merged [`kod-host`](kod-host-runbook.md) composition binary. The host exposes signed webhook/command ingress separately from sandbox gateway routes. [Connected acceptance](connected-runbook.md) remains separate from component implementation.
 
 ## Config
 
@@ -64,4 +64,4 @@ The host will validate the complete execution-binding shape before calling `stor
 
 Confirmed usage above its reservation is retained in full, matching the gateway ledger's overrun accounting. Aggregate charge saturates at `u64::MAX`; callers must treat that value as exhausted, while individual usage records remain lossless. Budget enforcement must halt an overrun rather than reject its settlement. Existing unbound runs with no requests report zero charge; unknown runs, malformed IDs and corrupt request records still fail. These APIs are storage foundations; dynamic proxy registration and its reservation sink are Task 2.
 
-One unresolved status-write intent per story is enforced by a partial unique index. A restart does not clear it; the later host refresh worker must reconcile it before another create. The host process, provider wiring, approved snapshots and connected acceptance are still pending.
+One unresolved status-write intent per story is enforced by a partial unique index. A restart does not clear it; the host refresh worker reconciles the bot-owned remote comment before another create. Host composition, provider wiring and approved snapshots merged in #40; real-container acceptance and live cutover are tracked in [6b-c](superpowers/plans/2026-10-23-phase1-connected-acceptance.md).

@@ -17,6 +17,14 @@ story's snapshot and invalid associations are errors, not an empty success.
 
 ## Source records
 
+The merged [`kod-host`](kod-host-runbook.md) refresh worker assembles source
+records and maintains the bot-owned comment. It fails closed for stories with
+publish attempts or rework records while their authoritative reconciliation
+sources remain missing; these limits are tracked in [issue #39](https://github.com/kiennt23/kod/issues/39).
+Data classification and workflow stage are separate: canonical approved links
+such as `design` select the stage; an artifact's `class` controls access.
+[Connected acceptance](connected-runbook.md) is still required before pilot cutover.
+
 The trusted host owns the snapshot outside every sandbox/PR workspace.
 The source schema is `kod_status::records::Snapshot`:
 
