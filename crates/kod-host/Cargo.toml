@@ -27,7 +27,12 @@ kod-status = { path = "../kod-status" }
 kod-audit = { path = "../kod-audit" }
 kod-policy = { path = "../kod-policy" }
 
+tempfile = { version = "3", optional = true }
+base64 = { version = "0.22", optional = true }
+hmac = { version = "0.12", optional = true }
+
 [features]
+connected-test-support = ["test-support", "kod-tool-gateway/test-support", "kod-tracker/test-support", "dep:tempfile", "dep:hmac", "dep:base64"]
 # Lets tests install a collection; production code cannot forge one.
 test-support = []
 
@@ -40,3 +45,7 @@ kod-eval = { path = "../kod-eval", features = ["connected-test-support"] }
 tower = { version = "0.5", features = ["util"] }
 tokio = { version = "1", features = ["test-util"] }
 futures-util = "0.3"
+
+[[test]]
+name = "connected_docker"
+required-features = ["connected-test-support"]
