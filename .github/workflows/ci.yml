@@ -1,5 +1,8 @@
 name: ci
-on: [push, pull_request]
+on:
+  push:
+    branches: [main]
+  pull_request:
 permissions:
   contents: read
 jobs:
@@ -35,6 +38,7 @@ jobs:
       - run: KOD_GATE_TEST_IMAGE=$(docker image inspect kod-gates-test --format '{{.Id}}') KOD_DOCKER_BIN=$(command -v docker) cargo test -p kod-gates
   connected:
     runs-on: ubuntu-24.04
+    timeout-minutes: 25
     needs: check
     env:
       KOD_DOCKER_TESTS: "1"

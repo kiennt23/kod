@@ -104,8 +104,8 @@ impl ConnectedFixture {
         let relay = format!("kod-relay-{}", std::process::id());
         let host: String = if !docker {
             "127.0.0.1".into()
-        } else if cfg!(target_os = "macos") {
-            // Docker Desktop/OrbStack cannot route an internal network to the host: forward through a relay attached to both networks.
+        } else {
+            // An internal network cannot reach the host (Docker Desktop, OrbStack, Linux): forward through a relay attached to both networks.
             let perl = format!(
                 "use IO::Socket::INET;$SIG{{CHLD}}='IGNORE';my $l=IO::Socket::INET->new(LocalPort=>{port},Listen=>64,ReuseAddr=>1) or die;while(my $c=$l->accept){{next if fork;my $u=IO::Socket::INET->new(PeerAddr=>'host.docker.internal:{port}') or exit;if(fork){{while(sysread($c,my $b,65536)){{syswrite($u,$b)}}}}else{{while(sysread($u,my $b,65536)){{syswrite($c,$b)}}}}exit}}"
             );
@@ -116,6 +116,8 @@ impl ConnectedFixture {
                         "-d",
                         "--name",
                         &relay,
+                        "--add-host",
+                        "host.docker.internal:host-gateway",
                         "--entrypoint",
                         "perl",
                         &image,
@@ -136,18 +138,6 @@ impl ConnectedFixture {
                     .success()
             );
             relay.clone()
-        } else {
-            let out = Command::new("docker")
-                .args([
-                    "network",
-                    "inspect",
-                    &network,
-                    "--format",
-                    "{{range .IPAM.Config}}{{.Gateway}}{{end}}",
-                ])
-                .output()
-                .unwrap();
-            String::from_utf8(out.stdout).unwrap().trim().into()
         };
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")

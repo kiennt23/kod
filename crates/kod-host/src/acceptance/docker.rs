@@ -82,12 +82,32 @@ pub fn provenance(config: &FsConfig) -> (Option<String>, Vec<String>) {
     digests.dedup();
     (commit, digests)
 }
+const SUITE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(600);
 pub async fn run(config: &FsConfig, evidence: &Path, suite: Arc<SuiteBudget>) -> Result<Execution> {
     preflight(config)?;
     let mut fixture = Fixture::new(config).await?;
     fixture.suite = Some(suite.clone());
     fixture.start().await?;
-    let result = conformance(&mut fixture, evidence).await;
+    let mut execution = Execution::default();
+    // A hung scenario must fail fast and name where it stopped, not stall CI.
+    let result = match tokio::time::timeout(
+        SUITE_DEADLINE,
+        conformance(&mut fixture, evidence, &mut execution),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(_) => Err(anyhow::anyhow!(
+            "docker suite exceeded {}s; scenarios completed before the hang: [{}]",
+            SUITE_DEADLINE.as_secs(),
+            execution
+                .scenarios
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    };
     let cleanup = fixture.shutdown().await;
     // Recorded even when a scenario errored, so a budget stop is independently observable.
     let received = fixture
@@ -101,7 +121,7 @@ pub async fn run(config: &FsConfig, evidence: &Path, suite: Arc<SuiteBudget>) ->
         &evidence.join("provider-observations.json"),
         &serde_json::to_vec(&serde_json::json!({"model_requests_received": received}))?,
     )?;
-    let mut execution = result?;
+    result?;
     cleanup?;
     let state = fixture
         .provider
@@ -129,8 +149,7 @@ pub async fn run(config: &FsConfig, evidence: &Path, suite: Arc<SuiteBudget>) ->
 }
 // The provider guard is dropped explicitly before the next await; clippy cannot see through drop().
 #[allow(clippy::await_holding_lock)]
-async fn conformance(h: &mut Fixture, evidence: &Path) -> Result<Execution> {
-    let mut execution = Execution::default();
+async fn conformance(h: &mut Fixture, evidence: &Path, execution: &mut Execution) -> Result<()> {
     let stage = |n: &'static str| Stage(n);
     // A valid-shaped payload, so the rejection can only be for its signature.
     let shaped = h.payload("labeled", "kiennt23")?;
@@ -260,5 +279,5 @@ async fn conformance(h: &mut Fixture, evidence: &Path) -> Result<Execution> {
     execution
         .scenarios
         .extend(lifecycle::run(h, evidence).await?);
-    Ok(execution)
+    Ok(())
 }
