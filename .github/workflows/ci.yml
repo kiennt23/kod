@@ -33,3 +33,12 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: docker build -t kod-gates-test --build-arg RUST_VERSION=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml) -f images/gates/Dockerfile .
       - run: KOD_GATE_TEST_IMAGE=$(docker image inspect kod-gates-test --format '{{.Id}}') KOD_DOCKER_BIN=$(command -v docker) cargo test -p kod-gates
+  connected:
+    runs-on: ubuntu-24.04
+    needs: check
+    env:
+      KOD_DOCKER_TESTS: "1"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: docker build -t kod-connected-sandbox --build-arg RUST_VERSION=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml) -f images/sandbox/Dockerfile .
+      - run: KOD_CONNECTED_IMAGE=kod-connected-sandbox cargo test -p kod-host --features connected-test-support --test connected_docker --test connected_lifecycle -- --include-ignored
