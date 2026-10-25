@@ -86,3 +86,39 @@ fn kill_confirms_container_absence() {
 fn restart_never_resumes_and_reconciles_publish() {
     scenario_passes("restart-never-resumes-and-reconciles-publish");
 }
+
+#[test]
+#[ignore = "requires real Docker; run explicitly with --ignored"]
+fn suite_stops_forwarding_once_the_authorized_budget_is_used() {
+    assert_eq!(std::env::var("KOD_DOCKER_TESTS").as_deref(), Ok("1"));
+    // Given an authorization for exactly one model request across the whole suite.
+    let h = connected::ConnectedFixture::docker();
+    h.cap_requests(1);
+    // When the full suite runs.
+    let (out, report) = h.accept();
+    // Then it fails closed: non-zero, not every scenario passed, the cap is the recorded reason.
+    assert_ne!(out.status.code(), Some(0), "report: {report}");
+    assert!(
+        report["blocked"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b == "suite_budget_exhausted"),
+        "report: {report}"
+    );
+    assert!(
+        report["scenarios"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["outcome"] != "pass")
+    );
+    // And the ledger shows exactly the one authorized request, while the provider received no more.
+    assert_eq!(report["actual_spend"]["requests"], 1, "report: {report}");
+    assert_eq!(report["model_requests"], 1);
+    let seen: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(h.dir.path().join("evidence/provider-observations.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(seen["model_requests_received"], 1, "provider saw {seen}");
+}

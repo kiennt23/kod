@@ -16,7 +16,9 @@ fn partial_report_cannot_pass() {
 #[path = "common/acceptance.rs"]
 mod fixture;
 use kod_host::{
-    acceptance::{AcceptanceConfig, Observation, Spend, SuiteBudget, authorize, preflight_report},
+    acceptance::{
+        AcceptanceConfig, Observation, Spend, SuiteBudget, SuiteSink, authorize, preflight_report,
+    },
     config::{FsConfig, strict_json},
 };
 use std::{
@@ -198,4 +200,114 @@ async fn private_evidence_refuses_reuse_and_symlink_destinations() {
             .await
             .is_err()
     );
+}
+
+#[test]
+fn valid_authorization_clears_only_the_authorization_blocker() {
+    // Given an exact owner record, the specific blocker is what disappears (not just the exit code).
+    let (_dir, config, auth) = authorized();
+    write_authorization(&config, &auth);
+    let report = preflight_report(Mode::Live, &config);
+    assert!(!report.blocked.iter().any(|s| s == "authorization"));
+    assert!(
+        report
+            .blocked
+            .iter()
+            .any(|s| s == "live_driver_and_gate_prerequisites")
+    );
+    assert_eq!(report.exit_code(), 2);
+    // And an invalid record puts exactly that blocker back.
+    let mut bad = auth;
+    bad["repo"] = serde_json::json!("acme/other");
+    write_authorization(&config, &bad);
+    assert!(
+        preflight_report(Mode::Live, &config)
+            .blocked
+            .iter()
+            .any(|s| s == "authorization")
+    );
+}
+#[test]
+fn acceptance_caps_must_be_positive_and_within_model_limits() {
+    // Model limits in the fixture are 10 requests / 1000 tokens / 1000 micro-USD.
+    for (field, value) in [
+        ("max_requests", 0),
+        ("max_tokens", 0),
+        ("max_cost_micro_usd", 0),
+        ("max_requests", 11),
+        ("max_tokens", 1001),
+        ("max_cost_micro_usd", 1001),
+    ] {
+        let (_dir, config, _) = authorized();
+        let mut acceptance = config.acceptance.clone().unwrap();
+        match field {
+            "max_requests" => acceptance.max_requests = value,
+            "max_tokens" => acceptance.max_tokens = value,
+            _ => acceptance.max_cost_micro_usd = value,
+        }
+        let error = acceptance.validate(&config).unwrap_err().to_string();
+        assert_eq!(error, "invalid acceptance caps", "{field}={value}");
+    }
+    let (_dir, config, _) = authorized();
+    assert!(
+        config
+            .acceptance
+            .as_ref()
+            .unwrap()
+            .validate(&config)
+            .is_ok()
+    );
+}
+#[derive(Default)]
+struct CountingSink(std::sync::atomic::AtomicU64);
+impl kod_llm_proxy::ReservationSink for CountingSink {
+    fn reserve(&self, _: &str, _: &str, _: kod_llm_proxy::Spend) -> anyhow::Result<()> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+    fn settle(&self, _: &str, _: &str, _: kod_llm_proxy::Spend) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+#[test]
+fn suite_sink_refuses_before_the_durable_reservation_once_the_cap_is_used() {
+    use kod_llm_proxy::ReservationSink;
+    let cap = Spend {
+        requests: 1,
+        tokens: 100,
+        cost_micro_usd: 100,
+    };
+    let budget = Arc::new(SuiteBudget::new(cap).unwrap());
+    let inner = Arc::new(CountingSink::default());
+    let sink = SuiteSink::new(budget.clone(), inner.clone());
+    let reserved = kod_llm_proxy::Spend {
+        tokens: 40,
+        pico_usd: 1_500_000,
+    };
+    sink.reserve("run", "a", reserved).unwrap();
+    // The cost rounds up to whole micro-USD.
+    assert_eq!(
+        budget.consumed().unwrap(),
+        Spend {
+            requests: 1,
+            tokens: 40,
+            cost_micro_usd: 2
+        }
+    );
+    assert!(!budget.refused());
+    // The second request is refused and never reaches the next sink (so is never forwarded).
+    assert!(sink.reserve("run", "b", reserved).is_err());
+    assert_eq!(inner.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(budget.refused());
+    // Settlement replaces the reservation with confirmed usage.
+    sink.settle(
+        "run",
+        "a",
+        kod_llm_proxy::Spend {
+            tokens: 10,
+            pico_usd: 500_000,
+        },
+    )
+    .unwrap();
+    assert_eq!(budget.consumed().unwrap().tokens, 10);
 }

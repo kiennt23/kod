@@ -259,9 +259,17 @@ fn private_subdir(path: &std::path::Path) -> Result<std::path::PathBuf> {
 enum AdapterOrigin {
     Production,
     #[cfg(feature = "connected-test-support")]
-    Loopback(String),
+    Loopback(String, Option<Arc<crate::acceptance::SuiteBudget>>),
 }
 impl AdapterOrigin {
+    /// Acceptance only: the suite-wide ledger every model request must reserve against.
+    fn suite(&self) -> Option<Arc<crate::acceptance::SuiteBudget>> {
+        match self {
+            Self::Production => None,
+            #[cfg(feature = "connected-test-support")]
+            Self::Loopback(_, suite) => suite.clone(),
+        }
+    }
     fn open(
         &self,
         config: &crate::config::FsConfig,
@@ -274,7 +282,7 @@ impl AdapterOrigin {
                 dir,
             ),
             #[cfg(feature = "connected-test-support")]
-            Self::Loopback(api) => kod_tool_gateway::github::GitHub::with_test_api(
+            Self::Loopback(api, _) => kod_tool_gateway::github::GitHub::with_test_api(
                 config.github.product.clone(),
                 config.github.app.clone(),
                 dir,
@@ -334,9 +342,13 @@ fn assemble(
         policy: policy.clone(),
         audit: audit.clone(),
     });
-    registry.set_reservation_sink(Arc::new(crate::runtime::model_sink::DurableSink(
+    let durable = Arc::new(crate::runtime::model_sink::DurableSink(
         p.dispatcher_db.clone(),
-    )))?;
+    ));
+    registry.set_reservation_sink(match origin.suite() {
+        Some(budget) => Arc::new(crate::acceptance::SuiteSink::new(budget, durable)),
+        None => durable,
+    })?;
     let github =
         Arc::new(origin.open(config, &private_subdir(&p.credential_dir.join("publish"))?)?);
     let workspace = Arc::new(crate::workspace::CollectedWorkspace::default());
@@ -423,9 +435,10 @@ impl Service {
         config: Arc<crate::config::FsConfig>,
         parts: Parts,
         api: &str,
+        suite: Option<Arc<crate::acceptance::SuiteBudget>>,
     ) -> Result<Service> {
         use anyhow::Context;
-        let origin = AdapterOrigin::Loopback(api.to_owned());
+        let origin = AdapterOrigin::Loopback(api.to_owned(), suite);
         let root = config
             .paths
             .dispatcher_db

@@ -11,6 +11,8 @@ pub struct Fixture {
     pub config: Arc<FsConfig>,
     pub service: Option<Service>,
     pub provider: Provider,
+    /// Acceptance: every model request reserves against this ledger before forwarding.
+    pub suite: Option<Arc<crate::acceptance::SuiteBudget>>,
 }
 impl Fixture {
     pub async fn new(config: &FsConfig) -> Result<Self> {
@@ -39,6 +41,7 @@ impl Fixture {
             config: Arc::new(cfg),
             service: None,
             provider,
+            suite: None,
         })
     }
     pub async fn start(&mut self) -> Result<()> {
@@ -58,8 +61,13 @@ impl Fixture {
         })
         .await??;
         self.service = Some(
-            Service::start_connected_fixture(self.config.clone(), parts, &self.provider.api)
-                .await?,
+            Service::start_connected_fixture(
+                self.config.clone(),
+                parts,
+                &self.provider.api,
+                self.suite.clone(),
+            )
+            .await?,
         );
         Ok(())
     }

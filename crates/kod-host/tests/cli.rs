@@ -46,6 +46,15 @@ fn missing_authorization_blocks_before_network_and_sanitizes_errors() {
     let report: serde_json::Value =
         serde_json::from_slice(&std::fs::read(root.join("evidence/report.json")).unwrap()).unwrap();
     assert_eq!(report["outcome"], "blocked");
+    // Blocked for the authorization itself, not for some other reason.
+    assert!(
+        report["blocked"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b == "authorization")
+    );
+    assert_eq!(report["model_requests"], 0);
 }
 #[test]
 fn malformed_config_and_evidence_failure_are_sanitized_blocked_exits() {

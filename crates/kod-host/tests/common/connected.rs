@@ -163,6 +163,12 @@ impl ConnectedFixture {
             docker,
         }
     }
+    /// Authorizes only `requests` model requests for the whole suite (generous tokens/cost).
+    pub fn cap_requests(&self, requests: u64) {
+        let mut cfg: Value = serde_json::from_slice(&std::fs::read(&self.config).unwrap()).unwrap();
+        cfg["acceptance"] = json!({"disposable_repo":"acme/app","authorization_ref":self.dir.path().join("authorization.json"),"expires_at":"2099-01-01T00:00:00Z","max_requests":requests,"max_tokens":100000,"max_cost_micro_usd":100000,"scenario_deadline_secs":60});
+        put(&self.config, cfg.to_string());
+    }
     pub fn accept(&self) -> (std::process::Output, Value) {
         let evidence = self.dir.path().join("evidence");
         let out = Command::new(env!("CARGO_BIN_EXE_kod-host"))

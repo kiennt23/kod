@@ -8,12 +8,20 @@ mod report;
 use crate::config::FsConfig;
 use anyhow::Result;
 pub use auth::{AcceptanceConfig, authorize};
-pub use budget::{Spend, SuiteBudget};
+pub use budget::{Spend, SuiteBudget, SuiteSink};
 pub use report::{
     DOCKER_SCENARIOS, Execution, LIVE_SCENARIOS, Mode, Observation, ObservationCode, Outcome,
     Report, Scenario,
 };
-use std::path::Path;
+use sha2::Digest;
+use std::{path::Path, sync::Arc};
+
+/// Docker fixtures spend nothing real; the cap only has to cover all 15 scenarios with margin.
+const DOCKER_DEFAULT_CAPS: Spend = Spend {
+    requests: 1000,
+    tokens: 100_000_000,
+    cost_micro_usd: 100_000_000,
+};
 
 pub fn preflight_report(mode: Mode, config: &FsConfig) -> Report {
     let mut report = Report::new(mode);
@@ -51,16 +59,19 @@ pub fn preflight_report(mode: Mode, config: &FsConfig) -> Report {
 pub async fn run(config: &FsConfig, evidence_path: &Path, mode: Mode) -> Result<Report> {
     let evidence_path = evidence::create(evidence_path)?;
     let mut report = preflight_report(mode, config);
+    // One suite-wide ledger for every model request of this run; docker fixtures get a generous default.
+    let suite = Arc::new(SuiteBudget::new(match &config.acceptance {
+        Some(a) => a.caps(),
+        None => DOCKER_DEFAULT_CAPS,
+    })?);
     if report.blocked.is_empty() {
         match mode {
             Mode::Docker => {
                 #[cfg(feature = "connected-test-support")]
-                match docker::run(config, &evidence_path).await {
+                match docker::run(config, &evidence_path, suite.clone()).await {
                     Ok(execution) => {
                         report.scenarios = execution.scenarios;
                         report.external_writes = execution.external_writes;
-                        report.model_requests = execution.spend.requests;
-                        report.actual_spend = execution.spend;
                     }
                     Err(e) => {
                         eprintln!("acceptance execution failed: {e:#}");
@@ -80,6 +91,24 @@ pub async fn run(config: &FsConfig, evidence_path: &Path, mode: Mode) -> Result<
                     .push("live_driver_and_gate_prerequisites".into());
             }
         }
+    }
+    // The real ledger, also when execution errored or was stopped by the cap.
+    report.actual_spend = suite.consumed()?;
+    report.model_requests = report.actual_spend.requests;
+    if suite.refused() {
+        report.blocked.push("suite_budget_exhausted".into());
+    }
+    #[cfg(feature = "connected-test-support")]
+    if mode == Mode::Docker {
+        (report.deployed_commit, report.image_digests) = docker::provenance(config);
+    }
+    if let Some(a) = &config.acceptance {
+        report.repository = Some(a.disposable_repo.clone());
+        report.authorization_sha256 = std::fs::read(&a.authorization_ref)
+            .ok()
+            .map(|b| format!("{:x}", sha2::Sha256::digest(b)));
+    } else if mode == Mode::Docker {
+        report.repository = Some(config.github.product.repo.clone());
     }
     evidence::write(&evidence_path, &report.json()?)?;
     Ok(report)

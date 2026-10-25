@@ -181,6 +181,7 @@ impl Report {
                 "live_driver_and_gate_prerequisites",
                 "connected_test_support_disabled",
                 "scenario_execution_failed",
+                "suite_budget_exhausted",
                 "docker_prerequisites"
             ]
             .contains(&code.as_str())),

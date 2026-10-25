@@ -12,11 +12,13 @@ impl std::fmt::Display for Stage {
         write!(f, "scenario {}", self.0)
     }
 }
-use super::{DOCKER_SCENARIOS, Execution, Observation, ObservationCode, Outcome, Scenario, Spend};
+use super::{
+    DOCKER_SCENARIOS, Execution, Observation, ObservationCode, Outcome, Scenario, SuiteBudget,
+};
 use crate::config::FsConfig;
 use anyhow::{Context, Result, ensure};
 use fixture::Fixture;
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
 pub fn preflight(config: &FsConfig) -> Result<()> {
     ensure!(
@@ -56,12 +58,49 @@ fn observed(name: &str, ok: bool, observation: Observation) -> Scenario {
         observations: vec![observation],
     }
 }
-pub async fn run(config: &FsConfig, evidence: &Path) -> Result<Execution> {
+/// Best-effort provenance knowable in Docker mode: the kod commit under test and the sandbox image ids.
+pub fn provenance(config: &FsConfig) -> (Option<String>, Vec<String>) {
+    let out = |cmd: &str, args: &[&str]| {
+        std::process::Command::new(cmd)
+            .args(args)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_owned())
+    };
+    let commit = out(
+        "git",
+        &["-C", env!("CARGO_MANIFEST_DIR"), "rev-parse", "HEAD"],
+    )
+    .filter(|c| c.len() == 40 && c.bytes().all(|b| b.is_ascii_hexdigit()));
+    let mut digests: Vec<String> = [&config.sandbox.agent_image, &config.sandbox.collector_image]
+        .into_iter()
+        .filter_map(|i| out("docker", &["image", "inspect", "--format", "{{.Id}}", i]))
+        .collect();
+    digests.sort();
+    digests.dedup();
+    (commit, digests)
+}
+pub async fn run(config: &FsConfig, evidence: &Path, suite: Arc<SuiteBudget>) -> Result<Execution> {
     preflight(config)?;
     let mut fixture = Fixture::new(config).await?;
+    fixture.suite = Some(suite.clone());
     fixture.start().await?;
     let result = conformance(&mut fixture, evidence).await;
     let cleanup = fixture.shutdown().await;
+    // Recorded even when a scenario errored, so a budget stop is independently observable.
+    let received = fixture
+        .provider
+        .state
+        .lock()
+        .map_err(|_| anyhow::anyhow!("provider lock"))?
+        .models
+        .len();
+    fixture::private_write(
+        &evidence.join("provider-observations.json"),
+        &serde_json::to_vec(&serde_json::json!({"model_requests_received": received}))?,
+    )?;
     let mut execution = result?;
     cleanup?;
     let state = fixture
@@ -76,13 +115,7 @@ pub async fn run(config: &FsConfig, evidence: &Path) -> Result<Execution> {
             .filter(|(method, path, _)| method != "GET" && path.starts_with("/repos/"))
             .count(),
     )?;
-    execution.spend = Spend {
-        requests: u64::try_from(state.models.len())?,
-        tokens: u64::try_from(state.models.len())?
-            .checked_mul(15)
-            .context("usage overflow")?,
-        cost_micro_usd: 0,
-    };
+    execution.spend = suite.consumed()?;
     for name in DOCKER_SCENARIOS {
         if !execution.scenarios.iter().any(|s| s.name == *name) {
             execution.scenarios.push(Scenario {
