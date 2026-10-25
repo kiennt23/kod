@@ -32,7 +32,12 @@ impl ConnectedFixture {
         let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let root = dir.path().canonicalize().unwrap();
         directory(&root);
-        let network = format!("kod-connected-{}", std::process::id());
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let network = format!(
+            "kod-connected-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
         let image=std::env::var("KOD_CONNECTED_IMAGE").unwrap_or_else(|_|"kod-connected-acceptance-sandbox@sha256:9865537ca85e074e4bea0ac25340ed7852d1a185726d15393a7878d174d851a3".into());
         if docker {
             assert!(
@@ -101,7 +106,7 @@ impl ConnectedFixture {
         let gateway = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
         let port = gateway.local_addr().unwrap().port();
         drop(gateway);
-        let relay = format!("kod-relay-{}", std::process::id());
+        let relay = format!("{network}-relay");
         let host: String = if !docker {
             "127.0.0.1".into()
         } else {
@@ -109,25 +114,26 @@ impl ConnectedFixture {
             let perl = format!(
                 "use IO::Socket::INET;$SIG{{CHLD}}='IGNORE';my $l=IO::Socket::INET->new(LocalPort=>{port},Listen=>64,ReuseAddr=>1) or die;while(my $c=$l->accept){{next if fork;my $u=IO::Socket::INET->new(PeerAddr=>'host.docker.internal:{port}') or exit;if(fork){{while(sysread($c,my $b,65536)){{syswrite($u,$b)}}}}else{{while(sysread($u,my $b,65536)){{syswrite($c,$b)}}}}exit}}"
             );
+            let ran = Command::new("docker")
+                .args([
+                    "run",
+                    "-d",
+                    "--name",
+                    &relay,
+                    "--add-host",
+                    "host.docker.internal:host-gateway",
+                    "--entrypoint",
+                    "perl",
+                    &image,
+                    "-e",
+                    &perl,
+                ])
+                .output()
+                .unwrap();
             assert!(
-                Command::new("docker")
-                    .args([
-                        "run",
-                        "-d",
-                        "--name",
-                        &relay,
-                        "--add-host",
-                        "host.docker.internal:host-gateway",
-                        "--entrypoint",
-                        "perl",
-                        &image,
-                        "-e",
-                        &perl
-                    ])
-                    .output()
-                    .unwrap()
-                    .status
-                    .success()
+                ran.status.success(),
+                "relay start failed: {}",
+                String::from_utf8_lossy(&ran.stderr)
             );
             assert!(
                 Command::new("docker")
@@ -179,7 +185,7 @@ impl Drop for ConnectedFixture {
             return;
         }
         let _ = Command::new("docker")
-            .args(["rm", "-f", &format!("kod-relay-{}", std::process::id())])
+            .args(["rm", "-f", &format!("{}-relay", self.network)])
             .output();
         let out = Command::new("docker")
             .args(["network", "rm", &self.network])
