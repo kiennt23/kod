@@ -34,6 +34,7 @@ test-support = []
 [dev-dependencies]
 kod-host = { path = ".", features = ["test-support"] }
 tempfile = "3"
+kod-tool-gateway = { path = "../kod-tool-gateway", features = ["test-support"] }
 kod-tracker = { path = "../kod-tracker", features = ["test-support"] }
 kod-eval = { path = "../kod-eval", features = ["connected-test-support"] }
 tower = { version = "0.5", features = ["util"] }

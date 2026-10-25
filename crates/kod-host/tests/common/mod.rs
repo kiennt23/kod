@@ -34,8 +34,17 @@ pub fn init() {
         let dir = std::env::temp_dir().join(format!("kod-fake-docker-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let argv = dir.join("argv");
+        let cases = dir.join("cases");
+        std::fs::create_dir_all(&cases).unwrap();
+        // A run with a `cases/<run>` script is driven by it: `sh cases/<run> agent|collect|export`.
+        let dispatch = format!(
+            "if [ \"$1\" = run ]; then for a in \"$@\"; do case $a in kod-agent-*) k=agent; r=${{a#kod-agent-}};; \
+             kod-collect-*) k=collect; r=${{a#kod-collect-}};; kod-export-*) k=export; r=${{a#kod-export-}};; esac; done; \
+             [ -n \"$k\" ] && [ -f '{c}'/$r ] && exec sh '{c}'/$r $k; fi\n",
+            c = cases.display()
+        );
         let script = format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{all}'\ncase \"$*\" in\n*run-77*) printf '%s\\n' \"$*\" >> '{}'\n\
+            "#!/bin/sh\n{dispatch}printf '%s\\n' \"$*\" >> '{all}'\ncase \"$*\" in\n*run-77*) printf '%s\\n' \"$*\" >> '{}'\n\
              case $1 in ps) echo container;; inspect) echo run-77;; kill) exit 0;; esac;;\n\
              *) exit 0;;\nesac\n",
             argv.display(),
@@ -47,6 +56,13 @@ pub fn init() {
         kod_eval::connected::use_docker_for_process(&docker);
         argv
     });
+}
+
+/// Install the fake docker script for a run: `$1` is agent, collect or export.
+pub fn docker_case(run: &str, script: &str) {
+    init();
+    let dir = FAKE_ARGV.get().unwrap().with_file_name("cases");
+    std::fs::write(dir.join(run), script).unwrap();
 }
 
 /// Every docker invocation any thread made (one argv per line).
@@ -87,6 +103,14 @@ pub fn admitted(root: &Path, start: &RunStart) -> Admitted {
         model_token: model_token(&start.id),
         mcp_token: mcp_token(&start.id),
     }
+}
+
+/// Optional production-like pieces: a config, a loopback GitHub API origin, a trusted base SHA.
+#[derive(Default)]
+pub struct Setup {
+    pub config: Option<Arc<FsConfig>>,
+    pub api: Option<String>,
+    pub base: Option<String>,
 }
 
 pub struct Fixture {
@@ -133,7 +157,16 @@ pub fn config(root: &Path, db: &Path) -> Arc<FsConfig> {
 impl Fixture {
     /// `execute` is the agent: it receives the admitted run and the spawn gate.
     pub fn start(execute: Execute) -> Self {
-        Self::build(tempfile::tempdir().unwrap(), execute, Arc::new(|_| {}))
+        Self::build(
+            tempfile::tempdir().unwrap(),
+            execute,
+            Arc::new(|_| {}),
+            Setup::default(),
+        )
+    }
+    /// A host over a caller-made temp dir with a real config, loopback GitHub and trusted base.
+    pub fn start_with(dir: tempfile::TempDir, execute: Execute, setup: Setup) -> Self {
+        Self::build(dir, execute, Arc::new(|_| {}), setup)
     }
     /// `on_resolve` runs inside admission, after the run is accepted and
     /// before the binding is written: a deterministic cancellation barrier.
@@ -141,7 +174,12 @@ impl Fixture {
         execute: Execute,
         on_resolve: Arc<dyn Fn(&RunStart) + Send + Sync>,
     ) -> Self {
-        Self::build(tempfile::tempdir().unwrap(), execute, on_resolve)
+        Self::build(
+            tempfile::tempdir().unwrap(),
+            execute,
+            on_resolve,
+            Setup::default(),
+        )
     }
     /// A host restart: fresh in-memory state over the same databases.
     pub fn restart(self, execute: Execute) -> Self {
@@ -160,12 +198,13 @@ impl Fixture {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         drop(runtime);
-        Self::build(dir, execute, Arc::new(|_| {}))
+        Self::build(dir, execute, Arc::new(|_| {}), Setup::default())
     }
     fn build(
         dir: tempfile::TempDir,
         execute: Execute,
         on_resolve: Arc<dyn Fn(&RunStart) + Send + Sync>,
+        setup: Setup,
     ) -> Self {
         init();
         let root = dir.path().canonicalize().unwrap();
@@ -199,15 +238,23 @@ impl Fixture {
         std::fs::create_dir_all(root.join("leases")).unwrap();
         std::fs::set_permissions(root.join("leases"), std::fs::Permissions::from_mode(0o700))
             .unwrap();
-        let cfg = config(&root, &db);
-        let github = Arc::new(
-            github::GitHub::new(
+        let cfg = setup.config.unwrap_or_else(|| config(&root, &db));
+        let github = Arc::new(match &setup.api {
+            None => github::GitHub::new(
                 cfg.github.product.clone(),
                 cfg.github.app.clone(),
                 root.join("leases"),
             )
             .unwrap(),
-        );
+            Some(api) => github::GitHub::with_test_api(
+                cfg.github.product.clone(),
+                cfg.github.app.clone(),
+                root.join("leases"),
+                api,
+                Arc::new(|| 1_800_000_000),
+            )
+            .unwrap(),
+        });
         let workspace = Arc::new(CollectedWorkspace::default());
         let (tracker, _seed) = kod_tracker::fake::sandbox();
         let tracker = Arc::new(tracker);
@@ -254,7 +301,11 @@ impl Fixture {
         let run_root = cfg.paths.run_root.clone();
         let resolve: ResolveAdmission = Arc::new(move |s| {
             on_resolve(s);
-            Ok(admitted(&run_root, s))
+            let mut a = admitted(&run_root, s);
+            if let Some(base) = &setup.base {
+                a.binding.base = base.clone();
+            }
+            Ok(a)
         });
         let runtime = Runtime::new(
             cfg,
