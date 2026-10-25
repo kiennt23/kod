@@ -53,3 +53,7 @@ required-features = ["connected-test-support"]
 [[test]]
 name = "connected_http"
 required-features = ["connected-test-support"]
+
+[[test]]
+name = "connected_preflight"
+required-features = ["connected-test-support"]
