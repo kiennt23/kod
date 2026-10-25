@@ -541,6 +541,22 @@ impl Service {
     }
 }
 
+/// Passes `result` through; on error runs the safety cleanup (blocking, so off the async threads).
+pub async fn cleanup_on_error<T>(
+    config: &Arc<crate::config::FsConfig>,
+    result: Result<T>,
+) -> Result<T> {
+    let Err(cause) = result else { return result };
+    let config = config.clone();
+    let cleaned = tokio::task::spawn_blocking(move || safety_cleanup(&config))
+        .await
+        .unwrap_or_else(|e| Err(anyhow::anyhow!("cleanup panicked: {e}")));
+    Err(match cleaned {
+        Ok(()) => cause,
+        Err(e) => cause.context(format!("safety cleanup incomplete: {e:#}")),
+    })
+}
+
 /// Process exit sequence: drop the runtime without waiting forever on a stuck blocking task, then
 /// always run the tracker revoke. A failure of either is reported.
 pub fn exit_sequence<T>(

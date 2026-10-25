@@ -546,3 +546,20 @@ async fn a_start_failure_before_recovery_still_cleans_up_durable_runs() {
         "{calls}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_parts_failure_cleans_up_without_blocking_the_async_threads() {
+    let w = world();
+    let id = seed_bound_run(&w, 91);
+    let r =
+        kod_host::service::cleanup_on_error::<()>(&w.config, Err(anyhow::anyhow!("parts failed")))
+            .await;
+    assert!(format!("{:#}", r.unwrap_err()).contains("parts failed"));
+    let calls = common::docker_calls();
+    assert!(
+        calls
+            .lines()
+            .any(|l| l.contains(&format!("kod-agent-{id}"))),
+        "{calls}"
+    );
+}

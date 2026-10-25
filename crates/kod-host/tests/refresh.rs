@@ -746,3 +746,23 @@ fn a_blocked_story_is_logged_and_audited_only_when_the_state_changes() {
     log.record(&audit, STORY, &e1);
     assert_eq!(count(), 3, "blocked again after recovering");
 }
+
+#[test]
+fn another_storys_publish_attempt_does_not_block_this_story() {
+    let r = rig();
+    let src = workflow(&r, vec![]);
+    let c = kod_dispatcher::store::open(&r.w.config.paths.dispatcher_db).unwrap();
+    c.execute(
+        "INSERT INTO runs(seq,ticket,revision,state) VALUES(1,'acme/tasks#9','v1','needs_human')",
+        [],
+    )
+    .unwrap();
+    c.execute(
+        "INSERT INTO followups(kind,target,arg,next_at,done) VALUES('check_publish','run-1','',0,1)",
+        [],
+    )
+    .unwrap();
+    drop(c);
+    go_with(&r, &src).unwrap();
+    assert_eq!(posts(&r), 1);
+}

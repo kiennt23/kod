@@ -54,16 +54,11 @@ fn main() -> Result<()> {
                     std::str::from_utf8(&secret)?.trim(),
                 )?;
                 let tracker = std::sync::Arc::new(tracker);
-                let parts = match kod_host::service::production_parts(&config, tracker.clone()) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        let cleanup = kod_host::service::safety_cleanup(&config);
-                        return Err(match cleanup {
-                            Ok(()) => e,
-                            Err(c) => e.context(format!("safety cleanup incomplete: {c:#}")),
-                        });
-                    }
-                };
+                let parts = kod_host::service::cleanup_on_error(
+                    &config,
+                    kod_host::service::production_parts(&config, tracker.clone()),
+                )
+                .await?;
                 kod_host::service::serve_refreshing(
                     config.clone(),
                     parts,

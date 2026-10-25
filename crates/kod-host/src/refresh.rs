@@ -154,8 +154,8 @@ impl Source for WorkflowSource {
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         )?
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM runs WHERE ticket=?1 AND state IN ('publishing','done')
-                OR EXISTS(SELECT 1 FROM followups f WHERE f.kind='check_publish' AND f.target='run-'||runs.seq))",
+            "SELECT EXISTS(SELECT 1 FROM runs WHERE ticket=?1 AND (state IN ('publishing','done')
+                OR EXISTS(SELECT 1 FROM followups f WHERE f.kind='check_publish' AND f.target='run-'||runs.seq)))",
             [story],
             |r| r.get(0),
         )?;
