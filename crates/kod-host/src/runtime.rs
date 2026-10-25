@@ -140,6 +140,11 @@ impl Runtime {
             barrier: Mutex::default(),
         })
     }
+    /// Acceptance/test hook: the trusted collected-result store.
+    #[cfg(feature = "test-support")]
+    pub fn workspace(&self) -> &Arc<CollectedWorkspace> {
+        &self.adapters.workspace
+    }
     /// The tool gateway the runtime registers MCP run tokens with.
     pub fn tool(&self) -> &Arc<kod_tool_gateway::Gateway> {
         &self.adapters.tool

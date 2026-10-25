@@ -25,7 +25,7 @@ fn connected_conformance_2_4_7() {
     let h = connected::ConnectedFixture::docker();
     let (out, report) = h.accept();
     println!("{}", String::from_utf8_lossy(&out.stderr));
-    // Scenarios not yet implemented stay blocked, so the suite is never green (exit 2), never failed (1).
+    // Only the later lifecycle scenarios stay blocked, so the suite is never green (exit 2), never failed (1).
     assert_eq!(out.status.code(), Some(2), "report: {report}");
     assert!(
         report["scenarios"]
@@ -34,12 +34,40 @@ fn connected_conformance_2_4_7() {
             .iter()
             .all(|s| s["outcome"] != "fail")
     );
-    assert!(report["executed"].as_u64().unwrap() >= 4);
+    assert_eq!(report["executed"].as_u64().unwrap(), 10, "report: {report}");
+    let blocked: Vec<_> = report["scenarios"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["outcome"] == "blocked")
+        .map(|s| s["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        blocked,
+        [
+            "cancel-revokes-queued-and-streaming-requests",
+            "label-removal-revokes-run",
+            "kill-confirms-container-absence",
+            "restart-never-resumes-and-reconciles-publish",
+            "kill-during-dependency-outages"
+        ]
+    );
+    for s in report["scenarios"].as_array().unwrap() {
+        if s["outcome"] == "pass" {
+            assert!(!s["observations"].as_array().unwrap().is_empty());
+        }
+    }
     for name in [
         "connected-ingress-safety",
         "mcp-tool-call",
         "planted-secret-denied-and-audited",
         "draft-pr-story-agent-trailers",
+        "connected-gateway-safety",
+        "collector-integrity",
+        "approval-refresh",
+        "current-source-fail-closed",
+        "status-comment-reconciliation",
+        "gate-container-isolation",
     ] {
         assert!(passed(&report, name), "{name} missing in {report}");
     }

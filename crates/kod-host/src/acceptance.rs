@@ -53,8 +53,7 @@ pub async fn run(config: &FsConfig, evidence_path: &Path, mode: Mode) -> Result<
     let mut report = preflight_report(mode, config);
     if report.blocked.is_empty() {
         match mode {
-            Mode::Docker =>
-            {
+            Mode::Docker => {
                 #[cfg(feature = "connected-test-support")]
                 match docker::run(config, &evidence_path).await {
                     Ok(execution) => {
@@ -63,9 +62,12 @@ pub async fn run(config: &FsConfig, evidence_path: &Path, mode: Mode) -> Result<
                         report.model_requests = execution.spend.requests;
                         report.actual_spend = execution.spend;
                     }
-                    Err(_) => {
-                        if let Some(first) = report.scenarios.first_mut() {
-                            first.outcome = Outcome::Fail;
+                    Err(e) => {
+                        // Blame only the scenario that was running, not an unrelated one.
+                        if let Some(stage) = e.downcast_ref::<docker::Stage>()
+                            && let Some(s) = report.scenarios.iter_mut().find(|s| s.name == stage.0)
+                        {
+                            s.outcome = Outcome::Fail;
                         }
                         report.blocked.push("scenario_execution_failed".into());
                     }

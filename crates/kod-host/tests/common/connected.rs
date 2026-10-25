@@ -10,6 +10,7 @@ pub struct ConnectedFixture {
     pub dir: tempfile::TempDir,
     pub config: PathBuf,
     pub network: String,
+    docker: bool,
 }
 pub fn put(path: &Path, bytes: impl AsRef<[u8]>) {
     std::fs::write(path, bytes).unwrap();
@@ -21,19 +22,28 @@ fn directory(path: &Path) {
 }
 impl ConnectedFixture {
     pub fn docker() -> Self {
+        Self::build(true)
+    }
+    /// Same configuration with no Docker network or relay, for loopback HTTP-level tests.
+    pub fn local() -> Self {
+        Self::build(false)
+    }
+    fn build(docker: bool) -> Self {
         let dir = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let root = dir.path().canonicalize().unwrap();
         directory(&root);
         let network = format!("kod-connected-{}", std::process::id());
         let image=std::env::var("KOD_CONNECTED_IMAGE").unwrap_or_else(|_|"kod-connected-acceptance-sandbox@sha256:9865537ca85e074e4bea0ac25340ed7852d1a185726d15393a7878d174d851a3".into());
-        assert!(
-            Command::new("docker")
-                .args(["network", "create", "--internal", &network])
-                .output()
-                .unwrap()
-                .status
-                .success()
-        );
+        if docker {
+            assert!(
+                Command::new("docker")
+                    .args(["network", "create", "--internal", &network])
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        }
         let p = |s: &str| root.join(s);
         for d in ["runs", "credentials", "mirror", "snapshots", "secrets"] {
             directory(&p(d));
@@ -92,7 +102,9 @@ impl ConnectedFixture {
         let port = gateway.local_addr().unwrap().port();
         drop(gateway);
         let relay = format!("kod-relay-{}", std::process::id());
-        let host: String = if cfg!(target_os = "macos") {
+        let host: String = if !docker {
+            "127.0.0.1".into()
+        } else if cfg!(target_os = "macos") {
             // Docker Desktop/OrbStack cannot route an internal network to the host: forward through a relay attached to both networks.
             let perl = format!(
                 "use IO::Socket::INET;$SIG{{CHLD}}='IGNORE';my $l=IO::Socket::INET->new(LocalPort=>{port},Listen=>64,ReuseAddr=>1) or die;while(my $c=$l->accept){{next if fork;my $u=IO::Socket::INET->new(PeerAddr=>'host.docker.internal:{port}') or exit;if(fork){{while(sysread($c,my $b,65536)){{syswrite($u,$b)}}}}else{{while(sysread($u,my $b,65536)){{syswrite($c,$b)}}}}exit}}"
@@ -148,6 +160,7 @@ impl ConnectedFixture {
             dir,
             config,
             network,
+            docker,
         }
     }
     pub fn accept(&self) -> (std::process::Output, Value) {
@@ -166,6 +179,9 @@ impl ConnectedFixture {
 }
 impl Drop for ConnectedFixture {
     fn drop(&mut self) {
+        if !self.docker {
+            return;
+        }
         let _ = Command::new("docker")
             .args(["rm", "-f", &format!("kod-relay-{}", std::process::id())])
             .output();

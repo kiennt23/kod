@@ -1,6 +1,16 @@
 //! Deterministic upstream simulation around the production connected composition.
 pub mod fixture;
 pub mod provider;
+mod scenarios;
+
+/// The scenario being executed when an error occurred; it is the one reported as failed.
+#[derive(Debug)]
+pub struct Stage(pub &'static str);
+impl std::fmt::Display for Stage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "scenario {}", self.0)
+    }
+}
 use super::{DOCKER_SCENARIOS, Execution, Observation, ObservationCode, Outcome, Scenario, Spend};
 use crate::config::FsConfig;
 use anyhow::{Context, Result, ensure};
@@ -83,9 +93,17 @@ pub async fn run(config: &FsConfig, evidence: &Path) -> Result<Execution> {
     }
     Ok(execution)
 }
+// The provider guard is dropped explicitly before the next await; clippy cannot see through drop().
+#[allow(clippy::await_holding_lock)]
 async fn conformance(h: &mut Fixture, evidence: &Path) -> Result<Execution> {
     let mut execution = Execution::default();
-    let wrong = h.webhook("invalid-signature", b"{}", false).await?;
+    let stage = |n: &'static str| Stage(n);
+    // A valid-shaped payload, so the rejection can only be for its signature.
+    let shaped = h.payload("labeled", "kiennt23")?;
+    let wrong = h
+        .webhook("invalid-signature", &shaped, false)
+        .await
+        .context(stage("connected-ingress-safety"))?;
     let status = h.delivery("conformance", "labeled", "kiennt23").await?;
     ensure!(status.is_success(), "delivery rejected: {status}");
     ensure!(
@@ -94,7 +112,10 @@ async fn conformance(h: &mut Fixture, evidence: &Path) -> Result<Execution> {
             .is_success(),
         "duplicate rejected"
     );
-    let (run, state) = h.terminal().await?;
+    let (run, state) = h
+        .terminal()
+        .await
+        .context(stage("draft-pr-story-agent-trailers"))?;
     let audit = h.audit()?;
     fixture::private_write(
         &evidence.join("audit-observations.json"),
@@ -111,9 +132,23 @@ async fn conformance(h: &mut Fixture, evidence: &Path) -> Result<Execution> {
             ..Default::default()
         },
     ));
-    let successful = audit
+    let records: Vec<(u64, serde_json::Value)> = audit
         .iter()
-        .find(|(_, p)| p.contains("read_doc") && p.contains("design-v1"));
+        .filter_map(|(seq, p)| Some((*seq, serde_json::from_str(p).ok()?)))
+        .collect();
+    let decision = |target: &str, allow: bool| {
+        records.iter().find(|(_, v)| {
+            v["kind"] == "policy_decision"
+                && v["input"]["target"]["id"] == target
+                && v["decision"]["allow"] == allow
+        })
+    };
+    // The read must have been allowed and then actually succeeded.
+    let successful = decision("design-v1", true).and_then(|_| {
+        records.iter().find(|(_, v)| {
+            v["kind"] == "tool_result" && v["tool"] == "read_doc" && v["result"] == "ok"
+        })
+    });
     execution.scenarios.push(observed(
         "mcp-tool-call",
         successful.is_some(),
@@ -123,9 +158,7 @@ async fn conformance(h: &mut Fixture, evidence: &Path) -> Result<Execution> {
             ..Default::default()
         },
     ));
-    let denied = audit
-        .iter()
-        .find(|(_, p)| p.contains("planted-secret") && (p.contains("deny") || p.contains("false")));
+    let denied = decision("planted-secret", false);
     execution.scenarios.push(observed(
         "planted-secret-denied-and-audited",
         denied.is_some(),
@@ -186,5 +219,9 @@ async fn conformance(h: &mut Fixture, evidence: &Path) -> Result<Execution> {
             ..Default::default()
         },
     ));
+    drop(remote);
+    execution
+        .scenarios
+        .extend(scenarios::run(h, evidence).await?);
     Ok(execution)
 }

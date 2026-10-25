@@ -75,6 +75,10 @@ impl Fixture {
         action: &str,
         actor: &str,
     ) -> Result<reqwest::StatusCode> {
+        let body = self.payload(action, actor)?;
+        self.webhook(id, &body, true).await
+    }
+    pub fn payload(&self, action: &str, actor: &str) -> Result<Vec<u8>> {
         let issue = self
             .provider
             .state
@@ -82,10 +86,9 @@ impl Fixture {
             .map_err(|_| anyhow::anyhow!("provider lock"))?
             .issue
             .clone();
-        let body = serde_json::to_vec(
+        Ok(serde_json::to_vec(
             &json!({"action":action,"repository":{"full_name":"acme/app"},"sender":{"id":9,"login":actor,"type":"User"},"issue":issue,"label":{"name":"kod"}}),
-        )?;
-        self.webhook(id, &body, true).await
+        )?)
     }
     pub async fn webhook(&self, id: &str, body: &[u8], valid: bool) -> Result<reqwest::StatusCode> {
         use hmac::{Hmac, Mac};

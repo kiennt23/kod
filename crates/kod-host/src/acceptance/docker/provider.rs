@@ -49,6 +49,9 @@ pub struct Remote {
     pub issue: Value,
     pub live: Vec<String>,
     pub fail: bool,
+    /// Owned status comments; a create with `lose_create` is stored but its response is lost.
+    pub comments: Vec<Value>,
+    pub lose_create: bool,
     pub model_blocked: Arc<std::sync::atomic::AtomicBool>,
     pub model_entered: Arc<tokio::sync::Notify>,
 }
@@ -214,6 +217,34 @@ fn serve(s: &mut Remote, m: &str, p: &str, b: Value) -> Result<(u16, Value)> {
             }
         }
         return Ok((200, s.issue.clone()));
+    }
+    if p == "/repos/acme/app/issues/7/comments" && m == "GET" {
+        return Ok((200, json!(s.comments)));
+    }
+    if p == "/repos/acme/app/issues/7/comments"
+        && m == "POST"
+        && b["body"]
+            .as_str()
+            .is_some_and(|t| t.starts_with("<!-- kod:status -->"))
+    {
+        let url = s.issue["repository_url"].as_str().context("url")?;
+        let comment = json!({"id":900 + s.comments.len(),"issue_url":format!("{url}/issues/7"),"body":b["body"],"user":{"id":4,"login":"kod-bot","type":"Bot"}});
+        s.comments.push(comment.clone());
+        return Ok(if s.lose_create {
+            (500, json!({}))
+        } else {
+            (201, comment)
+        });
+    }
+    if let Some(id) = p.strip_prefix("/repos/acme/app/issues/comments/")
+        && m == "PATCH"
+        && let Some(c) = s
+            .comments
+            .iter_mut()
+            .find(|c| c["id"].as_u64() == id.parse().ok())
+    {
+        c["body"] = b["body"].clone();
+        return Ok((200, c.clone()));
     }
     if p.ends_with("/sub_issues") || p.ends_with("/comments") {
         return Ok((if m == "GET" { 200 } else { 201 }, json!([])));

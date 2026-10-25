@@ -49,3 +49,7 @@ futures-util = "0.3"
 [[test]]
 name = "connected_docker"
 required-features = ["connected-test-support"]
+
+[[test]]
+name = "connected_http"
+required-features = ["connected-test-support"]
