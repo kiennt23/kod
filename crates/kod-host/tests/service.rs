@@ -633,12 +633,20 @@ fn leftover_refresh_and_activate_leases_are_revoked_and_unconfirmed_ones_fail() 
         assert!(gh(&w, sub, &bad).open_pulls().is_err());
         // Unconfirmed revoke: recovery errors (admission stays closed).
         assert!(
-            kod_host::service::recover_leases_with(&w.config, &|d| Ok(gh_at(&w, d, &bad))).is_err(),
+            kod_host::service::recover_leases_with(
+                &w.config,
+                &kod_host::service::LEASE_DIRS,
+                &|d| Ok(gh_at(&w, d, &bad))
+            )
+            .is_err(),
             "{sub}"
         );
         // Confirmed revoke succeeds and actually calls DELETE.
         let (good, calls) = lease_api(204);
-        kod_host::service::recover_leases_with(&w.config, &|d| Ok(gh_at(&w, d, &good))).unwrap();
+        kod_host::service::recover_leases_with(&w.config, &kod_host::service::LEASE_DIRS, &|d| {
+            Ok(gh_at(&w, d, &good))
+        })
+        .unwrap();
         assert!(
             calls
                 .lock()

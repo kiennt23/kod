@@ -432,9 +432,10 @@ impl Service {
             })
         };
         t("recover");
-        // Unconfirmed lease revocation refuses the start, so admission never opens.
+        // Unconfirmed revocation refuses the start, so admission never opens. The live publish
+        // GitHub owns its dir lock and is recovered by runtime cleanup.
         let leased = config.clone();
-        tokio::task::spawn_blocking(move || recover_leases(&leased))
+        tokio::task::spawn_blocking(move || recover_leases(&leased, &LEASE_DIRS[1..]))
             .await
             .context("lease recovery panicked")??;
         let (db, tracker, gateway) = (p.dispatcher_db.clone(), parts_tracker, runtime.clone());
@@ -744,9 +745,10 @@ pub const LEASE_DIRS: [&str; 3] = ["publish", "refresh", "activate"];
 /// Revokes every leftover lease in each product dir; every dir is attempted, any unconfirmed revoke is an error.
 pub fn recover_leases_with(
     config: &crate::config::FsConfig,
+    dirs: &[&str],
     open: &dyn Fn(&std::path::Path) -> Result<kod_tool_gateway::github::GitHub>,
 ) -> Result<()> {
-    let errors: Vec<String> = LEASE_DIRS
+    let errors: Vec<String> = dirs
         .iter()
         .filter_map(|name| {
             private_subdir(&config.paths.credential_dir.join(name))
@@ -760,8 +762,8 @@ pub fn recover_leases_with(
     Ok(())
 }
 
-pub fn recover_leases(config: &crate::config::FsConfig) -> Result<()> {
-    recover_leases_with(config, &|d| {
+pub fn recover_leases(config: &crate::config::FsConfig, dirs: &[&str]) -> Result<()> {
+    recover_leases_with(config, dirs, &|d| {
         kod_tool_gateway::github::GitHub::new(
             config.github.product.clone(),
             config.github.app.clone(),
@@ -805,7 +807,7 @@ pub fn safety_cleanup(config: &crate::config::FsConfig) -> Result<()> {
             Err(e) => errors.push(format!("reading bound runs: {e:#}")),
         }
     }
-    if let Err(e) = recover_leases(config) {
+    if let Err(e) = recover_leases(config, &LEASE_DIRS) {
         errors.push(format!("credential leases: {e:#}"));
     }
     anyhow::ensure!(
