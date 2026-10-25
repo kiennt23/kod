@@ -45,8 +45,12 @@ pub fn preflight_report(mode: Mode, config: &FsConfig) -> Report {
                     .push("connected_test_support_disabled".into());
             }
             #[cfg(feature = "connected-test-support")]
-            if docker::preflight(config).is_err() {
+            if let Err(e) = docker::preflight(config) {
                 report.blocked.push("docker_prerequisites".into());
+                report
+                    .blocked_reasons
+                    .push(format!("docker_prerequisites: {e:#}"));
+                eprintln!("acceptance blocked: docker_prerequisites: {e:#}");
             }
         }
     }

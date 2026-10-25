@@ -82,6 +82,8 @@ pub struct Report {
     pub mode: Mode,
     pub scenarios: Vec<Scenario>,
     pub blocked: Vec<String>,
+    /// Why each blocker fired (error chains), so a blocked run explains itself.
+    pub blocked_reasons: Vec<String>,
     pub external_writes: u64,
     pub model_requests: u64,
     pub configured_spend: Spend,
@@ -109,6 +111,7 @@ impl Report {
                 })
                 .collect(),
             blocked: vec![],
+            blocked_reasons: vec![],
             external_writes: 0,
             model_requests: 0,
             configured_spend: Spend::default(),
