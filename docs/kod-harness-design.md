@@ -726,6 +726,11 @@ Decisions taken in the phase 1 plans and code that the sections above do not sta
 | Logins are GitHub logins, compared lower-cased. Approvals from agents, or without an explicit `agent: false`, deny a merge. | [policy](superpowers/plans/2026-10-15-phase1-policy.md) |
 | The tracker contract has a fake adapter and a contract test; a real adapter is supported once it passes it. | [tracker contract](superpowers/plans/2026-10-15-phase1-tracker-contract.md) |
 | The gate runner and the workflow status view are separate crates. Status is computed on every read from the host's records and the dispatcher database (opened read-only). | [gates](superpowers/plans/2026-10-22-phase1-gates.md), [status](superpowers/plans/2026-10-22-phase1-status.md) |
+| Workflow status refresh fails closed (logged and audited) for a story with rework records, until rework reconciliation exists. Cost if wrong: those stories get no status updates. | [host](superpowers/plans/2026-10-23-phase1-connected-host.md) |
+| Workflow status refresh also fails closed for a story with any publish attempt, until there is a source for merged or closed PRs. Cost if wrong: published stories get no status updates. | [host](superpowers/plans/2026-10-23-phase1-connected-host.md) |
+| A story's status is shown only when the issue reporter is a team member (tracker audience). Cost if wrong: the wrong stories are shown or hidden; changing it is one function. | [host](superpowers/plans/2026-10-23-phase1-connected-host.md) |
+| Listing open PRs uses a write-scoped GitHub token, revoked straight after use; leftovers are revoked at startup. Cost if wrong: a failed revoke leaves the token live for up to 1 hour (tracked in #39). | [host](superpowers/plans/2026-10-23-phase1-connected-host.md) |
+| Test seams in kod-host are enabled only through dev-dependencies. Cost if wrong: a release build with `--all-features` compiles them in. | [host](superpowers/plans/2026-10-23-phase1-connected-host.md) |
 
 ## Risks
 
