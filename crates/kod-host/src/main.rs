@@ -64,12 +64,12 @@ fn main() -> Result<()> {
                         let term = tokio::signal::unix::signal(
                             tokio::signal::unix::SignalKind::terminate(),
                         );
-                        match term {
-                            Ok(mut term) => tokio::select! {
+                        // No handler means shut down at once (fail closed), not panic.
+                        if let Ok(mut term) = term {
+                            tokio::select! {
                                 _ = tokio::signal::ctrl_c() => {}
                                 _ = term.recv() => {}
-                            },
-                            Err(_) => {}
+                            }
                         }
                     },
                 )
