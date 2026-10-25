@@ -1,6 +1,6 @@
 # Kod architecture (C4)
 
-C4 views of Kod, as Mermaid flowcharts drawn in C4 style. Levels 1 to 3 are here; Level 4 (code) is the Rust docs (`cargo doc --workspace --no-deps`). Elements marked **planned** are not built yet: `kod-host` is specified by [sub-plan 6b-b](superpowers/plans/2026-10-23-phase1-connected-host.md) and accepted by [6b-c](superpowers/plans/2026-10-23-phase1-connected-acceptance.md). Status of every sub-plan is in the [phase 1 overview](superpowers/plans/2026-10-14-phase1-overview.md). Rationale is in the [design doc](kod-harness-design.md).
+C4 views of Kod, as Mermaid flowcharts drawn in C4 style. Levels 1 to 3 are here; Level 4 (code) is the Rust docs (`cargo doc --workspace --no-deps`). Elements marked **planned** are not built yet. `kod-host` ([sub-plan 6b-b](superpowers/plans/2026-10-23-phase1-connected-host.md), [runbook](kod-host-runbook.md)) is built; its live acceptance is [6b-c](superpowers/plans/2026-10-23-phase1-connected-acceptance.md). Status of every sub-plan is in the [phase 1 overview](superpowers/plans/2026-10-14-phase1-overview.md). Rationale is in the [design doc](kod-harness-design.md).
 
 ## Level 1: System context
 
@@ -65,7 +65,7 @@ flowchart TB
   end
 
   subgraph gw["Gateway-mediated external operations"]
-    host["<b>kod-host (planned)</b><br/>[Rust binary]<br/>Composes dispatcher and both gateways, see Level 3"]
+    host["<b>kod-host</b><br/>[Rust binary]<br/>Composes dispatcher and both gateways, see Level 3"]
     toolgw["<b>Tool gateway</b><br/>[kod-tool-gateway, MCP]<br/>Tracker, docs, publish, run tokens"]
     llmgw["<b>LLM gateway</b><br/>[kod-llm-proxy]<br/>Budgets, routing, redacted capture"]
     disp["<b>Dispatcher</b><br/>[kod-dispatcher]<br/>Webhook, WIP, run states, kill"]
@@ -95,11 +95,10 @@ flowchart TB
   class sandbox,runner,collector,host,toolgw,llmgw,disp internal
   class dispdb db
   class gh,llm ext
-  class host planned
 ```
 
-Untrusted zone: only the sandbox, runner and collector run agent or repo code. They get opaque gateway tokens, no GitHub or model keys, no host filesystem or Docker socket, and an egress allowlist. Today the offline harness (`kod-eval`) starts them; `kod-host` taking over that role is planned.
-Gateway zone: every external write passes policy, then an audit intent, then the call. Policy is a library inside each gateway and the dispatcher, not a service. The tool and LLM gateways exist today and run in one process; `kod-host` (planned, 6b-b) is the composition binary, and 6b-a adds the GitHub broker and forge to the tool gateway.
+Untrusted zone: only the sandbox, runner and collector run agent or repo code. They get opaque gateway tokens, no GitHub or model keys, no host filesystem or Docker socket, and an egress allowlist. The offline harness (`kod-eval`) starts them for evals; `kod-host` starts them for connected runs.
+Gateway zone: every external write passes policy, then an audit intent, then the call. Policy is a library inside each gateway and the dispatcher, not a service. The tool and LLM gateways exist today and run in one process; `kod-host` (6b-b) is the composition binary, and 6b-a adds the GitHub broker and forge to the tool gateway.
 Policy (`kod-policy`) and the audit log are not drawn here; policy and audit wiring: see 2b.
 
 ### Level 2b: Control and evidence
@@ -157,11 +156,11 @@ flowchart TB
 Trusted zone: gates run on a separate host and never share a sandbox or cache. The audit chain is checked off-host against write-once checkpoints. `kod-status` reads records and has no store of its own; `kod-eval` is offline and not part of the runtime path.
 Not drawn: the owner's and backup's kill switch path bypasses policy and keeps working when policy or audit is down; there is no third database. Gate scanners run in their own images (`images/gates`).
 
-## Level 3: Components of kod-host (planned)
+## Level 3: Components of kod-host
 
 ```mermaid
 ---
-title: "kod-host components (planned, sub-plan 6b-b)"
+title: "kod-host components (sub-plan 6b-b)"
 ---
 flowchart TB
   disp["<b>Dispatcher</b><br/>[kod-dispatcher]<br/>Queue and run states"]
@@ -171,7 +170,7 @@ flowchart TB
   sandbox["<b>Run sandbox</b><br/>[Docker]<br/>Agent execution"]
   gh["<b>GitHub</b><br/>External system<br/>API"]
 
-  subgraph khost["kod-host (planned)"]
+  subgraph khost["kod-host"]
     cfg["<b>config, deadlines</b><br/>[Rust]<br/>Strict config, fixed defaults"]
     runtime["<b>runtime, binding</b><br/>[Rust]<br/>Implements Gateway, run bindings"]
     hostrunner["<b>runner, workspace</b><br/>[Rust]<br/>Start sandbox, trusted collection"]
@@ -203,10 +202,9 @@ flowchart TB
   class dispdb db
   class gh ext
   class cfg,runtime,hostrunner,art,svc,cred component
-  class khost planned
 ```
 
-`kod-host` is an assembly binary, not a new domain service: it reuses the existing routers and libraries and adds concrete adapters. Component names are the planned source files in the 6b-b plan; the plan, not this diagram, is authoritative if they diverge.
+`kod-host` is an assembly binary, not a new domain service: it reuses the existing routers and libraries and adds concrete adapters. Component names are the source files in `crates/kod-host/src`.
 Enforced here: the dispatcher row is the sole durable stop flag; revocation starts before waiting for stop; no execution resumes after restart (active runs become NeedsHuman, `publishing` resolves only if the exact draft PR exists).
 Also enforced: collection runs only after the process is quiescent, and refuses binary files, symlinks, renames and mode changes before any forge write. Admitted document revisions are pinned and a live issue edit cannot widen them.
 The additive tables (`run_bindings`, `model_requests`, `tracker_write_intents`) live in the existing dispatcher database.
