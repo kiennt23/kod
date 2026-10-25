@@ -1,5 +1,6 @@
 //! Deterministic upstream simulation around the production connected composition.
 pub mod fixture;
+mod lifecycle;
 pub mod provider;
 mod scenarios;
 
@@ -223,5 +224,8 @@ async fn conformance(h: &mut Fixture, evidence: &Path) -> Result<Execution> {
     execution
         .scenarios
         .extend(scenarios::run(h, evidence).await?);
+    execution
+        .scenarios
+        .extend(lifecycle::run(h, evidence).await?);
     Ok(execution)
 }

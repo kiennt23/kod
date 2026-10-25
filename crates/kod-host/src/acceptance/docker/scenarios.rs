@@ -742,7 +742,7 @@ pub fn gate_container_isolation(c: &Ctx) -> Result<Checks> {
     Ok(k)
 }
 
-fn scenario(name: &str, checks: Result<Checks>, evidence: &Path) -> Scenario {
+pub(super) fn scenario(name: &str, checks: Result<Checks>, evidence: &Path) -> Scenario {
     let (ok, count, detail) = match checks {
         Ok(k) if !k.is_empty() => (
             k.iter().all(|(_, ok)| *ok),

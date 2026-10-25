@@ -59,7 +59,7 @@ async fn worker_wakes_at_250ms_without_early_action() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn model_registry_revokes_queued_and_streaming_requests_within_two_seconds() {
+async fn cancel_revokes_queued_and_streaming_requests() {
     // Given the real policy/audit/model gateway and a silent loopback provider.
     let dir = tempfile::tempdir().unwrap();
     let audit_path = dir.path().join("audit.db");
@@ -170,11 +170,11 @@ async fn model_registry_revokes_queued_and_streaming_requests_within_two_seconds
     // When the production registry revokes a run with a stream and queued request.
     let began = tokio::time::Instant::now();
     registry.revoke("run-1").unwrap();
-    tokio::time::advance(deadlines::MODEL_CANCEL).await;
     // Then the stream ends, queue is denied, old credentials cannot reset spend.
     requests.join_next().await.unwrap().unwrap();
     assert!(!second.await.unwrap().unwrap().status().is_success());
-    assert!(began.elapsed() <= deadlines::MODEL_CANCEL);
+    // Virtual time never advanced: both requests ended at the revoke instant, not by a timer.
+    assert!(began.elapsed() < deadlines::MODEL_CANCEL);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(router.oneshot(request()).await.unwrap().status(), 401);
     assert!(registry.register(token, spec).is_err());

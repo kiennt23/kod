@@ -63,6 +63,7 @@ pub async fn run(config: &FsConfig, evidence_path: &Path, mode: Mode) -> Result<
                         report.actual_spend = execution.spend;
                     }
                     Err(e) => {
+                        eprintln!("acceptance execution failed: {e:#}");
                         // Blame only the scenario that was running, not an unrelated one.
                         if let Some(stage) = e.downcast_ref::<docker::Stage>()
                             && let Some(s) = report.scenarios.iter_mut().find(|s| s.name == stage.0)

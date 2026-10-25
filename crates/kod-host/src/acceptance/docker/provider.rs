@@ -54,6 +54,19 @@ pub struct Remote {
     pub lose_create: bool,
     pub model_blocked: Arc<std::sync::atomic::AtomicBool>,
     pub model_entered: Arc<tokio::sync::Notify>,
+    /// Held model requests the client abandoned (the host revoked the run and dropped the stream).
+    pub model_aborted: Arc<std::sync::atomic::AtomicUsize>,
+    /// Pull-request listing fails, as when the forge cannot confirm a lookup.
+    pub fail_pulls: bool,
+    pub pr_count: u64,
+}
+struct Abandoned(Arc<std::sync::atomic::AtomicUsize>, bool);
+impl Drop for Abandoned {
+    fn drop(&mut self) {
+        if self.1 {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
 }
 pub struct Provider {
     pub api: String,
@@ -106,15 +119,42 @@ fn model(body: &Value) -> Result<Value> {
         json!({"type":"message","role":"assistant","content":[{"type":"tool_use","id":format!("call-{step}"),"name":name,"input":input}],"stop_reason":"tool_use","usage":{"input_tokens":10,"output_tokens":5}}),
     )
 }
+fn unescape(v: &str) -> String {
+    let b = v.as_bytes();
+    let mut out = vec![];
+    let mut i = 0;
+    while i < b.len() {
+        let hex = (b[i] == b'%' && i + 2 < b.len())
+            .then(|| std::str::from_utf8(&b[i + 1..i + 3]).ok())
+            .flatten()
+            .and_then(|h| u8::from_str_radix(h, 16).ok());
+        match hex {
+            Some(x) => {
+                out.push(x);
+                i += 3;
+            }
+            None => {
+                out.push(b[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
 async fn handler(State(state): State<Arc<Mutex<Remote>>>, request: Request) -> Response {
     let method = request.method().to_string();
     let path = request.uri().path().replace("%23", "#");
+    let head = request.uri().query().and_then(|q| {
+        q.split('&')
+            .find_map(|kv| kv.strip_prefix("head="))
+            .map(unescape)
+    });
     let bytes = match to_bytes(request.into_body(), 16 << 20).await {
         Ok(b) => b,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
     let body = if bytes.is_empty() {
-        Value::Null
+        head.map_or(Value::Null, |h| json!({"head": h}))
     } else {
         match serde_json::from_slice(&bytes) {
             Ok(v) => v,
@@ -122,19 +162,21 @@ async fn handler(State(state): State<Arc<Mutex<Remote>>>, request: Request) -> R
         }
     };
     if path == "/v1/messages" {
-        let hold = match state.lock() {
+        let (hold, aborted) = match state.lock() {
             Ok(mut s) => {
                 if s.model_blocked.load(std::sync::atomic::Ordering::SeqCst) {
                     s.models.push(body.clone());
                     s.model_entered.notify_one();
-                    true
+                    (true, s.model_aborted.clone())
                 } else {
-                    false
+                    (false, s.model_aborted.clone())
                 }
             }
             Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         };
         if hold {
+            // Dropped only if the client disconnects, which is what a revoked stream does.
+            let _guard = Abandoned(aborted, true);
             std::future::pending::<()>().await;
         }
     }
@@ -271,11 +313,26 @@ fn serve(s: &mut Remote, m: &str, p: &str, b: Value) -> Result<(u16, Value)> {
     }
     if p == "/repos/acme/app/pulls" {
         if m == "GET" {
-            return Ok((200, json!(s.pulls)));
+            if s.fail_pulls {
+                return Ok((503, json!({})));
+            }
+            // GitHub filters on `head=owner:branch`; without it, everything.
+            let want = b["head"]
+                .as_str()
+                .and_then(|h| h.split_once(':'))
+                .map(|x| x.1);
+            let list: Vec<_> = s
+                .pulls
+                .iter()
+                .filter(|p| want.is_none_or(|w| p["head"]["ref"] == w))
+                .collect();
+            return Ok((200, json!(list)));
         }
         let branch = b["head"].as_str().context("head")?;
         let sha = s.refs.get(branch).context("unpublished head")?;
-        let pr = json!({"number":1,"html_url":"https://github.com/acme/app/pull/1","state":"open","draft":b["draft"],"user":{"id":4},"head":{"repo":{"id":1},"ref":branch,"sha":sha},"base":{"repo":{"id":1},"ref":b["base"]}});
+        s.pr_count += 1;
+        let n = s.pr_count;
+        let pr = json!({"number":n,"html_url":format!("https://github.com/acme/app/pull/{n}"),"state":"open","draft":b["draft"],"user":{"id":4},"head":{"repo":{"id":1},"ref":branch,"sha":sha},"base":{"repo":{"id":1},"ref":b["base"]}});
         s.pulls.push(pr.clone());
         return Ok((201, pr));
     }

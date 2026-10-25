@@ -91,6 +91,15 @@ impl Fixture {
         )?)
     }
     pub async fn webhook(&self, id: &str, body: &[u8], valid: bool) -> Result<reqwest::StatusCode> {
+        self.webhook_event("issues", id, body, valid).await
+    }
+    pub async fn webhook_event(
+        &self,
+        event: &str,
+        id: &str,
+        body: &[u8],
+        valid: bool,
+    ) -> Result<reqwest::StatusCode> {
         use hmac::{Hmac, Mac};
         use sha2::Sha256;
         let mut mac = Hmac::<Sha256>::new_from_slice(b"connected-fixture-webhook")?;
@@ -103,7 +112,7 @@ impl Fixture {
         let ingress = self.service.as_ref().context("service missing")?.ingress;
         Ok(reqwest::Client::new()
             .post(format!("http://{ingress}/webhook"))
-            .header("x-github-event", "issues")
+            .header("x-github-event", event)
             .header("x-github-delivery", id)
             .header("x-hub-signature-256", signature)
             .body(body.to_vec())
@@ -115,14 +124,28 @@ impl Fixture {
         let body = serde_json::to_vec(&command)?;
         let key = crate::config::read_private(&self.config.github.owner_key_file)?;
         let signature = kod_dispatcher::command::sign(&key, &body);
+        self.command_signed(body, &signature).await
+    }
+    pub async fn command_signed(
+        &self,
+        body: Vec<u8>,
+        signature: &str,
+    ) -> Result<reqwest::StatusCode> {
         let ingress = self.service.as_ref().context("service missing")?.ingress;
-        Ok(reqwest::Client::new()
+        let reply = reqwest::Client::new()
             .post(format!("http://{ingress}/command"))
             .header("x-kod-signature", signature)
             .body(body)
             .send()
-            .await?
-            .status())
+            .await?;
+        let status = reply.status();
+        if !status.is_success() {
+            eprintln!(
+                "command refused: {status} {}",
+                reply.text().await.unwrap_or_default()
+            );
+        }
+        Ok(status)
     }
     pub async fn terminal(&self) -> Result<(String, String)> {
         let end = tokio::time::Instant::now()

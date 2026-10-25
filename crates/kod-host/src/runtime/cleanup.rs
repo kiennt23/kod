@@ -1,5 +1,7 @@
 use super::*;
 
+const RETRY_BUDGET: Duration = Duration::from_secs(5);
+
 pub(super) fn poll_cleanup(
     cell: &Mutex<Option<JoinHandle<Result<()>>>>,
     work: impl FnOnce() -> Result<()> + Send + 'static,
@@ -114,14 +116,13 @@ impl Runtime {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .context("missing cancellation time")?;
-        let remaining = crate::deadlines::ABSENCE.saturating_sub(began.elapsed());
+        // A retry that starts after the deadline still gets a real budget for Docker to answer;
+        // a 100ms budget would make every late retry fail and the debt permanent.
+        let remaining = crate::deadlines::ABSENCE
+            .saturating_sub(began.elapsed())
+            .max(RETRY_BUDGET);
         let grace = crate::deadlines::TERM_GRACE.saturating_sub(began.elapsed());
-        kod_eval::connected::stop_owned(
-            run,
-            &kod_eval::connected::names(run)?,
-            grace,
-            remaining.max(Duration::from_millis(100)),
-        )?;
+        kod_eval::connected::stop_owned(run, &kod_eval::connected::names(run)?, grace, remaining)?;
         if !slot.execution_done.load(Ordering::Acquire) {
             let deadline = began + crate::deadlines::ABSENCE;
             loop {
@@ -149,7 +150,7 @@ impl Runtime {
                 run,
                 &kod_eval::connected::names(run)?,
                 Duration::ZERO,
-                Duration::from_millis(100),
+                RETRY_BUDGET,
             )?;
         }
         slot.stop_confirmed.store(true, Ordering::Release);

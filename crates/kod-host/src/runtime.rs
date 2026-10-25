@@ -199,7 +199,15 @@ impl Runtime {
             hook(_point);
         }
     }
+    /// Whether credential revocation or a container stop is unconfirmed. A global revoke that
+    /// failed (say, during a forge outage) is retried here on each call, because a lifted kill
+    /// abandons its follow-up and admission stays closed until the debt is confirmed paid.
     pub fn cleanup_pending(&self) -> bool {
+        if self.cleanup_debt.load(Ordering::Acquire)
+            && !self.global_confirmed.load(Ordering::Acquire)
+        {
+            let _ = self.revoke_all();
+        }
         self.cleanup_debt.load(Ordering::Acquire)
     }
     pub fn quiesce(&self) -> Result<()> {
