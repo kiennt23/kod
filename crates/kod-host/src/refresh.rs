@@ -154,12 +154,13 @@ impl Source for WorkflowSource {
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         )?
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM runs WHERE ticket=?1 AND state IN ('publishing','done'))",
+            "SELECT EXISTS(SELECT 1 FROM runs WHERE ticket=?1 AND state IN ('publishing','done')
+                OR EXISTS(SELECT 1 FROM followups f WHERE f.kind='check_publish' AND f.target='run-'||runs.seq))",
             [story],
             |r| r.get(0),
         )?;
         if published {
-            bail!("pull request evidence is unavailable for {story}: a run has published");
+            bail!("pull request evidence is unavailable for {story}: a run entered publishing");
         }
         let mut stages = std::collections::BTreeMap::new();
         for a in self.artifacts.current_manifest()?.artifacts {
@@ -285,14 +286,29 @@ pub fn refresh_story(
 
 /// Recomputes at once and then every `interval` until `stop`. One story failing never stops the
 /// others or the loop; the next pass retries it.
-/// A story whose refresh failed (rework row, open PR, outage...) is logged and audited, never dropped.
-pub fn blocked(audit: &kod_audit::AuditLog, story: &str, error: &anyhow::Error) {
-    let error = kod_tool_gateway::scrub(&format!("{error:#}"));
-    eprintln!("status refresh blocked for {story}: {error}");
-    let _ = audit.append(
-        kod_audit::RUN_AUDIT,
-        &serde_json::json!({"kind": "status_refresh_blocked", "story": story, "error": error}),
-    );
+/// Stories whose refresh is blocked, so a persistent block is logged and audited once, not every tick.
+#[derive(Default)]
+pub struct BlockedLog(std::sync::Mutex<std::collections::HashMap<String, String>>);
+impl BlockedLog {
+    pub fn record(&self, audit: &kod_audit::AuditLog, story: &str, error: &anyhow::Error) {
+        let error = kod_tool_gateway::scrub(&format!("{error:#}"));
+        let mut seen = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.get(story) == Some(&error) {
+            return;
+        }
+        eprintln!("status refresh blocked for {story}: {error}");
+        let _ = audit.append(
+            kod_audit::RUN_AUDIT,
+            &serde_json::json!({"kind": "status_refresh_blocked", "story": story, "error": error}),
+        );
+        seen.insert(story.into(), error);
+    }
+    pub fn clear(&self, story: &str) {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(story);
+    }
 }
 
 pub fn run_loop(

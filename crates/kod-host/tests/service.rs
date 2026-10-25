@@ -530,3 +530,19 @@ async fn shutdown_reports_failed_stop_and_retains_followup() {
     assert_eq!(bound, 1);
     assert!(Service::start(w.config.clone(), parts(&w)).await.is_err());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_start_failure_before_recovery_still_cleans_up_durable_runs() {
+    let w = world();
+    let id = seed_bound_run(&w, 90);
+    w.base_up.store(false, Ordering::SeqCst);
+    let r = Service::start(w.config.clone(), parts(&w)).await;
+    assert!(r.is_err(), "start must fail while the mirror is down");
+    let calls = common::docker_calls();
+    assert!(
+        calls
+            .lines()
+            .any(|l| l.contains(&format!("kod-agent-{id}"))),
+        "{calls}"
+    );
+}

@@ -381,6 +381,27 @@ impl Service {
         parts: Parts,
         lock: std::fs::File,
     ) -> Result<Service> {
+        // The lock stays held (dup shares the flock) while a failed start cleans up durable runs.
+        let held = lock.try_clone()?;
+        match Self::start_inner(config.clone(), parts, lock).await {
+            Ok(s) => Ok(s),
+            Err(cause) => {
+                let cleaned = tokio::task::spawn_blocking(move || safety_cleanup(&config)).await;
+                drop(held);
+                match cleaned {
+                    Ok(Ok(())) => Err(cause),
+                    Ok(Err(e)) => Err(cause.context(format!("safety cleanup incomplete: {e:#}"))),
+                    Err(e) => Err(cause.context(format!("safety cleanup panicked: {e}"))),
+                }
+            }
+        }
+    }
+
+    async fn start_inner(
+        config: Arc<crate::config::FsConfig>,
+        parts: Parts,
+        lock: std::fs::File,
+    ) -> Result<Service> {
         use anyhow::Context;
         let trace = parts.trace.clone();
         let t = |p: &str| trace(p);
@@ -520,6 +541,19 @@ impl Service {
     }
 }
 
+/// Process exit sequence: drop the runtime without waiting forever on a stuck blocking task, then
+/// always run the tracker revoke. A failure of either is reported.
+pub fn exit_sequence<T>(
+    runtime: tokio::runtime::Runtime,
+    result: Result<T>,
+    bound: std::time::Duration,
+    revoke: impl FnOnce() -> Result<()>,
+) -> Result<T> {
+    runtime.shutdown_timeout(bound);
+    let revoked = revoke();
+    result.and_then(|v| revoked.map(|()| v))
+}
+
 /// Waits for the worker up to `within`, then aborts it; returns whether it stopped in time.
 async fn stop_worker(
     worker: &mut tokio::task::JoinHandle<Result<()>>,
@@ -579,7 +613,15 @@ pub async fn serve_refreshing(
 ) -> Result<()> {
     (parts.trace)("lock");
     let service = Service::start_locked(config.clone(), parts.clone(), lock).await?;
-    let refresher = start_refresh(&config, &parts, tracker)?;
+    let refresher = match start_refresh(&config, &parts, tracker) {
+        Ok(r) => r,
+        Err(e) => {
+            return match service.shutdown().await {
+                Ok(()) => Err(e),
+                Err(s) => Err(e.context(format!("shutdown incomplete: {s:#}"))),
+            };
+        }
+    };
     term.await;
     refresher.stop();
     service.shutdown().await
@@ -613,6 +655,7 @@ fn start_refresh(
     let db = config.paths.dispatcher_db.clone();
     let (cfg, audit_db) = (config.clone(), config.paths.audit_db.clone());
     let db2 = db.clone();
+    let blocked = crate::refresh::BlockedLog::default();
     Ok(crate::refresh::Refresher::spawn(
         move || {
             kod_dispatcher::store::open(&db2)
@@ -623,7 +666,8 @@ fn start_refresh(
             let mut c = kod_dispatcher::store::open(&db)?;
             let audit = kod_audit::AuditLog::open(&audit_db)?;
             crate::refresh::refresh_story(&cfg, &tracker, &source, &audit, &mut c, story)
-                .inspect_err(|e| crate::refresh::blocked(&audit, story, e))
+                .inspect(|_| blocked.clear(story))
+                .inspect_err(|e| blocked.record(&audit, story, e))
         },
         crate::deadlines::RECONCILE,
     ))
@@ -815,6 +859,45 @@ mod tests {
         );
         tx.send(true).unwrap();
         worker.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn exit_revokes_even_when_a_blocking_task_is_stuck() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let entered = Arc::new(AtomicBool::new(false));
+        let e = entered.clone();
+        rt.spawn_blocking(move || {
+            e.store(true, Ordering::SeqCst);
+            let _ = held.recv_timeout(std::time::Duration::from_secs(30));
+        });
+        while !entered.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let revoked = AtomicBool::new(false);
+        let start = std::time::Instant::now();
+        let out = exit_sequence(rt, Ok(7), std::time::Duration::from_millis(200), || {
+            revoked.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+        assert_eq!(out.unwrap(), 7);
+        assert!(revoked.load(Ordering::SeqCst));
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
+        drop(release);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        assert!(
+            exit_sequence(
+                rt,
+                Ok(()),
+                std::time::Duration::from_millis(10),
+                || anyhow::bail!("revoke failed")
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]

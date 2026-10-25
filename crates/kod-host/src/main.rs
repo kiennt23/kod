@@ -54,7 +54,16 @@ fn main() -> Result<()> {
                     std::str::from_utf8(&secret)?.trim(),
                 )?;
                 let tracker = std::sync::Arc::new(tracker);
-                let parts = kod_host::service::production_parts(&config, tracker.clone())?;
+                let parts = match kod_host::service::production_parts(&config, tracker.clone()) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let cleanup = kod_host::service::safety_cleanup(&config);
+                        return Err(match cleanup {
+                            Ok(()) => e,
+                            Err(c) => e.context(format!("safety cleanup incomplete: {c:#}")),
+                        });
+                    }
+                };
                 kod_host::service::serve_refreshing(
                     config.clone(),
                     parts,
@@ -75,9 +84,15 @@ fn main() -> Result<()> {
                 )
                 .await
             };
-            let result = tokio::runtime::Runtime::new()?.block_on(run);
-            let revoked = creds.shutdown();
-            result.and(revoked)
+            let runtime = tokio::runtime::Runtime::new()?;
+            let result = runtime.block_on(run);
+            // A stuck blocking tick must not keep the process (or the tracker revoke) waiting.
+            kod_host::service::exit_sequence(
+                runtime,
+                result,
+                std::time::Duration::from_secs(5),
+                || creds.shutdown(),
+            )
         }
         Command::Snapshot(Snapshot::Activate { config, manifest }) => {
             let config = kod_host::config::FsConfig::load(&config)?;

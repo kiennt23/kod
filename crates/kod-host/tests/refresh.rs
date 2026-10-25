@@ -682,7 +682,7 @@ fn stopping_the_refresher_does_not_wait_for_a_stuck_status_call() {
 
 #[test]
 fn a_story_with_a_published_run_fails_closed_without_pull_evidence() {
-    for state in ["publishing", "done"] {
+    for state in ["publishing", "done", "needs_human"] {
         let r = rig();
         let src = workflow(&r, vec![]);
         kod_dispatcher::store::open(&r.w.config.paths.dispatcher_db)
@@ -692,6 +692,16 @@ fn a_story_with_a_published_run_fails_closed_without_pull_evidence() {
                 rusqlite::params![STORY, state],
             )
             .unwrap();
+        if state == "needs_human" {
+            // Entered publishing, then escalated: only the check_publish followup remembers it.
+            kod_dispatcher::store::open(&r.w.config.paths.dispatcher_db)
+                .unwrap()
+                .execute(
+                    "INSERT INTO followups(kind,target,arg,next_at,done) VALUES('check_publish','run-1','',0,1)",
+                    [],
+                )
+                .unwrap();
+        }
         let e = go_with(&r, &src).unwrap_err();
         assert!(
             format!("{e:#}").contains("evidence is unavailable"),
@@ -711,28 +721,28 @@ fn a_pulls_source_error_fails_the_refresh_without_writing() {
 }
 
 #[test]
-fn a_blocked_story_is_logged_and_audited() {
+fn a_blocked_story_is_logged_and_audited_only_when_the_state_changes() {
     let r = rig();
-    db(&r)
-        .execute(
-            "INSERT INTO tracker_write_intents(operation_id,story,kind,audit_intent) VALUES('rework:x',?1,'rework',1)",
-            [STORY],
-        )
-        .unwrap();
     let path = r.w.dir.path().join("blocked-audit.log");
     let audit = kod_audit::AuditLog::open(&path).unwrap();
-    let e = go(&r, &tracker(&r)).unwrap_err();
-    kod_host::refresh::blocked(&audit, STORY, &e);
-    let text: String = rusqlite::Connection::open(&path)
-        .unwrap()
-        .query_row(
-            "SELECT payload FROM audit WHERE record_type=?1",
-            [kod_audit::RUN_AUDIT],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert!(
-        text.contains("status_refresh_blocked") && text.contains(STORY),
-        "{text}"
-    );
+    let count = || -> i64 {
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM audit WHERE record_type=?1 AND payload LIKE '%status_refresh_blocked%'",
+                [kod_audit::RUN_AUDIT],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    let log = kod_host::refresh::BlockedLog::default();
+    let e1 = anyhow::anyhow!("rework create has no record");
+    log.record(&audit, STORY, &e1);
+    log.record(&audit, STORY, &e1);
+    assert_eq!(count(), 1, "the same blocked state is audited once");
+    log.record(&audit, STORY, &anyhow::anyhow!("another reason"));
+    assert_eq!(count(), 2);
+    log.clear(STORY);
+    log.record(&audit, STORY, &e1);
+    assert_eq!(count(), 3, "blocked again after recovering");
 }
