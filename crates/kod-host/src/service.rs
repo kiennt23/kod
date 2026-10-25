@@ -432,6 +432,11 @@ impl Service {
             })
         };
         t("recover");
+        // Unconfirmed lease revocation refuses the start, so admission never opens.
+        let leased = config.clone();
+        tokio::task::spawn_blocking(move || recover_leases(&leased))
+            .await
+            .context("lease recovery panicked")??;
         let (db, tracker, gateway) = (p.dispatcher_db.clone(), parts_tracker, runtime.clone());
         let tr = trace.clone();
         let dispatcher = recover_and_attach(runtime.clone(), move || {
@@ -730,6 +735,41 @@ pub fn prepare<T>(
     }
 }
 
+/// Product-token lease directories under `credential_dir`: publish, the 30s refresh listing and
+/// snapshot activation all mint write-scoped installation tokens.
+// ponytail: listing still mints contents/pull_requests:write (issuance verifies that exact set);
+// a read-only mint needs a per-purpose permission set threaded through issuance.
+pub const LEASE_DIRS: [&str; 3] = ["publish", "refresh", "activate"];
+
+/// Revokes every leftover lease in each product dir; every dir is attempted, any unconfirmed revoke is an error.
+pub fn recover_leases_with(
+    config: &crate::config::FsConfig,
+    open: &dyn Fn(&std::path::Path) -> Result<kod_tool_gateway::github::GitHub>,
+) -> Result<()> {
+    let errors: Vec<String> = LEASE_DIRS
+        .iter()
+        .filter_map(|name| {
+            private_subdir(&config.paths.credential_dir.join(name))
+                .and_then(|d| open(&d))
+                .and_then(|g| retry_until_confirmed(|| g.recover()))
+                .err()
+                .map(|e| format!("{name} leases: {e:#}"))
+        })
+        .collect();
+    anyhow::ensure!(errors.is_empty(), "{}", errors.join("; "));
+    Ok(())
+}
+
+pub fn recover_leases(config: &crate::config::FsConfig) -> Result<()> {
+    recover_leases_with(config, &|d| {
+        kod_tool_gateway::github::GitHub::new(
+            config.github.product.clone(),
+            config.github.app.clone(),
+            d,
+        )
+    })
+}
+
 /// Stops containers of every durably bound run and revokes publish leases, using only
 /// path-validated durable state (no policy, model, tracker or artifact sources). Caller holds the lock.
 pub fn safety_cleanup(config: &crate::config::FsConfig) -> Result<()> {
@@ -765,17 +805,8 @@ pub fn safety_cleanup(config: &crate::config::FsConfig) -> Result<()> {
             Err(e) => errors.push(format!("reading bound runs: {e:#}")),
         }
     }
-    let leases = private_subdir(&config.paths.credential_dir.join("publish"))
-        .and_then(|d| {
-            kod_tool_gateway::github::GitHub::new(
-                config.github.product.clone(),
-                config.github.app.clone(),
-                d,
-            )
-        })
-        .and_then(|g| retry_until_confirmed(|| g.recover()));
-    if let Err(e) = leases {
-        errors.push(format!("publish leases: {e:#}"));
+    if let Err(e) = recover_leases(config) {
+        errors.push(format!("credential leases: {e:#}"));
     }
     anyhow::ensure!(
         errors.is_empty(),

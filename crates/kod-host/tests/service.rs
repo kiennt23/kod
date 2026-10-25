@@ -563,3 +563,101 @@ async fn a_parts_failure_cleans_up_without_blocking_the_async_threads() {
         "{calls}"
     );
 }
+
+/// Loopback GitHub: mints succeed, `DELETE /installation/token` answers `delete_status`.
+fn lease_api(delete_status: u16) -> (String, Arc<Mutex<Vec<String>>>) {
+    use axum::{Router, extract::State, http::Request, response::Response};
+    type Calls = Arc<Mutex<Vec<String>>>;
+    let calls = Calls::default();
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    l.set_nonblocking(true).unwrap();
+    let api = format!("http://{}/", l.local_addr().unwrap());
+    async fn h(
+        State((calls, del)): State<(Calls, u16)>,
+        req: Request<axum::body::Body>,
+    ) -> Response {
+        let key = format!("{} {}", req.method(), req.uri().path());
+        calls.lock().unwrap().push(key.clone());
+        let exp = chrono::DateTime::from_timestamp(1_800_003_600, 0)
+            .unwrap()
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let (code, body) = if key.ends_with("/access_tokens") {
+            (
+                201,
+                serde_json::json!({"token": "ghs_x", "expires_at": exp,
+                "permissions": {"contents": "write", "pull_requests": "write", "metadata": "read"},
+                "repositories": [{"id": 1, "full_name": "acme/app"}]})
+                .to_string(),
+            )
+        } else if key == "DELETE /installation/token" {
+            (del, String::new())
+        } else if key == "GET /repos/acme/app/pulls" {
+            (200, "[]".into())
+        } else {
+            (404, "{}".into())
+        };
+        Response::builder().status(code).body(body.into()).unwrap()
+    }
+    let app = Router::new()
+        .fallback(h)
+        .with_state((calls.clone(), delete_status));
+    std::thread::spawn(move || {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            axum::serve(tokio::net::TcpListener::from_std(l).unwrap(), app)
+                .await
+                .unwrap();
+        })
+    });
+    (api, calls)
+}
+
+fn gh(w: &World, sub: &str, api: &str) -> kod_tool_gateway::github::GitHub {
+    let d = w.config.paths.credential_dir.join(sub);
+    dir(&d);
+    kod_tool_gateway::github::GitHub::with_test_api(
+        w.config.github.product.clone(),
+        w.config.github.app.clone(),
+        d,
+        api,
+        Arc::new(|| 1_800_000_000),
+    )
+    .unwrap()
+}
+
+#[test]
+fn leftover_refresh_and_activate_leases_are_revoked_and_unconfirmed_ones_fail() {
+    for sub in ["refresh", "activate"] {
+        let w = world();
+        // A listing whose revoke fails leaves a live lease on disk.
+        let (bad, _) = lease_api(500);
+        assert!(gh(&w, sub, &bad).open_pulls().is_err());
+        // Unconfirmed revoke: recovery errors (admission stays closed).
+        assert!(
+            kod_host::service::recover_leases_with(&w.config, &|d| Ok(gh_at(&w, d, &bad))).is_err(),
+            "{sub}"
+        );
+        // Confirmed revoke succeeds and actually calls DELETE.
+        let (good, calls) = lease_api(204);
+        kod_host::service::recover_leases_with(&w.config, &|d| Ok(gh_at(&w, d, &good))).unwrap();
+        assert!(
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c == "DELETE /installation/token"),
+            "{sub}: {:?}",
+            calls.lock().unwrap()
+        );
+    }
+}
+
+fn gh_at(w: &World, d: &Path, api: &str) -> kod_tool_gateway::github::GitHub {
+    kod_tool_gateway::github::GitHub::with_test_api(
+        w.config.github.product.clone(),
+        w.config.github.app.clone(),
+        d,
+        api,
+        Arc::new(|| 1_800_000_000),
+    )
+    .unwrap()
+}
