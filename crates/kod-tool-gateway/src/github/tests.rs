@@ -5,6 +5,7 @@ mod contract;
 mod fixture;
 mod live;
 mod objects;
+mod open_pulls;
 mod pr_outcomes_review;
 mod provider;
 mod publication;

@@ -1,5 +1,10 @@
 use super::*;
 use crate::broker::Broker;
+impl AppCredentials {
+    pub fn jwt(&self, now: i64) -> Result<Secret> {
+        signing::jwt(self, now).map(Secret::new)
+    }
+}
 impl GitHub {
     pub fn recover(&self) -> Result<()> {
         self.revoke_all()

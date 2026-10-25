@@ -163,3 +163,5 @@ pub trait Tracker: Send + Sync {
     /// `Ok(None)`.
     fn parse_webhook(&self, request: &Webhook) -> Result<Option<Delivery>>;
 }
+
+pub use strict_json::parse as parse_json_unique;

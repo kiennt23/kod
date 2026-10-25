@@ -663,7 +663,7 @@ fn one_reservation() -> (String, Setup) {
 }
 
 #[tokio::test]
-async fn a_client_that_disconnects_mid_flight_releases_its_reservation() {
+async fn a_client_that_disconnects_after_dispatch_retains_unknown_charge() {
     let (up, _, calls) = recording(true).await;
     let (body, setup) = one_reservation();
     let g = gateway(&up, setup).await;
@@ -676,7 +676,8 @@ async fn a_client_that_disconnects_mid_flight_releases_its_reservation() {
     assert!(gone.is_err());
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(calls.load(Ordering::SeqCst), 1);
-    assert_eq!(status(&g, body).await, 200);
+    assert_eq!(status(&g, body).await, 403);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

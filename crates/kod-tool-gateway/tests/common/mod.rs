@@ -50,6 +50,7 @@ pub fn run() -> Run {
         repo: "acme/app".into(),
         base: BASE.into(),
         data_classes: vec!["placeholder".into()],
+        pins: std::collections::BTreeMap::from([("design".into(), LINKED_DOC.into())]),
         linked_tickets: vec![REWORK.into()],
         started_at: 1_700_000_000,
     }

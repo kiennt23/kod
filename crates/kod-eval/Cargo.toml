@@ -5,6 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
+libc = "0.2"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
@@ -18,3 +19,6 @@ kod-llm-proxy = { path = "../kod-llm-proxy" }
 kod-loop = { path = "../kod-loop" }
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "net"] }
+
+[features]
+connected-test-support = []

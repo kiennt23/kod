@@ -61,7 +61,7 @@ impl<'de> Deserialize<'de> for Unique {
     }
 }
 
-pub(crate) fn parse(text: &str) -> serde_json::Result<Value> {
+pub fn parse(text: &str) -> serde_json::Result<Value> {
     let mut d = serde_json::Deserializer::from_str(text);
     let Unique(v) = Unique::deserialize(&mut d)?;
     d.end()?;

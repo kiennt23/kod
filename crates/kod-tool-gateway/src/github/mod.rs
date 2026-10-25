@@ -31,6 +31,7 @@ mod tests;
 
 pub use config::{AppCredentials, Config, RunPermit};
 use config::{identity, sha, valid_ref};
+pub use pulls::OpenPull;
 const PRUNE_AFTER: i64 = 7 * 24 * 3600;
 pub(super) type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
 #[cfg(any(test, feature = "test-support"))]

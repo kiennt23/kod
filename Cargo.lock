@@ -868,6 +868,7 @@ dependencies = [
  "clap",
  "kod-llm-proxy",
  "kod-loop",
+ "libc",
  "roxmltree",
  "serde",
  "serde_json",
@@ -894,6 +895,37 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "kod-host"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "clap",
+ "futures-util",
+ "kod-audit",
+ "kod-dispatcher",
+ "kod-eval",
+ "kod-gates",
+ "kod-host",
+ "kod-llm-proxy",
+ "kod-loop",
+ "kod-policy",
+ "kod-status",
+ "kod-tool-gateway",
+ "kod-tracker",
+ "libc",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tower",
 ]
 
 [[package]]

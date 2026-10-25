@@ -598,6 +598,20 @@ pub fn refresh(
     audit: &AuditLog,
     story: &str,
 ) -> Result<View> {
+    refresh_with_writer(source, tracker, audit, story, |key, text, _intent| {
+        tracker.status_comment(key, text)
+    })
+}
+
+/// `refresh` with the write replaced by `writer(story, text, audit_intent)`, called only after the
+/// audit intent is appended, so a host can persist its own write guard at exactly that point.
+pub fn refresh_with_writer(
+    source: &dyn Source,
+    tracker: &dyn Tracker,
+    audit: &AuditLog,
+    story: &str,
+    writer: impl FnOnce(&str, &str, u64) -> Result<()>,
+) -> Result<View> {
     let view = load(source, story)?;
     let issue = tracker.get_issue(story)?;
     if issue.key != view.story {
@@ -605,7 +619,7 @@ pub fn refresh(
     }
     let text = view.render();
     let intent = audit.append(RUN_AUDIT, &json!({"kind": "workflow_status_comment_intent", "tracker": tracker.name(), "story": story, "text": text}))?;
-    match tracker.status_comment(story, &text) {
+    match writer(story, &text, intent) {
         Ok(()) => {
             audit.append(RUN_AUDIT, &json!({"kind": "workflow_status_comment_posted", "tracker": tracker.name(), "story": story, "intent": intent})).context("comment posted but recording outcome failed; reconcile before retry")?;
         }

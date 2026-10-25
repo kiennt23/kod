@@ -53,6 +53,7 @@ pub struct Run {
     pub base: String,
     /// The fixed classes admitted for both model routing and document reads.
     pub data_classes: Vec<String>,
+    pub pins: std::collections::BTreeMap<String, String>,
     /// The rework requests Kod itself linked to the ticket before this run,
     /// from the dispatcher's records: a snapshot taken at start, never the
     /// ticket's live links, which any human can change.
@@ -258,7 +259,7 @@ impl Gateway {
     /// minted for it is revoked. Safe to repeat. The dispatcher calls it
     /// when the run ends, however it ends.
     pub fn end_run(&self, run_id: &str) -> anyhow::Result<()> {
-        self.lock().retain(|_, l| l.run.id != run_id);
+        self.retire_run_access(run_id);
         self.adapters.broker.revoke(run_id)?;
         Ok(())
     }
@@ -266,9 +267,17 @@ impl Gateway {
     /// The kill switch: stop serving every run and revoke every agent
     /// credential.
     pub fn end_all(&self) -> anyhow::Result<()> {
-        self.lock().clear();
+        self.retire_all_access();
         self.adapters.broker.revoke_all()?;
         Ok(())
+    }
+
+    pub fn retire_run_access(&self, run: &str) {
+        self.lock().retain(|_, live| live.run.id != run);
+    }
+
+    pub fn retire_all_access(&self) {
+        self.lock().clear();
     }
 
     /// The run, or None for an unknown token.
@@ -378,12 +387,11 @@ impl Gateway {
 
     fn read_doc(&self, live: &Live, args: &Value) -> Reply {
         let (run, id) = (&live.run, text(args, "id")?);
-        let issue = self.own_issue(run)?;
         let target = json!({"kind": "doc", "id": id});
         self.allow(json!({
             "action": "read",
             "actor": {"kind": "agent"},
-            "run": {"id": run.id, "ticket": run.ticket, "linked_docs": issue.approved_versions},
+            "run": {"id": run.id, "ticket": run.ticket, "linked_docs": run.pins.values().collect::<Vec<_>>()},
             "target": target,
         }))?;
         let docs = &self.adapters.docs;

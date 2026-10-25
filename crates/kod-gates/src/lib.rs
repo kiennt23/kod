@@ -300,32 +300,10 @@ pub struct Gates<'a> {
 
 impl Gates<'_> {
     pub fn invalidate(&self, target: &str) -> Result<()> {
-        self.config.validate()?;
-        validate_sha(target)?;
-        for name in CHECKS {
-            self.report(
-                target,
-                &Check {
-                    name: name.into(),
-                    conclusion: Conclusion::Pending,
-                    summary: "Evaluating trusted records and scans".into(),
-                },
-            )?;
-        }
-        Ok(())
+        invalidate(self.config, self.audit, self.forge, target)
     }
     fn report(&self, sha: &str, check: &Check) -> Result<()> {
-        self.audit.before(
-            RUN_AUDIT,
-            &json!({"kind": "gate_report", "repo": self.config.repo,
-            "sha": sha, "check": check, "config_version": self.config.version()?}),
-            || self.forge.report(sha, check),
-        )??;
-        self.audit.append(
-            RUN_AUDIT,
-            &json!({"kind": "gate_reported", "sha": sha, "check": check}),
-        )?;
-        Ok(())
+        report(self.config, self.audit, self.forge, sha, check)
     }
 
     fn inputs(&self, e: &Evidence, pr: &PullRequest, issue: &Issue) -> Result<()> {
@@ -525,4 +503,50 @@ pub fn ruleset(app_id: u64) -> Result<serde_json::Value> {
                 "merge_method": "SQUASH", "min_entries_to_merge": 1, "min_entries_to_merge_wait_minutes": 0}}
         ]}),
     )
+}
+
+/// Marks every check on `target` pending through the audited report path, without needing
+/// the tracker, scanner or policy a full gate run uses.
+pub fn invalidate(
+    config: &Config,
+    audit: &AuditLog,
+    forge: &dyn Forge,
+    target: &str,
+) -> Result<()> {
+    config.validate()?;
+    validate_sha(target)?;
+    for name in CHECKS {
+        report(
+            config,
+            audit,
+            forge,
+            target,
+            &Check {
+                name: name.into(),
+                conclusion: Conclusion::Pending,
+                summary: "Evaluating trusted records and scans".into(),
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn report(
+    config: &Config,
+    audit: &AuditLog,
+    forge: &dyn Forge,
+    sha: &str,
+    check: &Check,
+) -> Result<()> {
+    audit.before(
+        RUN_AUDIT,
+        &json!({"kind": "gate_report", "repo": config.repo,
+        "sha": sha, "check": check, "config_version": config.version()?}),
+        || forge.report(sha, check),
+    )??;
+    audit.append(
+        RUN_AUDIT,
+        &json!({"kind": "gate_reported", "sha": sha, "check": check}),
+    )?;
+    Ok(())
 }

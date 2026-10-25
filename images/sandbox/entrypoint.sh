@@ -123,6 +123,24 @@ collect)
   bounded $((KOD_DISK_BYTES * 4)) /out/diff.patch git diff --cached --binary --no-renames --no-ext-diff --no-textconv HEAD || { rm -f /out/diff.patch; fail diff; }
   touch /out/collect_ok
   ;;
+collect-export)
+  trap 'give_back /out' EXIT
+  fail() { echo "export failed: $1" >&2; exit 1; }
+  unset GIT_DIR GIT_WORK_TREE
+  export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null HOME=/nonexistent
+  cp -R --preserve=mode,timestamps,links /in/. /wt/ || fail copy
+  cd /wt || fail cd
+  git -c core.hooksPath=/dev/null init -q || fail init
+  printf '* -text -filter -ident -working-tree-encoding diff\n' > .git/info/attributes || fail attributes
+  git -c core.hooksPath=/dev/null add -A -f || fail add
+  git -c core.hooksPath=/dev/null -c user.name=kod -c user.email=kod@localhost commit -q --allow-empty -m base || fail commit
+  if [ -s /patch/diff.patch ]; then
+    git -c core.hooksPath=/dev/null apply --index --check /patch/diff.patch || fail check
+    git -c core.hooksPath=/dev/null apply --index /patch/diff.patch || fail apply
+  fi
+  kod-collect-export --repo /wt --out /out --base "$KOD_BASE" || fail export
+  touch /out/export_ok
+  ;;
 score)
   # /work is read-only here, so build scripts can't rewrite the held-back tests.
   trap 'give_back /out' EXIT

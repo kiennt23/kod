@@ -29,6 +29,7 @@ process, so they have no binary yet.
 | [Phase 1 runbook](docs/phase1-runbook.md) | kod-loop against the baseline: conformance, tuning, held-out comparison |
 | [Phase 1 overview](docs/superpowers/plans/2026-10-14-phase1-overview.md) | Sub-plans, order and status |
 | [Audit log runbook](docs/audit-runbook.md) | Checkpoints, verify, purge, off-host verifier |
+| [kod-host runbook](docs/kod-host-runbook.md) | Connected host: config, serve, snapshot activate, tracker credentials, status refresh, fail-closed limits |
 | [Dispatcher runbook](docs/dispatcher-runbook.md) | Webhook setup, kill and resume, recovery |
 | [LLM gateway runbook](docs/llm-gateway-runbook.md) | Runs and prices config, budgets, failure behaviour |
 | [Tool gateway runbook](docs/tool-gateway-runbook.md) | Run tokens, tools, publish, failure behaviour |
@@ -53,6 +54,7 @@ Docs live in this repo as Markdown. A build PR updates the README, the overview 
 | `crates/kod-tracker` | Tracker adapter contract, GitHub Issues adapter, fake adapter and contract tests |
 | `crates/kod-tool-gateway` | MCP tools for a run, and the host-only publish operation (library) |
 | `crates/kod-dispatcher` | Webhooks to runs, kill switch and recovery (library) |
+| `crates/kod-host` | The `kod-host` binary: composes the dispatcher and both gateways, launches sandboxed runs, trusted collection, tracker credentials, status refresh. Implemented; live acceptance (6b-c) pending |
 | `crates/kod-gates` | Trusted check runner for pull requests |
 | `crates/kod-status` | The `kod status` CLI |
 | `images/sandbox`, `images/proxy` | Container images |

@@ -26,7 +26,17 @@ pub struct Config {
     pub comment_author_id: u64,
 }
 
+/// Yields the bearer token for each request, so a renewed credential reaches this same instance.
+pub type TokenSource = std::sync::Arc<dyn Fn() -> Result<String> + Send + Sync>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnedStatusComment {
+    pub id: u64,
+    pub body: String,
+}
+
 pub struct GitHub {
+    token: TokenSource,
     config: Config,
     mapping: Mapping,
     client: Client,
@@ -77,6 +87,14 @@ pub struct ReworkMetadata {
     pub fields: Rework,
 }
 
+fn fixed(token: &str) -> TokenSource {
+    let token = token.to_owned();
+    std::sync::Arc::new(move || {
+        ensure!(!token.is_empty(), "missing GitHub identity or credentials");
+        Ok(token.clone())
+    })
+}
+
 fn name(s: &str) -> bool {
     !s.is_empty()
         && !matches!(s, "." | "..")
@@ -84,26 +102,102 @@ fn name(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
 }
 
-#[derive(Debug)]
-struct UncertainWrite;
+/// Whether a failed GitHub write may have changed the remote. Carried as an error context; an
+/// untagged failure is `Uncertain`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteOutcome {
+    NotApplied,
+    Uncertain,
+}
 
-impl std::fmt::Display for UncertainWrite {
+impl std::fmt::Display for WriteOutcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("GitHub write outcome unknown; reconcile before retry")
+        f.write_str(match self {
+            Self::NotApplied => "GitHub write was not applied",
+            Self::Uncertain => "GitHub write outcome unknown; reconcile before retry",
+        })
     }
 }
 
-impl std::error::Error for UncertainWrite {}
+impl std::error::Error for WriteOutcome {}
+
+pub fn write_outcome(error: &anyhow::Error) -> WriteOutcome {
+    error
+        .downcast_ref::<WriteOutcome>()
+        .copied()
+        .unwrap_or(WriteOutcome::Uncertain)
+}
 
 impl GitHub {
-    pub fn new(config: Config, mapping: Mapping, token: &str, secret: &str) -> Result<Self> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_test_api(
+        config: Config,
+        mapping: Mapping,
+        token: &str,
+        secret: &str,
+        api: &str,
+    ) -> Result<Self> {
+        let u = reqwest::Url::parse(api)?;
+        let ip = u
+            .host_str()
+            .and_then(|h| h.trim_matches(['[', ']']).parse::<std::net::IpAddr>().ok());
+        ensure!(
+            u.scheme() == "http"
+                && ip.is_some_and(|ip| ip.is_loopback())
+                && u.port().is_some()
+                && u.username().is_empty()
+                && u.password().is_none()
+                && u.path() == "/"
+                && u.query().is_none()
+                && u.fragment().is_none(),
+            "test API must be literal loopback"
+        );
+        Self::with_api(
+            config,
+            mapping,
+            fixed(token),
+            secret,
+            api.trim_end_matches('/'),
+        )
+    }
+
+    /// `with_test_api` with a token that is fetched per request.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_test_api_source(
+        config: Config,
+        mapping: Mapping,
+        token: TokenSource,
+        secret: &str,
+        api: &str,
+    ) -> Result<Self> {
+        let probe = Self::with_test_api(config.clone(), mapping.clone(), "probe", secret, api)?;
+        Self::with_api(config, mapping, token, secret, &probe.api)
+    }
+
+    /// Production constructor whose token is renewed by `token` before each request.
+    pub fn with_token_source(
+        config: Config,
+        mapping: Mapping,
+        token: TokenSource,
+        secret: &str,
+    ) -> Result<Self> {
         Self::with_api(config, mapping, token, secret, "https://api.github.com")
+    }
+
+    pub fn new(config: Config, mapping: Mapping, token: &str, secret: &str) -> Result<Self> {
+        Self::with_api(
+            config,
+            mapping,
+            fixed(token),
+            secret,
+            "https://api.github.com",
+        )
     }
 
     fn with_api(
         config: Config,
         mapping: Mapping,
-        token: &str,
+        token: TokenSource,
         secret: &str,
         api: &str,
     ) -> Result<Self> {
@@ -113,7 +207,7 @@ impl GitHub {
             "invalid GitHub repository"
         );
         ensure!(
-            config.comment_author_id > 0 && !token.is_empty() && !secret.is_empty(),
+            config.comment_author_id > 0 && !secret.is_empty(),
             "missing GitHub identity or credentials"
         );
         ensure!(
@@ -151,10 +245,6 @@ impl GitHub {
             "GitHub workflow labels must use the reserved kod: namespace"
         );
         let mut headers = HeaderMap::new();
-        let mut auth = HeaderValue::from_str(&format!("Bearer {token}"))
-            .context("invalid GitHub credential")?;
-        auth.set_sensitive(true);
-        headers.insert(reqwest::header::AUTHORIZATION, auth);
         headers.insert(
             reqwest::header::ACCEPT,
             HeaderValue::from_static("application/vnd.github+json"),
@@ -171,6 +261,7 @@ impl GitHub {
             .timeout(Duration::from_secs(30))
             .build()?;
         Ok(Self {
+            token,
             config,
             mapping,
             client,
@@ -178,6 +269,21 @@ impl GitHub {
             secret: secret.into(),
             writes: Mutex::default(),
         })
+    }
+
+    /// The bound issue's unique bot-owned status comment, if any. Read-only; more than one
+    /// owned comment is an error, and an empty result is not proof that a create did not land.
+    pub fn owned_status_comment(&self, key: &str) -> Result<Option<OwnedStatusComment>> {
+        let number = self.number(key)?;
+        self.raw(number)?;
+        Ok(self
+            .status_comments(number)?
+            .into_iter()
+            .next()
+            .map(|c| OwnedStatusComment {
+                id: c.id,
+                body: c.body,
+            }))
     }
 
     fn key(&self, number: u64) -> String {
@@ -217,17 +323,23 @@ impl GitHub {
         body: Option<&Value>,
     ) -> Result<(StatusCode, Value)> {
         let write = method != Method::GET;
-        let mut request = self.client.request(
-            method,
-            format!("{}/repos/{}/{}", self.api, self.config.repo, path),
-        );
+        let mut auth = HeaderValue::from_str(&format!("Bearer {}", (self.token)()?))
+            .context("invalid GitHub credential")?;
+        auth.set_sensitive(true);
+        let mut request = self
+            .client
+            .request(
+                method,
+                format!("{}/repos/{}/{}", self.api, self.config.repo, path),
+            )
+            .header(reqwest::header::AUTHORIZATION, auth);
         if let Some(body) = body {
             request = request.json(body);
         }
         let mut response = request.send().map_err(|error| {
             let error = anyhow::Error::new(error.without_url()).context("GitHub request failed");
             if write {
-                error.context(UncertainWrite)
+                error.context(WriteOutcome::Uncertain)
             } else {
                 error
             }
@@ -256,7 +368,7 @@ impl GitHub {
         })()
         .map_err(|error| {
             if write {
-                error.context(UncertainWrite)
+                error.context(WriteOutcome::Uncertain)
             } else {
                 error
             }
@@ -268,9 +380,18 @@ impl GitHub {
         let write = method != Method::GET;
         let (status, value) = self.request(method, path, body)?;
         if write && status.is_server_error() {
-            return Err(anyhow::anyhow!("GitHub returned HTTP {status}").context(UncertainWrite));
+            return Err(
+                anyhow::anyhow!("GitHub returned HTTP {status}").context(WriteOutcome::Uncertain)
+            );
         }
-        ensure!(status.is_success(), "GitHub returned HTTP {status}");
+        if !status.is_success() {
+            let error = anyhow::anyhow!("GitHub returned HTTP {status}");
+            return Err(if write && status.is_client_error() {
+                error.context(WriteOutcome::NotApplied)
+            } else {
+                error
+            });
+        }
         Ok(value)
     }
 
@@ -593,8 +714,9 @@ impl Tracker for GitHub {
                 &json!({"title": format!("Rework for {story}: {}", fields.artifact), "body": body}),
             ),
         )?;
-        let raw: RawIssue = serde_json::from_value(value).context(UncertainWrite)?;
-        self.bind(&raw, raw.number).context(UncertainWrite)?;
+        let raw: RawIssue = serde_json::from_value(value).context(WriteOutcome::Uncertain)?;
+        self.bind(&raw, raw.number)
+            .context(WriteOutcome::Uncertain)?;
         let key = self.key(raw.number);
         self.call(
             Method::POST,
@@ -660,7 +782,11 @@ impl Tracker for GitHub {
         let longest = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
         let fence = "`".repeat(3.max(longest + 1));
         let body = format!("{STATUS}\n\n{fence}text\n{text}\n{fence}");
-        ensure!(body.len() <= 60_000, "status comment too large");
+        if body.len() > 60_000 {
+            return Err(
+                anyhow::anyhow!("status comment too large").context(WriteOutcome::NotApplied)
+            );
+        }
         let comments = self.status_comments(number)?;
         if let Some(existing) = comments.first() {
             self.call(
@@ -684,13 +810,13 @@ impl Tracker for GitHub {
         let value = match result {
             Ok(value) => value,
             Err(error) => {
-                if error.downcast_ref::<UncertainWrite>().is_none() {
+                if write_outcome(&error) == WriteOutcome::NotApplied {
                     uncertain.remove(&number);
                 }
                 return Err(error);
             }
         };
-        let comment: Comment = serde_json::from_value(value).context(UncertainWrite)?;
+        let comment: Comment = serde_json::from_value(value).context(WriteOutcome::Uncertain)?;
         ensure!(
             comment.user.id == self.config.comment_author_id
                 && comment.user.kind == "Bot"

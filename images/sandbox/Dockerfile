@@ -14,7 +14,7 @@ FROM rust:${RUST_VERSION}-slim-bookworm AS loop
 WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates crates
-RUN cargo build --release --locked -p kod-loop
+RUN cargo build --release --locked -p kod-loop -p kod-eval --bin kod-loop --bin kod-collect-export
 
 FROM ${BASE}
 ARG CLAUDE_CODE_VERSION=""
@@ -39,6 +39,7 @@ RUN apt-get update \
  && useradd --create-home --uid 10001 agent
 COPY images/sandbox/nextest.toml /etc/kod/nextest.toml
 COPY --from=loop /src/target/release/kod-loop /usr/local/bin/kod-loop
+COPY --from=loop /src/target/release/kod-collect-export /usr/local/bin/kod-collect-export
 COPY crates/kod-loop/system.md /etc/kod/kod-loop/system.md
 # Cargo's own state (registry cache, locks) goes in /tmp, which the agent can
 # write in both agent and score mode.

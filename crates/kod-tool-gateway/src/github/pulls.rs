@@ -203,3 +203,71 @@ impl GitHub {
         })
     }
 }
+/// An open PR in the product repository, as read live from GitHub.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenPull {
+    pub number: u64,
+    pub branch: String,
+    pub head: String,
+}
+impl GitHub {
+    /// Live read of every open PR the bot opened from an `agent/` branch of this repository.
+    /// Any malformed PR, provider error or pagination overrun is an error, never a partial list.
+    pub fn open_pulls(&self) -> Result<Vec<OpenPull>> {
+        use crate::broker::Broker;
+        self.register_run(RunPermit {
+            run: "activation-probe".into(),
+            ticket: "activation".into(),
+            repo: self.config.repo.clone(),
+            base: "0".repeat(40),
+        })?;
+        let token = self.mint("activation-probe", &self.config.repo)?;
+        let listed = self.list_open(&token);
+        let revoked = self.revoke("activation-probe");
+        let out = listed?;
+        revoked?;
+        Ok(out)
+    }
+    fn list_open(&self, t: &Secret) -> Result<Vec<OpenPull>> {
+        let path = self.repo_path(&["pulls"]);
+        let mut out = vec![];
+        for page in 1..=100 {
+            let reply = self.http.request(
+                Method::GET,
+                t.expose(),
+                &path,
+                &[
+                    ("state", "open".into()),
+                    ("base", self.config.base_branch.clone()),
+                    ("per_page", "100".into()),
+                    ("page", page.to_string()),
+                ],
+                None,
+            )?;
+            for p in reply.json::<Vec<Pr>>()? {
+                if !p.head.branch.starts_with("agent/")
+                    || p.user.id != self.config.bot_user_id
+                    || p.head.repo.id != self.config.repository_id
+                {
+                    continue;
+                }
+                ensure!(
+                    p.number > 0
+                        && p.state == "open"
+                        && p.base.branch == self.config.base_branch
+                        && sha(&p.head.sha),
+                    "GitHub open PR identity mismatch"
+                );
+                out.push(OpenPull {
+                    number: p.number,
+                    branch: p.head.branch,
+                    head: p.head.sha,
+                });
+            }
+            if !self.http.next_page(reply.link.as_deref(), &path, page)? {
+                return Ok(out);
+            }
+        }
+        anyhow::bail!("GitHub pagination limit")
+    }
+}

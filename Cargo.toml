@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/kod-host",
     "crates/kod-audit",
     "crates/kod-dispatcher",
     "crates/kod-eval",

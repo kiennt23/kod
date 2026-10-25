@@ -46,7 +46,18 @@ pub fn run_args(
     host_ids: (u32, u32),
     env: &[(String, String)],
 ) -> Vec<String> {
-    let b = &case.budget;
+    budget_args(name, run_id, &case.budget, network, m, host_ids, env)
+}
+
+pub fn budget_args(
+    name: &str,
+    run_id: &str,
+    b: &crate::case::Budget,
+    network: &str,
+    m: &Mounts,
+    host_ids: (u32, u32),
+    env: &[(String, String)],
+) -> Vec<String> {
     let mut a: Vec<String> = [
         "run",
         "--rm",
