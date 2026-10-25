@@ -11,29 +11,24 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
-    io::Write,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Command,
     sync::{Arc, Mutex},
 };
 
 pub fn git(repo: &Path, args: &[&str], input: Option<&[u8]>) -> Result<String> {
-    let mut child = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .env("GIT_AUTHOR_NAME", "kod-agent")
-        .env("GIT_AUTHOR_EMAIL", "agent@kod.invalid")
-        .env("GIT_COMMITTER_NAME", "kod-agent")
-        .env("GIT_COMMITTER_EMAIL", "agent@kod.invalid")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    if let Some(bytes) = input {
-        child.stdin.take().context("git stdin")?.write_all(bytes)?;
-    }
-    let output = child.wait_with_output()?;
+    let output = super::proc::output(
+        Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "kod-agent")
+            .env("GIT_AUTHOR_EMAIL", "agent@kod.invalid")
+            .env("GIT_COMMITTER_NAME", "kod-agent")
+            .env("GIT_COMMITTER_EMAIL", "agent@kod.invalid"),
+        input,
+        super::proc::SHORT,
+    )?;
     ensure!(output.status.success(), "fixture git command failed");
     Ok(String::from_utf8(output.stdout)?
         .trim_end_matches('\n')
@@ -356,11 +351,14 @@ fn objects(s: &Remote, m: &str, p: &str, b: &Value) -> Result<(u16, Value)> {
             return Ok((200, json!({"sha":sha,"truncated":false,"tree":entries?})));
         }
         if let Some(sha) = p.strip_prefix("blobs/") {
-            let output = Command::new("git")
-                .arg("-C")
-                .arg(repo)
-                .args(["cat-file", "blob", sha])
-                .output()?;
+            let output = super::proc::output(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(repo)
+                    .args(["cat-file", "blob", sha]),
+                None,
+                super::proc::SHORT,
+            )?;
             ensure!(output.status.success(), "blob read failed");
             return Ok((
                 200,

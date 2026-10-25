@@ -51,9 +51,11 @@ async fn until(limit: Duration, mut f: impl FnMut() -> Result<bool>) -> Result<b
 }
 /// Docker containers of `run` that still exist, running or not.
 fn containers(run: &str) -> Result<Vec<String>> {
-    let out = std::process::Command::new("docker")
-        .args(["ps", "-a", "--format", "{{.Names}}"])
-        .output()?;
+    let out = super::proc::output(
+        std::process::Command::new("docker").args(["ps", "-a", "--format", "{{.Names}}"]),
+        None,
+        super::proc::SHORT,
+    )?;
     ensure!(out.status.success(), "docker ps failed");
     let owned = kod_eval::connected::names(run)?;
     Ok(String::from_utf8(out.stdout)?

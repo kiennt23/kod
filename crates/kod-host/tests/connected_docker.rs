@@ -122,3 +122,39 @@ fn suite_stops_forwarding_once_the_authorized_budget_is_used() {
     .unwrap();
     assert_eq!(seen["model_requests_received"], 1, "provider saw {seen}");
 }
+
+#[test]
+fn hung_scenario_hits_the_suite_deadline_and_keeps_completed_results() {
+    if !enabled() {
+        return;
+    }
+    // Given a scenario that never finishes after the first two complete, and a short deadline.
+    let h = connected::ConnectedFixture::docker();
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_kod-host"));
+    cmd.env("KOD_ACCEPTANCE_TEST_HANG", "1")
+        .env("KOD_ACCEPTANCE_SUITE_DEADLINE_MS", "240000");
+    let began = std::time::Instant::now();
+    let (out, report) = h.accept_with(cmd);
+    // Then it fails fast (exit 1, not blocked), names what completed, and keeps results and counters.
+    assert!(began.elapsed() < std::time::Duration::from_secs(400));
+    assert_eq!(out.status.code(), Some(1), "report: {report}");
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        err.contains("scenarios completed before the hang: [connected-ingress-safety,")
+            && err.contains("draft-pr-story-agent-trailers]"),
+        "stderr: {err}"
+    );
+    assert!(
+        passed(&report, "connected-ingress-safety"),
+        "report: {report}"
+    );
+    assert!(
+        passed(&report, "draft-pr-story-agent-trailers"),
+        "report: {report}"
+    );
+    assert!(report["executed"].as_u64().unwrap() >= 2);
+    assert!(
+        report["external_writes"].as_u64().unwrap() > 0,
+        "report: {report}"
+    );
+}

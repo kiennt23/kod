@@ -57,3 +57,11 @@ required-features = ["connected-test-support"]
 [[test]]
 name = "connected_preflight"
 required-features = ["connected-test-support"]
+
+[[test]]
+name = "connected_bounded"
+required-features = ["connected-test-support"]
+
+[[test]]
+name = "connected_secret"
+required-features = ["connected-test-support"]

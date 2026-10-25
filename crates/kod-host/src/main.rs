@@ -46,9 +46,10 @@ fn main() -> Result<()> {
             let result = (|| -> Result<i32> {
                 let config = kod_host::config::FsConfig::parse(&config)?;
                 let runtime = tokio::runtime::Runtime::new()?;
-                let report =
-                    runtime.block_on(kod_host::acceptance::run(&config, &evidence, mode))?;
-                Ok(report.exit_code())
+                let report = runtime.block_on(kod_host::acceptance::run(&config, &evidence, mode));
+                // A stuck blocking task must not keep the process alive after the report exists.
+                runtime.shutdown_timeout(std::time::Duration::from_secs(5));
+                Ok(report?.exit_code())
             })();
             let code = match result {
                 Ok(code) => code,

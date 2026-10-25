@@ -34,7 +34,9 @@ impl SuiteBudget {
             .used
             .lock()
             .map_err(|_| anyhow::anyhow!("suite ledger unavailable"))?;
+        // Exhaustion is irreversible: once refused, every later reservation is refused too.
         let result = (|| {
+            ensure!(!self.refused(), "suite cap exhausted");
             let add = |a: u64, b: u64, cap: u64| {
                 a.checked_add(b)
                     .filter(|v| *v <= cap)
@@ -73,6 +75,11 @@ impl SuiteBudget {
             .cost_micro_usd
             .saturating_sub(reserved.cost_micro_usd)
             .saturating_add(actual.cost_micro_usd);
+        // Confirmed usage above the suite cap is an overrun: the suite is exhausted.
+        if used.tokens > self.cap.tokens || used.cost_micro_usd > self.cap.cost_micro_usd {
+            self.refused
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         Ok(())
     }
     /// True once any reservation was refused: the suite must stop scheduling work.
@@ -138,5 +145,33 @@ impl kod_llm_proxy::ReservationSink for SuiteSink {
             .remove(&format!("{run}/{id}"))
             .unwrap_or_default();
         self.budget.settle(reserved, suite_spend(spend))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn sp(requests: u64, tokens: u64, cost_micro_usd: u64) -> Spend {
+        Spend {
+            requests,
+            tokens,
+            cost_micro_usd,
+        }
+    }
+    #[test]
+    fn refusal_is_irreversible() {
+        let b = SuiteBudget::new(sp(10, 100, 100)).unwrap();
+        assert!(b.reserve(sp(1, 200, 1)).is_err());
+        // A small request that would fit on its own is still refused afterwards.
+        assert!(b.reserve(sp(1, 1, 1)).is_err());
+        assert!(b.refused());
+    }
+    #[test]
+    fn settlement_above_cap_exhausts_the_suite() {
+        let b = SuiteBudget::new(sp(10, 100, 100)).unwrap();
+        b.reserve(sp(1, 50, 50)).unwrap();
+        b.settle(sp(1, 50, 50), sp(1, 500, 50)).unwrap();
+        assert!(b.refused());
+        assert!(b.reserve(sp(1, 1, 1)).is_err());
     }
 }

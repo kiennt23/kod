@@ -82,7 +82,7 @@ pub struct Report {
     pub mode: Mode,
     pub scenarios: Vec<Scenario>,
     pub blocked: Vec<String>,
-    /// Why each blocker fired (error chains), so a blocked run explains itself.
+    /// Why each blocker fired (fixed codes only, never supplied values).
     pub blocked_reasons: Vec<String>,
     pub external_writes: u64,
     pub model_requests: u64,

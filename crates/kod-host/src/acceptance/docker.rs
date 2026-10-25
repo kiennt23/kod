@@ -1,6 +1,7 @@
 //! Deterministic upstream simulation around the production connected composition.
 pub mod fixture;
 mod lifecycle;
+pub mod proc;
 pub mod provider;
 mod scenarios;
 
@@ -20,15 +21,27 @@ use anyhow::{Context, Result, ensure};
 use fixture::Fixture;
 use std::{path::Path, sync::Arc};
 
-pub fn preflight(config: &FsConfig) -> Result<()> {
-    ensure!(
+/// A preflight failure reduced to a fixed code; the underlying error (which may echo supplied
+/// values such as a malformed policy) is never carried into stderr or the report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Blocked(pub &'static str);
+impl std::fmt::Display for Blocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+impl std::error::Error for Blocked {}
+
+pub fn preflight(config: &FsConfig) -> std::result::Result<(), Blocked> {
+    let check = |ok: bool, code| if ok { Ok(()) } else { Err(Blocked(code)) };
+    check(
         config.github.product.repo == "acme/app" && config.github.tracker.repo == "acme/app",
-        "fixture repository required"
-    );
-    ensure!(
+        "fixture_repository",
+    )?;
+    check(
         config.model.upstream == "https://connected-fixture.invalid",
-        "fixture upstream required"
-    );
+        "fixture_upstream",
+    )?;
     for (path, expected) in [
         (
             &config.model.api_key_file,
@@ -43,13 +56,19 @@ pub fn preflight(config: &FsConfig) -> Result<()> {
             b"connected-fixture-owner".as_slice(),
         ),
     ] {
-        ensure!(
-            crate::config::read_private(path)? == expected,
-            "fixture credential required"
-        );
+        check(
+            crate::config::read_private(path).is_ok_and(|v| v == expected),
+            "fixture_credential",
+        )?;
     }
-    config.validate_local()?;
-    Ok(())
+    // Only the fixed text of our own digest rule is matched; nothing from the error is kept.
+    config.validate_local().map_err(|e| {
+        Blocked(if format!("{e:#}").contains("exact sha256 digest") {
+            "image_digest"
+        } else {
+            "local_validation"
+        })
+    })
 }
 fn observed(name: &str, ok: bool, observation: Observation) -> Scenario {
     Scenario {
@@ -61,13 +80,15 @@ fn observed(name: &str, ok: bool, observation: Observation) -> Scenario {
 /// Best-effort provenance knowable in Docker mode: the kod commit under test and the sandbox image ids.
 pub fn provenance(config: &FsConfig) -> (Option<String>, Vec<String>) {
     let out = |cmd: &str, args: &[&str]| {
-        std::process::Command::new(cmd)
-            .args(args)
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| s.trim().to_owned())
+        proc::output(
+            std::process::Command::new(cmd).args(args),
+            None,
+            std::time::Duration::from_secs(10),
+        )
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_owned())
     };
     let commit = out(
         "git",
@@ -83,32 +104,87 @@ pub fn provenance(config: &FsConfig) -> (Option<String>, Vec<String>) {
     (commit, digests)
 }
 const SUITE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(600);
-pub async fn run(config: &FsConfig, evidence: &Path, suite: Arc<SuiteBudget>) -> Result<Execution> {
-    preflight(config)?;
-    let mut fixture = Fixture::new(config).await?;
-    fixture.suite = Some(suite.clone());
-    fixture.start().await?;
+const SHUTDOWN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The suite stopped at its deadline; carries only our own text (scenario names).
+#[derive(Debug)]
+pub struct SuiteTimeout(pub String);
+impl std::fmt::Display for SuiteTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for SuiteTimeout {}
+
+/// Test-support override so the CLI can be exercised with a short deadline.
+fn deadline() -> std::time::Duration {
+    std::env::var("KOD_ACCEPTANCE_SUITE_DEADLINE_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map_or(SUITE_DEADLINE, std::time::Duration::from_millis)
+}
+
+/// Always returns what was accumulated, with the error (if any) beside it: a failed or timed-out
+/// suite must not lose completed scenarios, external writes or spend.
+pub async fn run(
+    config: &FsConfig,
+    evidence: &Path,
+    suite: Arc<SuiteBudget>,
+) -> (Execution, Result<()>) {
     let mut execution = Execution::default();
-    // A hung scenario must fail fast and name where it stopped, not stall CI.
-    let result = match tokio::time::timeout(
-        SUITE_DEADLINE,
-        conformance(&mut fixture, evidence, &mut execution),
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(_) => Err(anyhow::anyhow!(
-            "docker suite exceeded {}s; scenarios completed before the hang: [{}]",
-            SUITE_DEADLINE.as_secs(),
-            execution
-                .scenarios
-                .iter()
-                .map(|s| s.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )),
+    let result = suite_run(config, evidence, &suite, deadline(), &mut execution).await;
+    // Unfinished scenarios stay explicit blockers; the caller marks the failing one.
+    for name in DOCKER_SCENARIOS {
+        if !execution.scenarios.iter().any(|s| s.name == *name) {
+            execution.scenarios.push(Scenario {
+                name: (*name).into(),
+                outcome: Outcome::Blocked,
+                observations: vec![],
+            });
+        }
+    }
+    execution.spend = suite.consumed().unwrap_or_default();
+    (execution, result)
+}
+async fn suite_run(
+    config: &FsConfig,
+    evidence: &Path,
+    suite: &Arc<SuiteBudget>,
+    limit: std::time::Duration,
+    execution: &mut Execution,
+) -> Result<()> {
+    preflight(config)?;
+    let mut fixture: Option<Fixture> = None;
+    // The deadline covers setup too: a hung fixture start must fail fast like a hung scenario.
+    let result = {
+        let body = async {
+            let f = fixture.insert(Fixture::new(config).await?);
+            f.suite = Some(suite.clone());
+            f.start().await?;
+            conformance(f, evidence, execution).await
+        };
+        match tokio::time::timeout(limit, body).await {
+            Ok(r) => r,
+            Err(_) => Err(SuiteTimeout(format!(
+                "docker suite exceeded {}ms; scenarios completed before the hang: [{}]",
+                limit.as_millis(),
+                execution
+                    .scenarios
+                    .iter()
+                    .map(|s| s.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+            .into()),
+        }
     };
-    let cleanup = fixture.shutdown().await;
+    let Some(mut fixture) = fixture else {
+        return result;
+    };
+    let cleanup = match tokio::time::timeout(SHUTDOWN_DEADLINE, fixture.shutdown()).await {
+        Ok(r) => r,
+        Err(_) => Err(anyhow::anyhow!("fixture shutdown timed out")),
+    };
     // Recorded even when a scenario errored, so a budget stop is independently observable.
     let received = fixture
         .provider
@@ -121,8 +197,6 @@ pub async fn run(config: &FsConfig, evidence: &Path, suite: Arc<SuiteBudget>) ->
         &evidence.join("provider-observations.json"),
         &serde_json::to_vec(&serde_json::json!({"model_requests_received": received}))?,
     )?;
-    result?;
-    cleanup?;
     let state = fixture
         .provider
         .state
@@ -135,17 +209,9 @@ pub async fn run(config: &FsConfig, evidence: &Path, suite: Arc<SuiteBudget>) ->
             .filter(|(method, path, _)| method != "GET" && path.starts_with("/repos/"))
             .count(),
     )?;
-    execution.spend = suite.consumed()?;
-    for name in DOCKER_SCENARIOS {
-        if !execution.scenarios.iter().any(|s| s.name == *name) {
-            execution.scenarios.push(Scenario {
-                name: (*name).into(),
-                outcome: Outcome::Blocked,
-                observations: vec![],
-            });
-        }
-    }
-    Ok(execution)
+    drop(state);
+    result?;
+    cleanup
 }
 // The provider guard is dropped explicitly before the next await; clippy cannot see through drop().
 #[allow(clippy::await_holding_lock)]
@@ -241,20 +307,11 @@ async fn conformance(h: &mut Fixture, evidence: &Path, execution: &mut Execution
         trailers = message.contains("Kod-Ticket: github:acme/app#7")
             && message.contains(&format!("Kod-Run: {run}"))
             && message.contains("Co-Authored-By: kod-agent <agent@kod.invalid>");
-        let exported = crate::workspace::read_export(
-            &h.config.paths.run_root.join(&run).join("export_out"),
-            &crate::production::mirror_base(&remote.repo, "main")?,
-        )?;
+        let export_dir = h.config.paths.run_root.join(&run).join("export_out");
+        let base = crate::production::mirror_base(&remote.repo, "main")?;
+        let exported = crate::workspace::read_export(&export_dir, &base)?;
         same = !exported.changes.is_empty()
-            && exported.changes.iter().all(|change| match &change.content {
-                Some(text) => provider::git(
-                    &remote.repo,
-                    &["show", &format!("{head}:{}", change.path)],
-                    None,
-                )
-                .is_ok_and(|actual| actual == text.trim_end_matches('\n')),
-                None => false,
-            });
+            && published_tree_matches(&remote.repo, &base, head, &export_dir)?;
         fixture::private_write(
             &evidence.join("published-objects.json"),
             &serde_json::to_vec(
@@ -273,6 +330,10 @@ async fn conformance(h: &mut Fixture, evidence: &Path, execution: &mut Execution
         },
     ));
     drop(remote);
+    // Test support (feature-gated build only): simulate a scenario that never finishes.
+    if std::env::var_os("KOD_ACCEPTANCE_TEST_HANG").is_some() {
+        std::future::pending::<()>().await;
+    }
     execution
         .scenarios
         .extend(scenarios::run(h, evidence).await?);
@@ -280,4 +341,114 @@ async fn conformance(h: &mut Fixture, evidence: &Path, execution: &mut Execution
         .scenarios
         .extend(lifecycle::run(h, evidence).await?);
     Ok(())
+}
+
+/// True only when the published head differs from `base` by EXACTLY the collected export: the
+/// same set of paths (so no extra unapproved file), deletions as deletions, and identical file
+/// modes and blob contents.
+pub fn published_tree_matches(repo: &Path, base: &str, head: &str, export: &Path) -> Result<bool> {
+    use std::collections::BTreeMap;
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(export.join("manifest.json"))?)?;
+    // path -> None (deleted) or Some((mode, git blob sha of the expected bytes))
+    let mut expected: BTreeMap<String, Option<(String, String)>> = BTreeMap::new();
+    for (i, f) in manifest["files"]
+        .as_array()
+        .context("files")?
+        .iter()
+        .enumerate()
+    {
+        let path = f["path"].as_str().context("path")?.to_owned();
+        let entry = if f["deleted"] == true {
+            None
+        } else {
+            let bytes = std::fs::read(export.join(i.to_string()))?;
+            let sha = provider::git(repo, &["hash-object", "--stdin"], Some(&bytes))?;
+            Some((f["mode"].as_str().context("mode")?.to_owned(), sha))
+        };
+        expected.insert(path, entry);
+    }
+    let raw = provider::git(
+        repo,
+        &[
+            "diff-tree",
+            "-r",
+            "--no-renames",
+            "--no-abbrev",
+            "-z",
+            base,
+            head,
+        ],
+        None,
+    )?;
+    let mut actual: BTreeMap<String, Option<(String, String)>> = BTreeMap::new();
+    let mut fields = raw.split('\0');
+    while let Some(meta) = fields.next().filter(|m| !m.is_empty()) {
+        let path = fields.next().context("diff path")?.to_owned();
+        let m: Vec<&str> = meta.trim_start_matches(':').split(' ').collect();
+        ensure!(m.len() == 5, "unexpected diff-tree record");
+        actual.insert(
+            path,
+            (m[4] != "D").then(|| (m[1].to_owned(), m[3].to_owned())),
+        );
+    }
+    Ok(actual == expected)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    /// base commit + a head commit on top of it, plus an export dir describing the expected change.
+    fn repo_and_export(
+        extra: Option<(&str, &str)>,
+        mode: &str,
+    ) -> (tempfile::TempDir, String, String, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let g = |a: &[&str], i: Option<&[u8]>| provider::git(dir.path(), a, i).unwrap();
+        g(&["init", "-b", "main"], None);
+        std::fs::write(dir.path().join("keep.txt"), "keep\n").unwrap();
+        std::fs::write(dir.path().join("old.txt"), "old\n").unwrap();
+        g(&["add", "."], None);
+        g(&["commit", "-m", "base"], None);
+        let base = g(&["rev-parse", "HEAD"], None);
+        std::fs::write(dir.path().join("new.txt"), "new\n").unwrap();
+        std::fs::remove_file(dir.path().join("old.txt")).unwrap();
+        if let Some((p, t)) = extra {
+            std::fs::write(dir.path().join(p), t).unwrap();
+        }
+        g(&["add", "-A"], None);
+        g(&["update-index", "--chmod=+x", "new.txt"], None);
+        g(&["commit", "-m", "head"], None);
+        let head = g(&["rev-parse", "HEAD"], None);
+        let export = tempfile::tempdir().unwrap();
+        std::fs::write(export.path().join("0"), "new\n").unwrap();
+        std::fs::write(
+            export.path().join("manifest.json"),
+            serde_json::json!({"files":[
+                {"path":"new.txt","mode":mode,"blob":0},
+                {"path":"old.txt","deleted":true}]})
+            .to_string(),
+        )
+        .unwrap();
+        (dir, base, head, export)
+    }
+    #[test]
+    fn published_tree_must_equal_the_export_exactly() {
+        let (r, base, head, e) = repo_and_export(None, "100755");
+        assert!(published_tree_matches(r.path(), &base, &head, e.path()).unwrap());
+        // An extra unapproved file in the published tree.
+        let (r, base, head, e) = repo_and_export(Some(("evil.txt", "x")), "100755");
+        assert!(!published_tree_matches(r.path(), &base, &head, e.path()).unwrap());
+        // A wrong file mode.
+        let (r, base, head, e) = repo_and_export(None, "100644");
+        assert!(!published_tree_matches(r.path(), &base, &head, e.path()).unwrap());
+        // A deletion the export does not contain (published head deletes old.txt, export keeps it).
+        let (r, base, head, e) = repo_and_export(None, "100755");
+        std::fs::write(
+            e.path().join("manifest.json"),
+            serde_json::json!({"files":[{"path":"new.txt","mode":"100755","blob":0}]}).to_string(),
+        )
+        .unwrap();
+        assert!(!published_tree_matches(r.path(), &base, &head, e.path()).unwrap());
+    }
 }

@@ -304,15 +304,16 @@ fn tar_work(dir: &Path, build: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
     let tree = dir.join("tree");
     std::fs::create_dir(&tree)?;
     build(&tree)?;
-    let ok = std::process::Command::new("tar")
-        .env("COPYFILE_DISABLE", "1")
-        .arg("-cf")
-        .arg(dir.join("agent_out/work.tar"))
-        .arg("-C")
-        .arg(&tree)
-        .arg(".")
-        .status()?
-        .success();
+    let ok = super::proc::success(
+        std::process::Command::new("tar")
+            .env("COPYFILE_DISABLE", "1")
+            .arg("-cf")
+            .arg(dir.join("agent_out/work.tar"))
+            .arg("-C")
+            .arg(&tree)
+            .arg("."),
+        super::proc::SHORT,
+    )?;
     ensure!(ok, "tar failed");
     std::fs::remove_dir_all(&tree)?;
     Ok(())
@@ -457,6 +458,20 @@ impl kod_gates::Forge for RecordingForge {
     }
 }
 
+/// Replaces the EXISTING `design` link's revision (no new link), so old pins become superseded.
+fn advance_design(manifest: &mut Value, text: &str) -> Result<()> {
+    let entry = manifest["artifacts"]
+        .as_array_mut()
+        .context("artifacts")?
+        .iter_mut()
+        .find(|a| a["link"] == "design")
+        .context("design link")?;
+    entry["revision"] = "design-v2".into();
+    entry["path"] = "design2.txt".into();
+    entry["sha256"] = format!("{:x}", Sha256::digest(text)).into();
+    Ok(())
+}
+
 pub fn approval_refresh(c: &Ctx) -> Result<Checks> {
     use std::os::unix::fs::PermissionsExt;
     let mut k: Checks = vec![];
@@ -464,16 +479,8 @@ pub fn approval_refresh(c: &Ctx) -> Result<Checks> {
     let active = &cfg.paths.approval_manifest;
     let old = std::fs::read(active)?;
     let mut manifest: Value = serde_json::from_slice(&old)?;
-    let mut entry = manifest["artifacts"][0].clone();
     let text = "Approved fixture design, second revision";
-    entry["link"] = "design2".into();
-    entry["revision"] = "design-v2".into();
-    entry["path"] = "design2.txt".into();
-    entry["sha256"] = format!("{:x}", Sha256::digest(text)).into();
-    manifest["artifacts"]
-        .as_array_mut()
-        .context("artifacts")?
-        .push(entry);
+    advance_design(&mut manifest, text)?;
     let stage = tempfile::tempdir_in(std::env::temp_dir().canonicalize()?)?;
     std::fs::set_permissions(stage.path(), std::fs::Permissions::from_mode(0o700))?;
     let candidate = stage.path().join("manifest.json");
@@ -544,12 +551,19 @@ pub fn approval_refresh(c: &Ctx) -> Result<Checks> {
             && std::fs::read(active)? == std::fs::read(&candidate)?
             && active.parent().context("dir")?.join("design2.txt").exists(),
     ));
-    // The new approved revision is readable; replacing an old revision's content is refused.
+    // The new approved revision is readable and old content stays immutable; the required `design`
+    // link now resolves to v2, so a v1 pin is superseded and refused while a v2 pin is accepted.
     let artifacts = crate::artifacts::Artifacts::new(active.clone(), &cfg.paths.policy_dir)?;
+    let design = ["design".to_owned()];
     k.push((
-        "new-revision-active-and-old-revision-immutable",
-        artifacts.read("design-v2").is_ok_and(|d| d.text == text)
-            && artifacts.read("design-v1").is_ok(),
+        "new-revision-active",
+        artifacts.read("design-v2").is_ok_and(|d| d.text == text),
+    ));
+    k.push((
+        "required-link-advanced-and-old-pin-stale",
+        kod_gates::Artifacts::current(&artifacts, "design").is_ok_and(|r| r == "design-v2")
+            && kod_gates::check_pins(&["design-v1".into()], &design, &artifacts).is_err()
+            && kod_gates::check_pins(&["design-v2".into()], &design, &artifacts).is_ok(),
     ));
     Ok(k)
 }
@@ -683,14 +697,15 @@ pub fn gate_container_isolation(c: &Ctx) -> Result<Checks> {
     let archive = dir.path().join("source.tar.gz");
     write(dir.path(), "src/marker", "original\n")?;
     ensure!(
-        std::process::Command::new("tar")
-            .arg("-czf")
-            .arg(&archive)
-            .arg("-C")
-            .arg(dir.path())
-            .arg("src")
-            .status()?
-            .success(),
+        super::proc::success(
+            std::process::Command::new("tar")
+                .arg("-czf")
+                .arg(&archive)
+                .arg("-C")
+                .arg(dir.path())
+                .arg("src"),
+            super::proc::SHORT
+        )?,
         "tar failed"
     );
     let sha = "a".repeat(40);
@@ -727,17 +742,19 @@ pub fn gate_container_isolation(c: &Ctx) -> Result<Checks> {
          test \"$(ls /sys/class/net | tr -d '\\n')\" = lo"
             .into(),
     ]);
-    let run = std::process::Command::new("docker").args(&args).output()?;
-    let _ = std::process::Command::new("docker")
-        .args(["rm", "--force", "--volumes", &name])
-        .output();
-    let listed = std::process::Command::new("docker")
-        .args(["ps", "-a", "-q", "--filter", &format!("name={name}")])
-        .output()?;
-    k.push(("gate-container-ran-isolated", run.status.success()));
+    use super::proc::{LONG, SHORT, output};
+    let docker = |a: &[&str]| output(std::process::Command::new("docker").args(a), None, SHORT);
+    // A hung or killed `docker run` client may leave its container behind: always remove by name.
+    let run = output(std::process::Command::new("docker").args(&args), None, LONG);
+    let removed = docker(&["rm", "--force", "--volumes", &name]);
+    let listed = docker(&["ps", "-a", "-q", "--filter", &format!("name={name}")]);
+    k.push((
+        "gate-container-ran-isolated",
+        run.is_ok_and(|r| r.status.success()),
+    ));
     k.push((
         "gate-container-absent-afterwards",
-        listed.status.success() && listed.stdout.is_empty(),
+        removed.is_ok() && listed.is_ok_and(|l| l.status.success() && l.stdout.is_empty()),
     ));
     Ok(k)
 }
@@ -805,4 +822,28 @@ pub async fn run(h: &Fixture, evidence: &Path) -> Result<Vec<Scenario>> {
     })
     .await
     .context("scenario worker")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    struct Stub(Value);
+    impl kod_gates::Artifacts for Stub {
+        fn current(&self, link: &str) -> Result<String> {
+            let a = self.0["artifacts"].as_array().context("artifacts")?;
+            let a = a.iter().find(|a| a["link"] == link).context("unknown")?;
+            Ok(a["revision"].as_str().context("revision")?.to_owned())
+        }
+    }
+    #[test]
+    fn refresh_advances_the_required_link_and_stales_old_pins() {
+        let mut m = json!({"artifacts":[
+            {"link":"design","revision":"design-v1","path":"design.txt","sha256":"x"},
+            {"link":"secret","revision":"planted-secret","path":"secret.txt","sha256":"y"}]});
+        advance_design(&mut m, "v2").unwrap();
+        assert_eq!(m["artifacts"].as_array().unwrap().len(), 2);
+        let (stub, design) = (Stub(m), ["design".to_owned()]);
+        assert!(kod_gates::check_pins(&["design-v1".into()], &design, &stub).is_err());
+        assert!(kod_gates::check_pins(&["design-v2".into()], &design, &stub).is_ok());
+    }
 }

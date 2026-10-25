@@ -166,8 +166,12 @@ impl ConnectedFixture {
         put(&self.config, cfg.to_string());
     }
     pub fn accept(&self) -> (std::process::Output, Value) {
+        self.accept_with(Command::new(env!("CARGO_BIN_EXE_kod-host")))
+    }
+    /// Like `accept`, with the caller's environment on the command (program is already set).
+    pub fn accept_with(&self, mut cmd: Command) -> (std::process::Output, Value) {
         let evidence = self.dir.path().join("evidence");
-        let out = Command::new(env!("CARGO_BIN_EXE_kod-host"))
+        let out = cmd
             .args(["accept", "--config"])
             .arg(&self.config)
             .arg("--evidence")

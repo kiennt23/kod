@@ -10,7 +10,9 @@ fn tag_only_image_blocks_with_a_reason() {
     let (out, report) = h.accept();
     assert_eq!(out.status.code(), Some(2), "report: {report}");
     assert_eq!(report["blocked"][0], "docker_prerequisites");
-    let reason = report["blocked_reasons"][0].as_str().unwrap();
-    assert!(reason.contains("sha256 digest"), "reason: {reason}");
-    assert!(String::from_utf8_lossy(&out.stderr).contains("sha256 digest"));
+    assert_eq!(
+        report["blocked_reasons"][0],
+        "docker_prerequisites: image_digest"
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("image_digest"));
 }

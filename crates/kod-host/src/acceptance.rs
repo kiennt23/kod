@@ -47,10 +47,11 @@ pub fn preflight_report(mode: Mode, config: &FsConfig) -> Report {
             #[cfg(feature = "connected-test-support")]
             if let Err(e) = docker::preflight(config) {
                 report.blocked.push("docker_prerequisites".into());
+                // Only the fixed code: the underlying error may echo supplied values.
                 report
                     .blocked_reasons
-                    .push(format!("docker_prerequisites: {e:#}"));
-                eprintln!("acceptance blocked: docker_prerequisites: {e:#}");
+                    .push(format!("docker_prerequisites: {}", e.0));
+                eprintln!("acceptance blocked: docker_prerequisites: {}", e.0);
             }
         }
     }
@@ -72,18 +73,33 @@ pub async fn run(config: &FsConfig, evidence_path: &Path, mode: Mode) -> Result<
         match mode {
             Mode::Docker => {
                 #[cfg(feature = "connected-test-support")]
-                match docker::run(config, &evidence_path, suite.clone()).await {
-                    Ok(execution) => {
-                        report.scenarios = execution.scenarios;
-                        report.external_writes = execution.external_writes;
-                    }
-                    Err(e) => {
-                        eprintln!("acceptance execution failed: {e:#}");
-                        // Blame only the scenario that was running, not an unrelated one.
-                        if let Some(stage) = e.downcast_ref::<docker::Stage>()
-                            && let Some(s) = report.scenarios.iter_mut().find(|s| s.name == stage.0)
-                        {
-                            s.outcome = Outcome::Fail;
+                {
+                    let (execution, result) =
+                        docker::run(config, &evidence_path, suite.clone()).await;
+                    report.scenarios = execution.scenarios;
+                    report.external_writes = execution.external_writes;
+                    if let Err(e) = result {
+                        // Fixed text only: error chains can echo supplied values.
+                        let stage = e.downcast_ref::<docker::Stage>().map(|s| s.0);
+                        eprintln!(
+                            "acceptance execution failed{}",
+                            stage.map_or(String::new(), |s| format!(" in scenario {s}"))
+                        );
+                        if let Some(t) = e.downcast_ref::<docker::SuiteTimeout>() {
+                            eprintln!("{t}");
+                        }
+                        // Blame the running scenario, else the first unfinished one: a failure
+                        // is never reported as merely blocked.
+                        let at = stage
+                            .and_then(|n| report.scenarios.iter().position(|s| s.name == n))
+                            .or_else(|| {
+                                report
+                                    .scenarios
+                                    .iter()
+                                    .position(|s| s.outcome == Outcome::Blocked)
+                            });
+                        if let Some(i) = at {
+                            report.scenarios[i].outcome = Outcome::Fail;
                         }
                         report.blocked.push("scenario_execution_failed".into());
                     }
