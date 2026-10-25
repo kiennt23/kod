@@ -35,10 +35,17 @@ fn world() -> World {
     let root = tmp.path().to_path_buf();
     dir(&root);
     let mut c = (*common::config(&root, &root.join("dispatcher.db"))).clone();
-    c.paths.policy_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../policy")
-        .canonicalize()
-        .unwrap();
+    let policy = root.join("policy");
+    assert!(
+        std::process::Command::new("cp")
+            .arg("-R")
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../policy"))
+            .arg(&policy)
+            .status()
+            .unwrap()
+            .success()
+    );
+    c.paths.policy_dir = policy.canonicalize().unwrap();
     c.paths.approval_manifest = root.join("active/manifest.json");
     c.paths.credential_dir = root.join("cred");
     dir(&c.paths.credential_dir);
@@ -220,27 +227,56 @@ async fn old_token_is_denied_after_restart() {
             },
         )
         .unwrap();
+    let mcp = common::mcp_token("run-5");
+    s.runtime
+        .tool()
+        .start_run(
+            &mcp,
+            kod_tool_gateway::Run {
+                id: "run-5".into(),
+                ticket: "acme/app#7".into(),
+                repo: "acme/app".into(),
+                base: "c".repeat(40),
+                data_classes: vec!["placeholder".into()],
+                pins: Default::default(),
+                linked_tickets: vec![],
+                started_at: 1,
+            },
+        )
+        .unwrap();
     let live = status(s.gateway, "POST", &format!("/r/{token}/v1/messages"), None).await;
     assert_ne!(live, 401, "registered token is recognised");
-    let denied_mcp = status(s.gateway, "POST", &format!("/r/{token}/mcp"), None).await;
+    let live_mcp = status(s.gateway, "POST", &format!("/r/{mcp}/mcp"), None).await;
+    assert_ne!(
+        live_mcp, 401,
+        "the registered token is recognised on MCP too"
+    );
     s.shutdown().await.unwrap();
     let s = Service::start(w.config.clone(), parts(&w)).await.unwrap();
     assert_eq!(
         status(s.gateway, "POST", &format!("/r/{token}/v1/messages"), None).await,
         401
     );
-    assert_eq!(
-        status(s.gateway, "POST", &format!("/r/{token}/mcp"), None).await,
-        denied_mcp
+    let denied_mcp = status(s.gateway, "POST", &format!("/r/{mcp}/mcp"), None).await;
+    assert!(
+        [401, 404].contains(&denied_mcp) && denied_mcp != live_mcp,
+        "live {live_mcp}, after restart {denied_mcp}"
     );
     s.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn signed_kill_works_during_a_source_outage() {
+async fn owner_kill_remains_live_during_dependency_outage() {
     let w = world();
     let s = Service::start(w.config.clone(), parts(&w)).await.unwrap();
+    // Every dependency a kill could consult goes away: mirror source, policy files, and the
+    // audit store (swapped, so the open handle's identity check fails closed).
     w.base_up.store(false, Ordering::SeqCst);
+    fs::remove_dir_all(&w.config.paths.policy_dir).unwrap();
+    let audit = &w.config.paths.audit_db;
+    fs::rename(audit, audit.with_extension("old")).unwrap();
+    put(audit, "");
+    fs::set_permissions(audit, fs::Permissions::from_mode(0o600)).unwrap();
     let body = serde_json::json!({"by": "kiennt23", "at": kod_host::service::system_now(), "command": "kill"}).to_string();
     let sig = kod_dispatcher::command::sign(OWNER_KEY, body.as_bytes());
     let r = reqwest::Client::new()
@@ -352,4 +388,145 @@ async fn model_spend_is_durable_across_restart() {
         )
         .unwrap();
     assert_eq!(n, 1);
+}
+
+/// A config that passes full local validation (paths, secrets, images, model, networking).
+fn bootable(w: &World) -> kod_host::config::FsConfig {
+    let root = w.config.paths.dispatcher_db.parent().unwrap().to_owned();
+    dir(&root.join("runs"));
+    dir(&root.join("mirror"));
+    put(&root.join("webhook"), "whsec");
+    for db in [&w.config.paths.dispatcher_db, &root.join("audit.db")] {
+        if db.exists() {
+            fs::set_permissions(db, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+    let mut c = (*w.config).clone();
+    c.paths.run_root = root.join("runs");
+    c.paths.mirror = root.join("mirror");
+    c.paths.audit_db = root.join("audit.db");
+    c.github.mapping = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../registry/trackers/github.json")
+        .canonicalize()
+        .unwrap();
+    c.github.webhook_secret_file = root.join("webhook");
+    c.networking.ingress_listen = "127.0.0.1:3000".parse().unwrap();
+    c.networking.gateway_listen = "127.0.0.1:3001".parse().unwrap();
+    c.networking.accepted_hosts = vec!["localhost".into()];
+    c.networking.sandbox_network = "n".into();
+    c.networking.sandbox_gateway_url = "http://h:1".into();
+    c.model.upstream = "https://api.example.invalid".into();
+    c.model.prices = root.join("prices.json");
+    c.model.max_tokens = 100;
+    c.model.max_body = 4096;
+    c.model.max_requests = 10;
+    c.model.max_concurrent = 2;
+    c.model.run_max_tokens = 100;
+    c.model.run_max_cost_micro_usd = 100;
+    c.sandbox.agent_image = format!("a@sha256:{}", "a".repeat(64));
+    c.sandbox.collector_image = format!("c@sha256:{}", "c".repeat(64));
+    c.sandbox.memory = "8g".into();
+    c.sandbox.disk = "1g".into();
+    c
+}
+
+fn seed_bound_run(w: &World, seq: i64) -> String {
+    let id = format!("run-{seq}");
+    let c = kod_dispatcher::store::open(&w.config.paths.dispatcher_db).unwrap();
+    c.execute(
+        "INSERT INTO runs(seq,ticket,revision,state) VALUES(?1,'acme/app#7','v1','running')",
+        [seq],
+    )
+    .unwrap();
+    let start = kod_dispatcher::RunStart {
+        id: id.clone(),
+        ticket: "acme/app#7".into(),
+        revision: "v1".into(),
+        repo: "acme/app".into(),
+    };
+    let root = w.config.paths.dispatcher_db.parent().unwrap().to_owned();
+    let b = serde_json::to_value(common::admitted(&root.join("runs"), &start).binding).unwrap();
+    kod_dispatcher::store::bind_once(&c, &id, &b).unwrap();
+    id
+}
+
+#[test]
+fn a_second_serve_is_refused_before_it_starts_tracker_credentials() {
+    let w = world();
+    let root = w.config.paths.dispatcher_db.parent().unwrap().to_owned();
+    let _first = kod_host::service::instance_lock(&root).unwrap();
+    let started = AtomicBool::new(false);
+    let r = kod_host::service::prepare(bootable(&w), |_| {
+        started.store(true, Ordering::SeqCst);
+        Ok(())
+    });
+    assert!(r.is_err());
+    assert!(
+        !started.load(Ordering::SeqCst),
+        "creds.start ran before the lock"
+    );
+}
+
+#[test]
+fn a_config_that_parses_but_fails_validation_still_cleans_up_durable_runs() {
+    let w = world();
+    let id = seed_bound_run(&w, 88);
+    let mut cfg = bootable(&w);
+    cfg.sandbox.agent_image = "not-a-digest".into();
+    assert!(cfg.validate_paths().is_ok() && cfg.validate_local().is_err());
+    let started = AtomicBool::new(false);
+    let r = kod_host::service::prepare(cfg, |_| {
+        started.store(true, Ordering::SeqCst);
+        Ok(())
+    });
+    assert!(r.is_err());
+    assert!(!started.load(Ordering::SeqCst));
+    let calls = common::docker_calls();
+    assert!(
+        calls
+            .lines()
+            .any(|l| l.contains(&format!("kod-agent-{id}"))),
+        "no cleanup attempt for {id}: {calls}"
+    );
+}
+
+#[test]
+fn a_tracker_outage_at_boot_still_cleans_up_durable_runs() {
+    let w = world();
+    let id = seed_bound_run(&w, 89);
+    let cfg = bootable(&w);
+    cfg.validate_local().unwrap();
+    let r = kod_host::service::prepare(cfg, |_| -> anyhow::Result<()> {
+        anyhow::bail!("tracker unavailable")
+    });
+    let e = format!("{:#}", r.err().expect("must refuse"));
+    assert!(e.contains("tracker unavailable"), "{e}");
+    let calls = common::docker_calls();
+    assert!(
+        calls
+            .lines()
+            .any(|l| l.contains(&format!("kod-agent-{id}"))),
+        "{calls}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_reports_failed_stop_and_retains_followup() {
+    let w = world();
+    let s = Service::start(w.config.clone(), parts(&w)).await.unwrap();
+    // A bound run whose container never goes away (fake docker, run-77).
+    seed_bound_run(&w, 77);
+    let err = s.shutdown().await.unwrap_err();
+    assert!(format!("{err:#}").contains("cleanup pending"), "{err:#}");
+    // The durable identity is retained, so the next start's recovery still owns the stop.
+    let c = kod_dispatcher::store::open(&w.config.paths.dispatcher_db).unwrap();
+    let bound: i64 = c
+        .query_row(
+            "SELECT count(*) FROM run_bindings WHERE run_seq=77",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(bound, 1);
+    assert!(Service::start(w.config.clone(), parts(&w)).await.is_err());
 }

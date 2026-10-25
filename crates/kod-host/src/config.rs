@@ -102,6 +102,15 @@ where
 }
 
 impl FsConfig {
+    /// Parse only. Callers must validate (`prepare` validates paths first, then the rest under the lock).
+    pub fn parse(path: &Path) -> Result<Self> {
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()?.join(path)
+        };
+        strict_json(&read_local(&absolute)?)
+    }
     pub fn load(path: &Path) -> Result<Self> {
         let absolute = if path.is_absolute() {
             path.to_path_buf()

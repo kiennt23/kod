@@ -340,7 +340,10 @@ fn the_cli_refuses_without_a_gates_config_or_token_and_publishes_nothing() {
     let before = active_text(&w);
     stage(&w.root.join("staged"), "design-v4", "v4 text");
     let err = records::activate_cli(&w.config, &w.root.join("staged/manifest.json"));
-    assert!(err.is_err());
+    assert!(
+        format!("{:#}", err.as_ref().unwrap_err()).contains("reading gates configuration"),
+        "{err:?}"
+    );
     assert_eq!(active_text(&w), before);
     assert!(!w.root.join("active/design-v4.txt").exists());
     // A bad candidate is refused on its own merits first.

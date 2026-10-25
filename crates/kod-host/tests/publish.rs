@@ -267,6 +267,13 @@ fn a_valid_collection_does_reach_the_forge() {
         "{:?}",
         w.calls()
     );
+    // Without a shutdown, publish goes on past the mint to the Forge's pull lookup (the fake
+    // returns none, so the run ends needs_human); the SIGTERM test below must show that stops.
+    assert!(
+        w.calls().iter().any(|c| c == "GET /repos/acme/app/pulls"),
+        "{:?}",
+        w.calls()
+    );
 }
 
 fn seed(dir: &Path, seq: i64) {
@@ -397,10 +404,14 @@ fn sigterm_during_publish_cleans_up_and_never_finishes_the_run() {
     std::thread::sleep(Duration::from_millis(200));
     w.fake.lock().unwrap().hold = false;
     cleanup.join().unwrap();
+    // Let any publish that is still going finish before looking at what it sent.
+    w.wait();
     let (state, why) = w.state();
     assert_ne!(state, "done", "{why}");
     assert!(
-        w.calls().iter().all(|c| c != "POST /repos/acme/app/pulls"),
+        w.calls()
+            .iter()
+            .all(|c| !c.contains("/git/") && !c.ends_with("/pulls")),
         "{:?}",
         w.calls()
     );

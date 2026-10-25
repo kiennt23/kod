@@ -521,8 +521,7 @@ fn a_slow_source_times_out_without_a_stale_fallback() {
 fn refresh_waits_for_the_gates_lock_that_activation_holds() {
     let r = rig();
     let t = tracker(&r);
-    let mut p = r.w.config.paths.audit_db.as_os_str().to_owned();
-    p.push(".gates.lock");
+    let p = kod_host::records::gates_lock_path(&r.w.config);
     let held = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -679,4 +678,61 @@ fn stopping_the_refresher_does_not_wait_for_a_stuck_status_call() {
     rf.stop();
     assert!(t.elapsed() < std::time::Duration::from_millis(100));
     drop(tx);
+}
+
+#[test]
+fn a_story_with_a_published_run_fails_closed_without_pull_evidence() {
+    for state in ["publishing", "done"] {
+        let r = rig();
+        let src = workflow(&r, vec![]);
+        kod_dispatcher::store::open(&r.w.config.paths.dispatcher_db)
+            .unwrap()
+            .execute(
+                "INSERT INTO runs(seq,ticket,revision,state) VALUES(1,?1,'v1',?2)",
+                rusqlite::params![STORY, state],
+            )
+            .unwrap();
+        let e = go_with(&r, &src).unwrap_err();
+        assert!(
+            format!("{e:#}").contains("evidence is unavailable"),
+            "{e:#}"
+        );
+        assert_eq!(posts(&r), 0, "{state}");
+    }
+}
+
+#[test]
+fn a_pulls_source_error_fails_the_refresh_without_writing() {
+    let r = rig();
+    let mut src = workflow(&r, vec![]);
+    src.open = Arc::new(|| anyhow::bail!("github unavailable"));
+    assert!(go_with(&r, &src).is_err());
+    assert_eq!(posts(&r), 0);
+}
+
+#[test]
+fn a_blocked_story_is_logged_and_audited() {
+    let r = rig();
+    db(&r)
+        .execute(
+            "INSERT INTO tracker_write_intents(operation_id,story,kind,audit_intent) VALUES('rework:x',?1,'rework',1)",
+            [STORY],
+        )
+        .unwrap();
+    let path = r.w.dir.path().join("blocked-audit.log");
+    let audit = kod_audit::AuditLog::open(&path).unwrap();
+    let e = go(&r, &tracker(&r)).unwrap_err();
+    kod_host::refresh::blocked(&audit, STORY, &e);
+    let text: String = rusqlite::Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT payload FROM audit WHERE record_type=?1",
+            [kod_audit::RUN_AUDIT],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        text.contains("status_refresh_blocked") && text.contains(STORY),
+        "{text}"
+    );
 }

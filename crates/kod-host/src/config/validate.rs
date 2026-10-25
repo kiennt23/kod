@@ -17,7 +17,8 @@ fn digest(value: &str) -> bool {
     })
 }
 impl FsConfig {
-    pub fn validate_local(&self) -> Result<()> {
+    /// Only the directories and databases: enough to trust durable identities for safety cleanup.
+    pub fn validate_paths(&self) -> Result<()> {
         let p = &self.paths;
         let run = private_dir(&p.run_root)?;
         let credentials = private_dir(&p.credential_dir)?;
@@ -43,6 +44,12 @@ impl FsConfig {
                 "database is below agent-visible directories"
             );
         }
+        Ok(())
+    }
+    pub fn validate_local(&self) -> Result<()> {
+        self.validate_paths()?;
+        let p = &self.paths;
+        let policy = canonical(&p.policy_dir)?;
         let g = &self.github;
         g.product.validate()?;
         ensure!(

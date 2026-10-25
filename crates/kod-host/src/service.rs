@@ -83,6 +83,8 @@ pub fn retry_until_confirmed(mut f: impl FnMut() -> Result<()>) -> Result<()> {
         }
     }
 }
+/// Longer than a healthy tick (250 ms) plus a store retry, far shorter than a hung call.
+const WORKER_JOIN: std::time::Duration = std::time::Duration::from_secs(5);
 const CONFIRM_WITHIN: std::time::Duration = std::time::Duration::from_secs(20);
 
 pub async fn recover_and_attach(
@@ -100,12 +102,55 @@ pub async fn recover_and_attach(
     .await?
 }
 
+/// Admission state: `ready` is the guard read by the dispatcher; `shutting_down` is sticky.
+#[derive(Clone, Default)]
+pub struct Admission {
+    pub ready: Arc<AtomicBool>,
+    pub shutting_down: Arc<AtomicBool>,
+}
+impl Admission {
+    pub fn close_for_shutdown(&self) {
+        self.shutting_down.store(true, Ordering::Release);
+        self.ready.store(false, Ordering::Release);
+    }
+    /// Re-opens only when nothing forbids it; re-checks so a racing shutdown wins.
+    fn reopen(&self, cleanup_pending: bool) {
+        if self.shutting_down.load(Ordering::Acquire) || cleanup_pending {
+            return;
+        }
+        self.ready.store(true, Ordering::Release);
+        if self.shutting_down.load(Ordering::Acquire) {
+            self.ready.store(false, Ordering::Release);
+        }
+    }
+}
+
 pub async fn dispatch_worker(
     dispatcher: Arc<kod_dispatcher::Dispatcher>,
-    ready: Arc<AtomicBool>,
-    mut stop: watch::Receiver<bool>,
+    admission: Admission,
+    cleanup_pending: Arc<dyn Fn() -> bool + Send + Sync>,
+    stop: watch::Receiver<bool>,
 ) -> Result<()> {
-    let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+    worker_loop(
+        Arc::new(move |allow| dispatcher.work_once_with_admission(allow)),
+        admission,
+        cleanup_pending,
+        stop,
+        std::time::Duration::from_millis(250),
+    )
+    .await
+}
+
+/// A failed tick closes admission; a later successful tick re-opens it unless cleanup is
+/// pending or shutdown has begun. Ticks run (cancel/cleanup deliveries) whether or not ready.
+pub async fn worker_loop(
+    work: Arc<dyn Fn(bool) -> Result<bool> + Send + Sync>,
+    admission: Admission,
+    cleanup_pending: Arc<dyn Fn() -> bool + Send + Sync>,
+    mut stop: watch::Receiver<bool>,
+    period: std::time::Duration,
+) -> Result<()> {
+    let mut tick = tokio::time::interval(period);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         if *stop.borrow() {
@@ -115,17 +160,20 @@ pub async fn dispatch_worker(
             biased;
             _ = stop.changed() => return Ok(()),
             _ = tick.tick() => {
-                let d = dispatcher.clone();
-                let allow = ready.load(Ordering::Acquire);
-                let result = tokio::task::spawn_blocking(move || d.work_once_with_admission(allow)).await;
+                let w = work.clone();
+                let allow = admission.ready.load(Ordering::Acquire);
+                let result = tokio::task::spawn_blocking(move || w(allow)).await;
                 let error = match result {
                     Ok(Ok(_)) => None,
                     Ok(Err(error)) => Some(format!("{error:#}")),
                     Err(error) => Some(error.to_string()),
                 };
-                if let Some(error) = error {
-                    ready.store(false, Ordering::Release);
-                    eprintln!("maintenance retry: {}", kod_tool_gateway::scrub(&error));
+                match error {
+                    Some(error) => {
+                        admission.ready.store(false, Ordering::Release);
+                        eprintln!("maintenance retry: {}", kod_tool_gateway::scrub(&error));
+                    }
+                    None => admission.reopen(cleanup_pending()),
                 }
             }
         }
@@ -181,7 +229,7 @@ pub struct Service {
     pub dispatcher: Arc<kod_dispatcher::Dispatcher>,
     pub ingress: std::net::SocketAddr,
     pub gateway: std::net::SocketAddr,
-    ready: Arc<AtomicBool>,
+    admission: Admission,
     stop: watch::Sender<bool>,
     worker: tokio::task::JoinHandle<Result<()>>,
     listeners: Vec<tokio::task::JoinHandle<()>>,
@@ -317,15 +365,25 @@ impl Service {
     ///   Any failure after recovery starts runs the cleanup path before returning.
     pub async fn start(config: Arc<crate::config::FsConfig>, parts: Parts) -> Result<Service> {
         use anyhow::Context;
-        let trace = parts.trace.clone();
-        let t = |p: &str| trace(p);
-        t("lock");
+        (parts.trace)("lock");
         let root = config
             .paths
             .dispatcher_db
             .parent()
             .context("dispatcher_db has no parent")?;
         let lock = instance_lock(root)?;
+        Self::start_locked(config, parts, lock).await
+    }
+
+    /// `start` for a caller that already holds the instance lock (see `prepare`).
+    pub async fn start_locked(
+        config: Arc<crate::config::FsConfig>,
+        parts: Parts,
+        lock: std::fs::File,
+    ) -> Result<Service> {
+        use anyhow::Context;
+        let trace = parts.trace.clone();
+        let t = |p: &str| trace(p);
         let (cfg, tr) = (config.clone(), parts.tracker.clone());
         let parts2 = Parts {
             trace: trace.clone(),
@@ -345,9 +403,9 @@ impl Service {
             cli_keys,
         } = asm;
         let (p, parts_tracker) = (&config.paths, tr);
-        let ready = Arc::new(AtomicBool::new(false));
+        let admission = Admission::default();
         let guard = {
-            let (ready, rt) = (ready.clone(), Arc::downgrade(&runtime));
+            let (ready, rt) = (admission.ready.clone(), Arc::downgrade(&runtime));
             Arc::new(move || {
                 ready.load(Ordering::Acquire) && rt.upgrade().is_some_and(|r| !r.cleanup_pending())
             })
@@ -404,8 +462,17 @@ impl Service {
             serve(ingress_l, public, stop_rx.clone()),
             serve(gateway_l, internal, stop_rx.clone()),
         ];
-        let worker = tokio::spawn(dispatch_worker(dispatcher.clone(), ready.clone(), stop_rx));
-        ready.store(true, Ordering::Release);
+        let pending = {
+            let rt = Arc::downgrade(&runtime);
+            Arc::new(move || rt.upgrade().is_none_or(|r| r.cleanup_pending()))
+        };
+        let worker = tokio::spawn(dispatch_worker(
+            dispatcher.clone(),
+            admission.clone(),
+            pending,
+            stop_rx,
+        ));
+        admission.ready.store(true, Ordering::Release);
         t("ready");
         Ok(Service {
             runtime,
@@ -413,7 +480,7 @@ impl Service {
             dispatcher: dispatcher.clone(),
             ingress: ia,
             gateway: ga,
-            ready,
+            admission,
             stop,
             worker,
             listeners,
@@ -424,17 +491,18 @@ impl Service {
 
     /// Admission is open and no revocation or container stop is pending.
     pub fn is_ready(&self) -> bool {
-        self.ready.load(Ordering::Acquire) && !self.runtime.cleanup_pending()
+        self.admission.ready.load(Ordering::Acquire) && !self.runtime.cleanup_pending()
     }
 
     /// SIGTERM path: close admission, stop the worker, quiesce/revoke/stop with
     /// every phase attempted, then close the listeners. Err while cleanup is pending.
-    pub async fn shutdown(self) -> Result<()> {
+    pub async fn shutdown(mut self) -> Result<()> {
         (self.trace)("close-admission");
-        self.ready.store(false, Ordering::Release);
+        self.admission.close_for_shutdown();
         (self.trace)("stop-worker");
         let _ = self.stop.send(true);
-        let _ = self.worker.await;
+        // A tick stuck in a blocking call must not hold up quiesce/revoke/stop.
+        stop_worker(&mut self.worker, WORKER_JOIN).await;
         let result = shutdown_cleanup(&self.runtime, &self.trace).await;
         (self.trace)("stop-listeners");
         for l in self.listeners {
@@ -450,6 +518,19 @@ impl Service {
         let _ = tokio::task::spawn_blocking(move || drop((runtime, registry, dispatcher))).await;
         result
     }
+}
+
+/// Waits for the worker up to `within`, then aborts it; returns whether it stopped in time.
+async fn stop_worker(
+    worker: &mut tokio::task::JoinHandle<Result<()>>,
+    within: std::time::Duration,
+) -> bool {
+    if tokio::time::timeout(within, &mut *worker).await.is_ok() {
+        return true;
+    }
+    eprintln!("dispatch worker did not stop in time; continuing with cleanup");
+    worker.abort();
+    false
 }
 
 async fn shutdown_cleanup(
@@ -493,9 +574,11 @@ pub async fn serve_refreshing(
     config: Arc<crate::config::FsConfig>,
     parts: Parts,
     tracker: Arc<kod_tracker::github::GitHub>,
+    lock: std::fs::File,
     term: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
-    let service = Service::start(config.clone(), parts.clone()).await?;
+    (parts.trace)("lock");
+    let service = Service::start_locked(config.clone(), parts.clone(), lock).await?;
     let refresher = start_refresh(&config, &parts, tracker)?;
     term.await;
     refresher.stop();
@@ -540,9 +623,106 @@ fn start_refresh(
             let mut c = kod_dispatcher::store::open(&db)?;
             let audit = kod_audit::AuditLog::open(&audit_db)?;
             crate::refresh::refresh_story(&cfg, &tracker, &source, &audit, &mut c, story)
+                .inspect_err(|e| crate::refresh::blocked(&audit, story, e))
         },
         crate::deadlines::RECONCILE,
     ))
+}
+
+/// What `prepare` hands to the service: the validated config, the instance lock and the caller's extra.
+pub struct Prepared<T> {
+    pub config: Arc<crate::config::FsConfig>,
+    pub lock: std::fs::File,
+    pub extra: T,
+}
+
+/// Boot gate. Order: path validation, instance lock, full validation, caller start (tracker
+/// credentials). Nothing is touched before the lock; a failure after it runs safety cleanup.
+pub fn prepare<T>(
+    config: crate::config::FsConfig,
+    start: impl FnOnce(&Arc<crate::config::FsConfig>) -> Result<T>,
+) -> Result<Prepared<T>> {
+    use anyhow::Context;
+    config.validate_paths()?;
+    let config = Arc::new(config);
+    let root = config
+        .paths
+        .dispatcher_db
+        .parent()
+        .context("dispatcher_db has no parent")?;
+    let lock = instance_lock(root)?;
+    let fail = |cause: anyhow::Error| -> anyhow::Error {
+        match safety_cleanup(&config) {
+            Ok(()) => cause,
+            Err(e) => cause.context(format!("safety cleanup incomplete: {e:#}")),
+        }
+    };
+    if let Err(e) = config.validate_local() {
+        return Err(fail(e));
+    }
+    match start(&config) {
+        Ok(extra) => Ok(Prepared {
+            config,
+            lock,
+            extra,
+        }),
+        Err(e) => Err(fail(e)),
+    }
+}
+
+/// Stops containers of every durably bound run and revokes publish leases, using only
+/// path-validated durable state (no policy, model, tracker or artifact sources). Caller holds the lock.
+pub fn safety_cleanup(config: &crate::config::FsConfig) -> Result<()> {
+    let mut errors = Vec::new();
+    let db = &config.paths.dispatcher_db;
+    if db.exists() {
+        let ids: Result<Vec<String>> = (|| {
+            let c = rusqlite::Connection::open_with_flags(
+                db,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?;
+            let mut st = c.prepare("SELECT run_seq FROM run_bindings ORDER BY run_seq")?;
+            let seqs = st
+                .query_map([], |r| r.get::<_, i64>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(seqs.into_iter().map(kod_dispatcher::run_id).collect())
+        })();
+        match ids {
+            Ok(ids) => {
+                for id in ids {
+                    if let Err(e) = retry_until_confirmed(|| {
+                        kod_eval::connected::stop_owned(
+                            &id,
+                            &kod_eval::connected::names(&id)?,
+                            crate::deadlines::TERM_GRACE,
+                            crate::deadlines::ABSENCE,
+                        )
+                    }) {
+                        errors.push(format!("stop {id}: {e:#}"));
+                    }
+                }
+            }
+            Err(e) => errors.push(format!("reading bound runs: {e:#}")),
+        }
+    }
+    let leases = private_subdir(&config.paths.credential_dir.join("publish"))
+        .and_then(|d| {
+            kod_tool_gateway::github::GitHub::new(
+                config.github.product.clone(),
+                config.github.app.clone(),
+                d,
+            )
+        })
+        .and_then(|g| retry_until_confirmed(|| g.recover()));
+    if let Err(e) = leases {
+        errors.push(format!("publish leases: {e:#}"));
+    }
+    anyhow::ensure!(
+        errors.is_empty(),
+        "{}",
+        kod_tool_gateway::scrub(&errors.join("; "))
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -555,6 +735,113 @@ mod tests {
     };
     use std::cell::RefCell;
     use tower::ServiceExt;
+
+    fn adm() -> (Admission, watch::Sender<bool>, watch::Receiver<bool>) {
+        let (tx, rx) = watch::channel(false);
+        (Admission::default(), tx, rx)
+    }
+    const FAST: std::time::Duration = std::time::Duration::from_millis(10);
+    async fn until(f: impl Fn() -> bool) {
+        for _ in 0..300 {
+            if f() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("condition never held");
+    }
+
+    #[tokio::test]
+    async fn readiness_reopens_after_a_transient_error_only_when_nothing_forbids_it() {
+        use std::sync::atomic::AtomicUsize;
+        let (a, tx, rx) = adm();
+        a.ready.store(true, Ordering::SeqCst);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let pending = Arc::new(AtomicBool::new(true));
+        let (c, p) = (calls.clone(), pending.clone());
+        let worker = tokio::spawn(worker_loop(
+            Arc::new(move |_| {
+                // Fail once, then succeed.
+                if c.fetch_add(1, Ordering::SeqCst) == 0 {
+                    anyhow::bail!("busy")
+                }
+                Ok(false)
+            }),
+            a.clone(),
+            Arc::new(move || p.load(Ordering::SeqCst)),
+            rx,
+            FAST,
+        ));
+        until(|| calls.load(Ordering::SeqCst) > 3).await;
+        assert!(
+            !a.ready.load(Ordering::SeqCst),
+            "cleanup pending keeps it closed"
+        );
+        pending.store(false, Ordering::SeqCst);
+        until(|| a.ready.load(Ordering::SeqCst)).await;
+        // Sticky shutdown: later successful ticks never re-open.
+        a.close_for_shutdown();
+        let seen = calls.load(Ordering::SeqCst);
+        until(|| calls.load(Ordering::SeqCst) > seen + 3).await;
+        assert!(!a.ready.load(Ordering::SeqCst));
+        tx.send(true).unwrap();
+        worker.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn unready_worker_still_processes_cancel_and_cleanup() {
+        use std::sync::atomic::AtomicUsize;
+        let (a, tx, rx) = adm();
+        let (ticks, allowed) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let (t, al) = (ticks.clone(), allowed.clone());
+        let worker = tokio::spawn(worker_loop(
+            Arc::new(move |allow| {
+                t.fetch_add(1, Ordering::SeqCst);
+                if allow {
+                    al.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(false)
+            }),
+            a.clone(),
+            Arc::new(|| true),
+            rx,
+            FAST,
+        ));
+        until(|| ticks.load(Ordering::SeqCst) > 5).await;
+        assert_eq!(
+            allowed.load(Ordering::SeqCst),
+            0,
+            "unready ticks must not admit"
+        );
+        tx.send(true).unwrap();
+        worker.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_stuck_worker_does_not_hold_up_cleanup() {
+        let (a, tx, rx) = adm();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let held = std::sync::Mutex::new(held);
+        let mut worker = tokio::spawn(worker_loop(
+            Arc::new(move |_| {
+                let _ = held
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(30));
+                Ok(false)
+            }),
+            a,
+            Arc::new(|| false),
+            rx,
+            FAST,
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tx.send(true).unwrap();
+        let start = std::time::Instant::now();
+        assert!(!stop_worker(&mut worker, std::time::Duration::from_millis(200)).await);
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+        drop(release);
+    }
 
     #[test]
     fn failed_recovery_does_not_open_dispatcher_or_enable_admission() {

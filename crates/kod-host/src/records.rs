@@ -122,6 +122,13 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// The gates lock activation and refresh both take.
+pub fn gates_lock_path(config: &FsConfig) -> PathBuf {
+    let mut p = config.paths.audit_db.as_os_str().to_owned();
+    p.push(".gates.lock");
+    PathBuf::from(p)
+}
+
 pub(crate) fn lock(path: PathBuf) -> Result<std::fs::File> {
     let f = std::fs::OpenOptions::new()
         .read(true)
@@ -182,7 +189,7 @@ pub fn activate_from(
         p.push(s);
         PathBuf::from(p)
     };
-    let _gates = lock(suffix(".gates.lock"))?;
+    let _gates = lock(gates_lock_path(config))?;
     let open = source().context("open pull source failed")?;
     let stories: BTreeSet<_> = open.iter().map(|o| o.story.as_str()).collect();
     let mut _held = vec![];

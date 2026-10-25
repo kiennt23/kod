@@ -140,6 +140,10 @@ impl Runtime {
             barrier: Mutex::default(),
         })
     }
+    /// The tool gateway the runtime registers MCP run tokens with.
+    pub fn tool(&self) -> &Arc<kod_tool_gateway::Gateway> {
+        &self.adapters.tool
+    }
     pub fn attach(&self, dispatcher: Weak<Dispatcher>) -> Result<()> {
         ensure!(dispatcher.upgrade().is_some(), "dispatcher detached");
         self.dispatcher
