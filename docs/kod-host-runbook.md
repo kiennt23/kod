@@ -68,7 +68,7 @@ Status writes are guarded in the dispatcher DB. A write whose outcome is unknown
 These are deliberate. They show up as a missing or stale status comment, not as a wrong one.
 
 - **Stories with rework rows fail the status refresh.** The dispatcher keeps no resolved-rework record, so rework reconciliation is not implemented. The refresh logs the reason (scrubbed) and audits `status_refresh_blocked`, once per state change. Those stories get no status comment updates until a follow-up adds rework reconcile.
-- **Stories with any publish attempt fail the status refresh** (a run that is `publishing` or `done`, or or a `check_publish` follow-up exists, open or resolved: a published or needs_human run may have left a PR that no source can list once merged or closed) until a merged/closed PR source exists. Published stories get no status comment updates until then.
+- **Stories with any publish attempt fail the status refresh** (a run that is `publishing` or `done`, or a `check_publish` follow-up exists, open or resolved: a published or needs_human run may have left a PR that no source can list once merged or closed) until a merged/closed PR source exists. Published stories get no status comment updates until then.
 - **Do not build release binaries with `--all-features`.** That enables the `test-support` seams (loopback API overrides, injected clocks). Build with default features: `cargo build --release -p kod-host`.
 - **Revision history is in memory.** Approved-document revisions pinned at admission are readable while the host runs; after a restart an old pinned revision can no longer be read.
 
